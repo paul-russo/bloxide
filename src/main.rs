@@ -2,10 +2,9 @@ mod block;
 mod grid;
 mod piece;
 
-use block::Block;
 use grid::{Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS};
 use macroquad::{color::colors, prelude::*};
-use piece::{pieces, Piece};
+use piece::{get_random_bag, pieces, Piece};
 use std::{
     cmp,
     time::{Duration, Instant},
@@ -86,29 +85,43 @@ fn draw_score(score: u32) {
 #[macroquad::main("Retris")]
 async fn main() {
     // Game state
-    let active_piece = pieces::J;
+    let bag = get_random_bag();
+    let mut active_piece_index = 0;
     let gravity: f32 = 1.0 / 60.0; // 1 row per 60 ticks
     let grid_locked = Grid::new();
     let grid_active = Grid::new();
     let mut score: u32 = 0;
     let mut tick: u32;
     let mut active_piece_col: i32 = 2;
+    let mut orientation: usize = 0;
+    let mut piece_birth: u32 = 0;
 
     let start = Instant::now();
 
     loop {
         tick = (start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as u32;
 
-        let active_piece_row = ((tick as f32 * gravity).floor() - 2.0) as usize;
-        let col_offset = match get_last_key_pressed() {
-            Some(KeyCode::Left) => -1,
-            Some(KeyCode::Right) => 1,
-            _ => 0,
+        let piece_tick = tick - piece_birth;
+        let active_piece = bag[active_piece_index];
+        let active_piece_row = ((piece_tick as f32 * gravity).floor() - 2.0) as usize;
+        let mut col_offset = 0;
+
+        match get_last_key_pressed() {
+            Some(KeyCode::Left) => col_offset = -1,
+            Some(KeyCode::Right) => col_offset = 1,
+            Some(KeyCode::Up) => orientation = (orientation + 1) % 4,
+            Some(KeyCode::Space) => {
+                active_piece_index = (active_piece_index + 1) % 7;
+                orientation = 0;
+                active_piece_col = ((10 - bag[active_piece_index].bounds_width) / 2) as i32;
+                piece_birth = tick;
+            }
+            _ => (),
         };
 
         active_piece_col = cmp::max(active_piece_col + col_offset, 0);
 
-        let active_blocks = active_piece.get_blocks();
+        let active_blocks = active_piece.get_blocks(orientation);
         grid_active.set_cells(active_piece_row, active_piece_col as usize, active_blocks);
 
         clear_background(BLACK);
