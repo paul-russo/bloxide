@@ -30,7 +30,7 @@ impl Piece {
                 blocks_vec_row.push(
                     match self.orientations[orientation % 4].blocks[canvas_row][canvas_col] {
                         0 => None,
-                        _ => Some(Block::new(self.color, false)),
+                        _ => Some(Block::new(self.color)),
                     },
                 )
             }
@@ -383,6 +383,7 @@ pub mod pieces {
     };
 }
 
+// TODO: Could this be an iterator, and manage the "bag" internally?
 pub fn get_random_bag() -> [Piece; 7] {
     let mut rng = thread_rng();
     let mut bag = [
