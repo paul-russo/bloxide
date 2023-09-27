@@ -20,7 +20,7 @@ const OFFSET_INNER_X: f32 = PLAYFIELD_OFFSET_X + (OUTLINE_WIDTH / 2.0);
 const OFFSET_INNER_Y: f32 = PLAYFIELD_OFFSET_Y + (OUTLINE_WIDTH / 2.0);
 
 const PREVIEW_OFFSET_X: f32 = PLAYFIELD_OFFSET_X * 2.0 + PLAYFIELD_WIDTH;
-const PREVIEW_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y + 48.0;
+const PREVIEW_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y;
 const PREVIEW_WIDTH: f32 = 6.0 * BLOCK_SIZE + OUTLINE_WIDTH;
 const PREVIEW_HEIGHT: f32 = 6.0 * 3.0 * BLOCK_SIZE + OUTLINE_WIDTH;
 const PREVIEW_OFFSET_INNER_X: f32 = PREVIEW_OFFSET_X + (OUTLINE_WIDTH / 2.0);
@@ -74,7 +74,7 @@ fn draw_grid(grid: &Grid) {
 fn draw_debug_info(tick: u32) {
     draw_text(
         &format!("tick: {}", tick),
-        PLAYFIELD_OFFSET_X,
+        PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
         PLAYFIELD_OFFSET_Y - 10.0,
         32.0,
         WHITE,
@@ -84,8 +84,8 @@ fn draw_debug_info(tick: u32) {
 fn draw_score(score: u32) {
     draw_text(
         &format!("score: {}", score),
-        PLAYFIELD_OFFSET_X * 2.0 + PLAYFIELD_WIDTH,
-        PLAYFIELD_OFFSET_Y + 16.0,
+        PLAYFIELD_OFFSET_X,
+        PLAYFIELD_OFFSET_Y - 10.0,
         32.0,
         WHITE,
     );
@@ -173,7 +173,19 @@ async fn main() {
         match get_last_key_pressed() {
             Some(KeyCode::Left) => col_offset = -1,
             Some(KeyCode::Right) => col_offset = 1,
-            Some(KeyCode::Up) => orientation = (orientation + 1) % 4,
+            Some(KeyCode::Up) => {
+                let next_orientation = (orientation + 1) % 4;
+
+                let has_collision = grid_locked.collision_check(
+                    active_piece_row,
+                    active_piece_col,
+                    active_piece.get_blocks(next_orientation),
+                );
+
+                if !has_collision {
+                    orientation = next_orientation;
+                }
+            }
             Some(KeyCode::C) => {
                 active_piece = bag_manager.next();
                 orientation = 0;
