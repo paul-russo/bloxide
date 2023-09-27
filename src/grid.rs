@@ -1,5 +1,4 @@
 use crate::block::Block;
-use std::mem;
 
 pub const GRID_COUNT_ROWS: usize = 20;
 pub const GRID_COUNT_COLS: usize = 10;

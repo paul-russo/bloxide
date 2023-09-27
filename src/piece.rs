@@ -1,8 +1,7 @@
-use macroquad::prelude::Color;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-
 use crate::block::Block;
+use crate::grid::GRID_COUNT_COLS;
+use macroquad::prelude::Color;
+use std::fmt::Display;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct OrientationDef {
@@ -12,6 +11,7 @@ pub struct OrientationDef {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Piece {
+    pub name: &'static str,
     pub color: Color,
     pub bounds_width: usize,
     pub bounds_height: usize,
@@ -40,6 +40,16 @@ impl Piece {
 
         blocks_vec
     }
+
+    pub fn get_initial_col(&self) -> isize {
+        ((GRID_COUNT_COLS - self.bounds_width) / 2) as isize
+    }
+}
+
+impl Display for Piece {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
 }
 
 pub mod pieces {
@@ -47,6 +57,7 @@ pub mod pieces {
     use macroquad::{color_u8, prelude::Color};
 
     pub const I: Piece = Piece {
+        name: "I",
         color: color_u8!(100, 196, 235, 255),
         bounds_width: 5,
         bounds_height: 5,
@@ -95,6 +106,7 @@ pub mod pieces {
     };
 
     pub const J: Piece = Piece {
+        name: "J",
         color: color_u8!(92, 101, 168, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -143,6 +155,7 @@ pub mod pieces {
     };
 
     pub const L: Piece = Piece {
+        name: "L",
         color: color_u8!(224, 127, 58, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -191,6 +204,7 @@ pub mod pieces {
     };
 
     pub const O: Piece = Piece {
+        name: "O",
         color: color_u8!(241, 212, 72, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -239,6 +253,7 @@ pub mod pieces {
     };
 
     pub const S: Piece = Piece {
+        name: "S",
         color: color_u8!(100, 180, 82, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -287,6 +302,7 @@ pub mod pieces {
     };
 
     pub const T: Piece = Piece {
+        name: "T",
         color: color_u8!(140, 26, 245, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -335,6 +351,7 @@ pub mod pieces {
     };
 
     pub const Z: Piece = Piece {
+        name: "Z",
         color: color_u8!(234, 51, 35, 255),
         bounds_width: 3,
         bounds_height: 3,
@@ -381,21 +398,4 @@ pub mod pieces {
             },
         ],
     };
-}
-
-// TODO: Could this be an iterator, and manage the "bag" internally?
-pub fn get_random_bag() -> [Piece; 7] {
-    let mut rng = thread_rng();
-    let mut bag = [
-        pieces::I,
-        pieces::J,
-        pieces::L,
-        pieces::O,
-        pieces::S,
-        pieces::T,
-        pieces::Z,
-    ];
-
-    bag.shuffle(&mut rng);
-    bag
 }
