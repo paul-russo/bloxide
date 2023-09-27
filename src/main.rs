@@ -2,6 +2,7 @@ mod bag_manager;
 mod block;
 mod grid;
 mod piece;
+mod utils;
 
 use bag_manager::BagManager;
 use block::Block;
@@ -21,8 +22,12 @@ const OFFSET_INNER_Y: f32 = PLAYFIELD_OFFSET_Y + (OUTLINE_WIDTH / 2.0);
 
 const PREVIEW_OFFSET_X: f32 = PLAYFIELD_OFFSET_X * 2.0 + PLAYFIELD_WIDTH;
 const PREVIEW_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y;
-const PREVIEW_WIDTH: f32 = 6.0 * BLOCK_SIZE + OUTLINE_WIDTH;
-const PREVIEW_HEIGHT: f32 = 6.0 * 3.0 * BLOCK_SIZE + OUTLINE_WIDTH;
+const PREVIEW_PIECE_MAX_BLOCKS_H: f32 = 2.0;
+const PREVIEW_PIECE_MAX_BLOCKS_W: f32 = 4.0;
+const PREVIEW_PIECE_MARGIN: f32 = 20.0;
+const PREVIEW_WIDTH: f32 = PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH;
+const PREVIEW_HEIGHT: f32 =
+    PREVIEW_PIECE_MAX_BLOCKS_H * 3.0 * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PIECE_MARGIN * 2.0);
 const PREVIEW_OFFSET_INNER_X: f32 = PREVIEW_OFFSET_X + (OUTLINE_WIDTH / 2.0);
 const PREVIEW_OFFSET_INNER_Y: f32 = PREVIEW_OFFSET_Y + (OUTLINE_WIDTH / 2.0);
 
@@ -92,10 +97,10 @@ fn draw_score(score: u32) {
 }
 
 fn draw_piece(piece: Piece, orientation: usize, offset_x: f32, offset_y: f32) {
-    let blocks = piece.get_blocks(orientation);
+    let blocks = piece.get_blocks(orientation, true);
 
-    for row_id in 0..piece.bounds_height {
-        for col_id in 0..piece.bounds_width {
+    for row_id in 0..blocks.len() {
+        for col_id in 0..blocks[row_id].len() {
             let cell = blocks[row_id][col_id];
 
             match cell {
@@ -125,13 +130,13 @@ fn draw_next_pieces(bag_manager: &BagManager) {
         piece_2,
         0,
         PREVIEW_OFFSET_INNER_X,
-        PREVIEW_OFFSET_INNER_Y + (6.0 * BLOCK_SIZE),
+        PREVIEW_OFFSET_INNER_Y + (2.0 * BLOCK_SIZE) + PREVIEW_PIECE_MARGIN,
     );
     draw_piece(
         piece_3,
         0,
         PREVIEW_OFFSET_INNER_X,
-        PREVIEW_OFFSET_INNER_Y + (6.0 * BLOCK_SIZE * 2.0),
+        PREVIEW_OFFSET_INNER_Y + (2.0 * BLOCK_SIZE * 2.0) + PREVIEW_PIECE_MARGIN * 2.0,
     );
 }
 
@@ -179,7 +184,7 @@ async fn main() {
                 let has_collision = grid_locked.collision_check(
                     active_piece_row,
                     active_piece_col,
-                    active_piece.get_blocks(next_orientation),
+                    active_piece.get_blocks(next_orientation, false),
                 );
 
                 if !has_collision {
@@ -204,7 +209,7 @@ async fn main() {
             let has_collision = grid_locked.collision_check(
                 active_piece_row,
                 next_active_piece_col,
-                active_piece.get_blocks(orientation),
+                active_piece.get_blocks(orientation, false),
             );
 
             if !has_collision {
@@ -217,14 +222,14 @@ async fn main() {
             let has_collision = grid_locked.collision_check(
                 next_active_piece_row,
                 active_piece_col,
-                active_piece.get_blocks(orientation),
+                active_piece.get_blocks(orientation, false),
             );
 
             if has_collision {
                 grid_locked.set_cells(
                     active_piece_row,
                     active_piece_col,
-                    active_piece.get_blocks(orientation),
+                    active_piece.get_blocks(orientation, false),
                 );
 
                 active_piece = bag_manager.next();
@@ -238,7 +243,7 @@ async fn main() {
             }
         }
 
-        let active_blocks = active_piece.get_blocks(orientation);
+        let active_blocks = active_piece.get_blocks(orientation, false);
         grid_active.set_cells(active_piece_row, active_piece_col, active_blocks);
 
         clear_background(BLACK);
