@@ -31,6 +31,7 @@ impl Piece {
         } else {
             (0, self.bounds_height)
         };
+
         let canvas_bounds_x = if trimmed {
             orientation_def.bounds_x
         } else {

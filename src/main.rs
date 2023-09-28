@@ -7,9 +7,9 @@ mod utils;
 use bag_manager::BagManager;
 use block::Block;
 use grid::{Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS};
-use macroquad::{prelude::*, telemetry::Frame};
+use macroquad::prelude::*;
 use piece::Piece;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const BLOCK_SIZE: f32 = 20.0;
 const PLAYFIELD_OFFSET_X: f32 = 40.0;
@@ -25,10 +25,10 @@ const PREVIEW_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y;
 const PREVIEW_PIECE_MAX_BLOCKS_H: f32 = 2.0;
 const PREVIEW_PIECE_MAX_BLOCKS_W: f32 = 4.0;
 const PREVIEW_PIECE_MARGIN: f32 = 20.0;
-const PREVIEW_PADDING_X: f32 = 5.0;
-const PREVIEW_PADDING_Y: f32 = 5.0;
+const PREVIEW_PADDING_X: f32 = 10.0;
+const PREVIEW_PADDING_Y: f32 = 10.0;
 const PREVIEW_WIDTH: f32 =
-    PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_Y * 2.0);
+    PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_X * 2.0);
 const PREVIEW_HEIGHT: f32 = PREVIEW_PIECE_MAX_BLOCKS_H * 3.0 * BLOCK_SIZE
     + OUTLINE_WIDTH
     + (PREVIEW_PIECE_MARGIN * 2.0)
@@ -49,13 +49,25 @@ fn draw_playfield() {
     );
 }
 
-fn draw_block(block: Block, row_id: usize, col_id: usize, offset_x: f32, offset_y: f32) {
+fn draw_block(
+    block: Block,
+    row_id: usize,
+    col_id: usize,
+    offset_x: f32,
+    offset_y: f32,
+    opacity: f32,
+) {
     draw_rectangle(
         offset_x + (col_id as f32 * BLOCK_SIZE),
         offset_y + (row_id as f32 * BLOCK_SIZE),
         BLOCK_SIZE,
         BLOCK_SIZE,
-        block.color,
+        Color {
+            r: block.color.r,
+            g: block.color.g,
+            b: block.color.b,
+            a: opacity,
+        },
     );
 
     draw_rectangle_lines(
@@ -64,17 +76,29 @@ fn draw_block(block: Block, row_id: usize, col_id: usize, offset_x: f32, offset_
         BLOCK_SIZE,
         BLOCK_SIZE,
         OUTLINE_WIDTH,
-        WHITE,
+        Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: opacity,
+        },
     );
 }
 
-fn draw_grid(grid: &Grid) {
+fn draw_grid(grid: &Grid, opacity: f32) {
     for row_id in 0..GRID_COUNT_ROWS {
         for col_id in 0..GRID_COUNT_COLS {
             let cell = grid.get_cell(row_id, col_id);
 
             match cell {
-                Some(block) => draw_block(block, row_id, col_id, OFFSET_INNER_X, OFFSET_INNER_Y),
+                Some(block) => draw_block(
+                    block,
+                    row_id,
+                    col_id,
+                    OFFSET_INNER_X,
+                    OFFSET_INNER_Y,
+                    opacity,
+                ),
                 None => (),
             }
         }
@@ -146,7 +170,7 @@ fn draw_piece(piece: Piece, orientation: usize, offset_x: f32, offset_y: f32) {
             let cell = blocks[row_id][col_id];
 
             match cell {
-                Some(block) => draw_block(block, row_id, col_id, offset_x, offset_y),
+                Some(block) => draw_block(block, row_id, col_id, offset_x, offset_y, 1.0),
                 None => (),
             }
         }
@@ -179,7 +203,16 @@ fn draw_next_pieces(bag_manager: &BagManager) {
     }
 }
 
-#[macroquad::main("Retris")]
+fn window_conf() -> Conf {
+    Conf {
+        window_title: String::from("Retris"),
+        high_dpi: true,
+        window_resizable: false,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() {
     // Game state
     let mut bag_manager = BagManager::new();
@@ -187,6 +220,7 @@ async fn main() {
     let gravity: f32 = 1.0 / 60.0; // 1 row per 60 ticks (1 second)
     let mut grid_locked = Grid::new();
     let mut grid_active = Grid::new();
+    let mut grid_ghost = Grid::new();
     let mut score: u32 = 0;
     let mut tick: u32;
     let mut last_tick: u32 = 0;
@@ -224,7 +258,7 @@ async fn main() {
                 let has_collision = grid_locked.collision_check(
                     active_piece_row,
                     active_piece_col,
-                    active_piece.get_blocks(next_orientation, false),
+                    &active_piece.get_blocks(next_orientation, false),
                 );
 
                 if !has_collision {
@@ -232,6 +266,26 @@ async fn main() {
                 }
             }
             Some(KeyCode::C) => {
+                active_piece = bag_manager.next();
+                orientation = 0;
+                active_piece_col = active_piece.get_initial_col();
+                active_piece_row = 0;
+                next_active_piece_row = 0;
+                ticks_to_next_row_inc = (1.0 / gravity).ceil() as i32;
+            }
+            Some(KeyCode::Space) => {
+                active_piece_row = grid_locked.find_landing_row(
+                    active_piece_row,
+                    active_piece_col,
+                    &active_piece.get_blocks(orientation, false),
+                );
+
+                grid_locked.set_cells(
+                    active_piece_row,
+                    active_piece_col,
+                    &active_piece.get_blocks(orientation, false),
+                );
+
                 active_piece = bag_manager.next();
                 orientation = 0;
                 active_piece_col = active_piece.get_initial_col();
@@ -249,7 +303,7 @@ async fn main() {
             let has_collision = grid_locked.collision_check(
                 active_piece_row,
                 next_active_piece_col,
-                active_piece.get_blocks(orientation, false),
+                &active_piece.get_blocks(orientation, false),
             );
 
             if !has_collision {
@@ -262,14 +316,14 @@ async fn main() {
             let has_collision = grid_locked.collision_check(
                 next_active_piece_row,
                 active_piece_col,
-                active_piece.get_blocks(orientation, false),
+                &active_piece.get_blocks(orientation, false),
             );
 
             if has_collision {
                 grid_locked.set_cells(
                     active_piece_row,
                     active_piece_col,
-                    active_piece.get_blocks(orientation, false),
+                    &active_piece.get_blocks(orientation, false),
                 );
 
                 active_piece = bag_manager.next();
@@ -284,13 +338,18 @@ async fn main() {
         }
 
         let active_blocks = active_piece.get_blocks(orientation, false);
-        grid_active.set_cells(active_piece_row, active_piece_col, active_blocks);
+        grid_active.set_cells(active_piece_row, active_piece_col, &active_blocks);
+
+        let ghost_row =
+            grid_locked.find_landing_row(active_piece_row, active_piece_col, &active_blocks);
+        grid_ghost.set_cells(ghost_row, active_piece_col, &active_blocks);
 
         clear_background(BLACK);
         draw_score(score);
         draw_playfield();
-        draw_grid(&grid_locked);
-        draw_grid(&grid_active);
+        draw_grid(&grid_locked, 1.0);
+        draw_grid(&grid_active, 1.0);
+        draw_grid(&grid_ghost, 0.5);
         draw_next_pieces(&bag_manager);
 
         draw_debug_info(tick, gravity, last_key_pressed, speed_modifier);
@@ -304,6 +363,7 @@ async fn main() {
         }
 
         grid_active.clear();
+        grid_ghost.clear();
 
         last_tick = tick;
 

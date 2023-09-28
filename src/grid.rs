@@ -36,7 +36,7 @@ impl Grid {
         &mut self,
         row_offset: isize,
         col_offset: isize,
-        canvas: Vec<Vec<Option<Block>>>,
+        canvas: &Vec<Vec<Option<Block>>>,
     ) {
         for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
             for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
@@ -65,7 +65,7 @@ impl Grid {
         &self,
         row_offset: isize,
         col_offset: isize,
-        canvas: Vec<Vec<Option<Block>>>,
+        canvas: &Vec<Vec<Option<Block>>>,
     ) -> bool {
         for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
             for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
@@ -86,6 +86,23 @@ impl Grid {
         }
 
         false
+    }
+
+    pub fn find_landing_row(
+        &self,
+        row_offset: isize,
+        col_offset: isize,
+        canvas: &Vec<Vec<Option<Block>>>,
+    ) -> isize {
+        for next_row_offset in row_offset..GRID_COUNT_ROWS as isize {
+            let has_collision = self.collision_check(next_row_offset, col_offset, canvas);
+
+            if has_collision {
+                return next_row_offset - 1;
+            }
+        }
+
+        return GRID_COUNT_ROWS as isize;
     }
 
     pub fn get_cell(&self, row_id: usize, col_id: usize) -> Option<Block> {
