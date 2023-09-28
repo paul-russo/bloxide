@@ -7,9 +7,9 @@ mod utils;
 use bag_manager::BagManager;
 use block::Block;
 use grid::{Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS};
-use macroquad::prelude::*;
+use macroquad::{prelude::*, telemetry::Frame};
 use piece::Piece;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BLOCK_SIZE: f32 = 20.0;
 const PLAYFIELD_OFFSET_X: f32 = 40.0;
@@ -25,11 +25,16 @@ const PREVIEW_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y;
 const PREVIEW_PIECE_MAX_BLOCKS_H: f32 = 2.0;
 const PREVIEW_PIECE_MAX_BLOCKS_W: f32 = 4.0;
 const PREVIEW_PIECE_MARGIN: f32 = 20.0;
-const PREVIEW_WIDTH: f32 = PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH;
-const PREVIEW_HEIGHT: f32 =
-    PREVIEW_PIECE_MAX_BLOCKS_H * 3.0 * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PIECE_MARGIN * 2.0);
-const PREVIEW_OFFSET_INNER_X: f32 = PREVIEW_OFFSET_X + (OUTLINE_WIDTH / 2.0);
-const PREVIEW_OFFSET_INNER_Y: f32 = PREVIEW_OFFSET_Y + (OUTLINE_WIDTH / 2.0);
+const PREVIEW_PADDING_X: f32 = 5.0;
+const PREVIEW_PADDING_Y: f32 = 5.0;
+const PREVIEW_WIDTH: f32 =
+    PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_Y * 2.0);
+const PREVIEW_HEIGHT: f32 = PREVIEW_PIECE_MAX_BLOCKS_H * 3.0 * BLOCK_SIZE
+    + OUTLINE_WIDTH
+    + (PREVIEW_PIECE_MARGIN * 2.0)
+    + (PREVIEW_PADDING_Y * 2.0);
+const PREVIEW_OFFSET_INNER_X: f32 = PREVIEW_OFFSET_X + (OUTLINE_WIDTH / 2.0) + PREVIEW_PADDING_X;
+const PREVIEW_OFFSET_INNER_Y: f32 = PREVIEW_OFFSET_Y + (OUTLINE_WIDTH / 2.0) + PREVIEW_PADDING_Y;
 
 const TICKS_PER_SECOND: f32 = 60.0;
 
@@ -76,12 +81,49 @@ fn draw_grid(grid: &Grid) {
     }
 }
 
-fn draw_debug_info(tick: u32) {
+fn draw_debug_info(
+    tick: u32,
+    gravity: f32,
+    last_key_pressed: Option<KeyCode>,
+    speed_modifier: u32,
+) {
     draw_text(
         &format!("tick: {}", tick),
         PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
         PLAYFIELD_OFFSET_Y - 10.0,
-        32.0,
+        16.0,
+        WHITE,
+    );
+
+    draw_text(
+        &format!("gravity: {}", gravity),
+        PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
+        PLAYFIELD_OFFSET_Y + 6.0,
+        16.0,
+        WHITE,
+    );
+
+    draw_text(
+        &format!("key: {:?}", last_key_pressed),
+        PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
+        PLAYFIELD_OFFSET_Y + 22.0,
+        16.0,
+        WHITE,
+    );
+
+    draw_text(
+        &format!("modifier: {}", speed_modifier),
+        PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
+        PLAYFIELD_OFFSET_Y + 38.0,
+        16.0,
+        WHITE,
+    );
+
+    draw_text(
+        &format!("FPS: {} ({}ms)", get_fps(), get_frame_time() * 1000.0),
+        PLAYFIELD_OFFSET_X + PLAYFIELD_WIDTH + 350.0,
+        PLAYFIELD_OFFSET_Y + 54.0,
+        16.0,
         WHITE,
     );
 }
@@ -121,23 +163,20 @@ fn draw_next_pieces(bag_manager: &BagManager) {
         WHITE,
     );
 
-    let piece_1 = bag_manager.peek(1);
-    let piece_2 = bag_manager.peek(2);
-    let piece_3 = bag_manager.peek(3);
+    for offset in 1..4 {
+        let piece = bag_manager.peek(offset);
+        let piece_w = piece.orientations[0].bounds_x.1 - piece.orientations[0].bounds_x.0;
+        let piece_offset_x = ((PREVIEW_PIECE_MAX_BLOCKS_W - piece_w as f32) / 2.0) * BLOCK_SIZE;
 
-    draw_piece(piece_1, 0, PREVIEW_OFFSET_INNER_X, PREVIEW_OFFSET_INNER_Y);
-    draw_piece(
-        piece_2,
-        0,
-        PREVIEW_OFFSET_INNER_X,
-        PREVIEW_OFFSET_INNER_Y + (2.0 * BLOCK_SIZE) + PREVIEW_PIECE_MARGIN,
-    );
-    draw_piece(
-        piece_3,
-        0,
-        PREVIEW_OFFSET_INNER_X,
-        PREVIEW_OFFSET_INNER_Y + (2.0 * BLOCK_SIZE * 2.0) + PREVIEW_PIECE_MARGIN * 2.0,
-    );
+        draw_piece(
+            piece,
+            0,
+            PREVIEW_OFFSET_INNER_X + piece_offset_x,
+            PREVIEW_OFFSET_INNER_Y
+                + (2.0 * BLOCK_SIZE * (offset as f32 - 1.0))
+                + (PREVIEW_PIECE_MARGIN * (offset as f32 - 1.0)),
+        );
+    }
 }
 
 #[macroquad::main("Retris")]
@@ -175,7 +214,8 @@ async fn main() {
         };
 
         let mut col_offset = 0;
-        match get_last_key_pressed() {
+        let last_key_pressed = get_last_key_pressed();
+        match last_key_pressed {
             Some(KeyCode::Left) => col_offset = -1,
             Some(KeyCode::Right) => col_offset = 1,
             Some(KeyCode::Up) => {
@@ -253,7 +293,7 @@ async fn main() {
         draw_grid(&grid_active);
         draw_next_pieces(&bag_manager);
 
-        draw_debug_info(tick);
+        draw_debug_info(tick, gravity, last_key_pressed, speed_modifier);
 
         match grid_locked.clear_all_filled_rows() {
             1 => score += 100,
