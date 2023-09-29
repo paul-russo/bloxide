@@ -284,7 +284,12 @@ async fn main() {
 
         let last_key_pressed = get_last_key_pressed();
 
-        game_state.apply_input(is_key_down(KeyCode::Down), last_key_pressed);
+        game_state.apply_input(
+            is_key_down(KeyCode::Down),
+            is_key_down(KeyCode::Left),
+            is_key_down(KeyCode::Right),
+            last_key_pressed,
+        );
 
         clear_background(BLACK);
         draw_score(game_state.get_score());

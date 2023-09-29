@@ -7,6 +7,14 @@ use crate::{bag_manager::BagManager, grid::Grid, piece::Piece};
 const TICKS_PER_SECOND: f32 = 60.0;
 const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
 const G_SOFT_DROP: f32 = 30.0 / 60.0; // 1/2G. 30 rows per 60 ticks (1 second)
+const REPEAT_DELAY_TICKS: isize = 11; // ~183ms. Delay before repeating horizontal movement.
+const REPEAT_INTERVAL_TICKS: isize = 3; // ~50ms. Repeat interval for horizontal movement.
+
+enum ShiftDirection {
+    Left,
+    Right,
+    Neither,
+}
 
 enum CollisionVar {
     Row(isize),
@@ -54,6 +62,8 @@ pub struct GameState {
     active_piece_row: isize,
     active_piece_orientation: usize,
     ticks_to_next_row_inc: isize,
+    ticks_to_repeat: isize,
+    shift_direction: ShiftDirection,
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
     rows_cleared: usize,
@@ -91,6 +101,8 @@ impl GameState {
             active_piece_row,
             active_piece_orientation,
             ticks_to_next_row_inc,
+            ticks_to_repeat: REPEAT_DELAY_TICKS,
+            shift_direction: ShiftDirection::Neither,
             held_piece: None,
             last_piece_swapped: false,
             rows_cleared: 0,
@@ -208,7 +220,63 @@ impl GameState {
         }
     }
 
-    fn try_move_horizontal(&mut self, col_offset: isize) {
+    fn set_shift_direction(&mut self, new_shift_direction: ShiftDirection) {
+        self.ticks_to_repeat = REPEAT_DELAY_TICKS;
+        self.shift_direction = new_shift_direction;
+    }
+
+    fn try_move_horizontal(&mut self, is_shift_left: bool, is_shift_right: bool) {
+        let tick_delta = self.get_tick_delta();
+        let mut col_offset = 0;
+
+        if !is_shift_left && !is_shift_right {
+            return self.set_shift_direction(ShiftDirection::Neither);
+        }
+
+        match self.shift_direction {
+            ShiftDirection::Left => {
+                if !is_shift_left {
+                    if is_shift_right {
+                        self.set_shift_direction(ShiftDirection::Right);
+                        col_offset = 1;
+                    }
+                } else {
+                    self.ticks_to_repeat -= tick_delta as isize;
+                }
+            }
+
+            ShiftDirection::Right => {
+                if !is_shift_right {
+                    if is_shift_left {
+                        self.set_shift_direction(ShiftDirection::Left);
+                        col_offset = -1;
+                    }
+                } else {
+                    self.ticks_to_repeat -= tick_delta as isize;
+                }
+            }
+
+            ShiftDirection::Neither => {
+                if is_shift_left {
+                    self.set_shift_direction(ShiftDirection::Left);
+                    col_offset = -1;
+                } else if is_shift_right {
+                    self.set_shift_direction(ShiftDirection::Right);
+                    col_offset = 1;
+                }
+            }
+        }
+
+        if self.ticks_to_repeat <= 0 {
+            col_offset = match self.shift_direction {
+                ShiftDirection::Left => -1,
+                ShiftDirection::Right => 1,
+                ShiftDirection::Neither => unreachable!(),
+            };
+
+            self.ticks_to_repeat = REPEAT_INTERVAL_TICKS;
+        }
+
         let next_active_piece_col = self.active_piece_col + col_offset;
 
         // Horizontal collision check
@@ -242,7 +310,13 @@ impl GameState {
         }
     }
 
-    pub fn apply_input(&mut self, is_soft_drop: bool, last_key_pressed: Option<KeyCode>) {
+    pub fn apply_input(
+        &mut self,
+        is_soft_drop: bool,
+        is_shift_left: bool,
+        is_shift_right: bool,
+        last_key_pressed: Option<KeyCode>,
+    ) {
         let speed_modifier = if is_soft_drop {
             (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
         } else {
@@ -251,11 +325,7 @@ impl GameState {
 
         self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as isize;
 
-        let mut col_offset = 0;
-
         match last_key_pressed {
-            Some(KeyCode::Left) => col_offset = -1,
-            Some(KeyCode::Right) => col_offset = 1,
             Some(KeyCode::Up) => self.try_rotate_right(),
             Some(KeyCode::C) => self.swap_active_piece(),
             Some(KeyCode::Space) => self.hard_drop(),
@@ -263,7 +333,7 @@ impl GameState {
         };
 
         // Try and move the piece horizontally,
-        self.try_move_horizontal(col_offset);
+        self.try_move_horizontal(is_shift_left, is_shift_right);
 
         // Drop the piece, or lock it if dropping would cause a collision.
         self.try_gravity_drop();
