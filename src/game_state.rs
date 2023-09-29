@@ -6,6 +6,38 @@ use crate::{bag_manager::BagManager, grid::Grid, piece::Piece};
 
 const TICKS_PER_SECOND: f32 = 60.0;
 
+enum CollisionVar {
+    Row(isize),
+    Col(isize),
+    Orientation(usize),
+}
+
+impl CollisionVar {
+    fn row_or(&self, fallback: isize) -> isize {
+        match &self {
+            CollisionVar::Col(_) => fallback,
+            CollisionVar::Row(value) => *value,
+            CollisionVar::Orientation(_) => fallback,
+        }
+    }
+
+    fn col_or(&self, fallback: isize) -> isize {
+        match &self {
+            CollisionVar::Col(value) => *value,
+            CollisionVar::Row(_) => fallback,
+            CollisionVar::Orientation(_) => fallback,
+        }
+    }
+
+    fn orientation_or(&self, fallback: usize) -> usize {
+        match &self {
+            CollisionVar::Col(_) => fallback,
+            CollisionVar::Row(_) => fallback,
+            CollisionVar::Orientation(value) => *value,
+        }
+    }
+}
+
 pub struct GameState {
     grid_locked: Grid,
     grid_active: Grid,
@@ -18,9 +50,7 @@ pub struct GameState {
     last_tick: u32,
     start: Instant,
     active_piece_col: isize,
-    next_active_piece_col: isize,
     active_piece_row: isize,
-    next_active_piece_row: isize,
     active_piece_orientation: usize,
     ticks_to_next_row_inc: i32,
     held_piece: Option<Piece>,
@@ -56,9 +86,7 @@ impl GameState {
             last_tick,
             start,
             active_piece_col,
-            next_active_piece_col: active_piece_col,
             active_piece_row,
-            next_active_piece_row: active_piece_row,
             active_piece_orientation,
             ticks_to_next_row_inc,
             held_piece: None,
@@ -73,7 +101,7 @@ impl GameState {
 
     pub fn end_tick(&mut self) {
         self.last_tick = self.tick;
-        self.update_score();
+        self.clear_filled_rows_and_update_score();
         self.grid_active.clear();
         self.grid_ghost.clear();
     }
@@ -88,7 +116,6 @@ impl GameState {
         self.active_piece_orientation = 0;
         self.active_piece_col = self.active_piece.get_initial_col();
         self.active_piece_row = 0;
-        self.next_active_piece_row = 0;
         self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
         self.last_piece_swapped = false;
     }
@@ -144,90 +171,90 @@ impl GameState {
         self.next_piece();
     }
 
-    pub fn apply_input(&mut self, is_down_key_down: bool, last_key_pressed: Option<KeyCode>) {
-        let speed_modifier = if is_down_key_down { 5 } else { 1 };
-
-        self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as i32;
-
-        self.next_active_piece_row = if self.ticks_to_next_row_inc <= 0 {
+    fn get_next_active_piece_row(&self) -> isize {
+        if self.ticks_to_next_row_inc <= 0 {
             self.active_piece_row + 1
         } else {
             self.active_piece_row
-        };
+        }
+    }
+
+    fn collision_check(&self, collision_var: CollisionVar) -> bool {
+        self.grid_locked.collision_check(
+            collision_var.row_or(self.active_piece_row),
+            collision_var.col_or(self.active_piece_col),
+            &self.active_piece.get_blocks(
+                collision_var.orientation_or(self.active_piece_orientation),
+                false,
+            ),
+        )
+    }
+
+    fn try_rotate_right(&mut self) {
+        let next_orientation = (self.active_piece_orientation + 1) % 4;
+
+        let has_collision = self.collision_check(CollisionVar::Orientation(next_orientation));
+
+        if !has_collision {
+            self.active_piece_orientation = next_orientation;
+        }
+    }
+
+    fn try_move_horizontal(&mut self, col_offset: isize) {
+        let next_active_piece_col = self.active_piece_col + col_offset;
+
+        // Horizontal collision check
+        if next_active_piece_col != self.active_piece_col {
+            let has_collision = self.collision_check(CollisionVar::Col(next_active_piece_col));
+
+            if !has_collision {
+                self.active_piece_col = next_active_piece_col;
+            }
+        }
+    }
+
+    fn set_active_piece_row(&mut self, new_active_piece_row: isize) {
+        self.active_piece_row = new_active_piece_row;
+        self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
+    }
+
+    fn try_gravity_drop(&mut self) {
+        let next_active_piece_row = self.get_next_active_piece_row();
+
+        // Vertical collision check
+        if next_active_piece_row != self.active_piece_row {
+            let has_collision = self.collision_check(CollisionVar::Row(next_active_piece_row));
+
+            if has_collision {
+                self.lock_active_piece();
+                self.next_piece();
+            } else {
+                self.set_active_piece_row(next_active_piece_row);
+            }
+        }
+    }
+
+    pub fn apply_input(&mut self, is_soft_drop: bool, last_key_pressed: Option<KeyCode>) {
+        let speed_modifier = if is_soft_drop { 5 } else { 1 };
+
+        self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as i32;
 
         let mut col_offset = 0;
 
         match last_key_pressed {
             Some(KeyCode::Left) => col_offset = -1,
             Some(KeyCode::Right) => col_offset = 1,
-            Some(KeyCode::Up) => {
-                let next_orientation = (self.active_piece_orientation + 1) % 4;
-
-                let has_collision = self.grid_locked.collision_check(
-                    self.active_piece_row,
-                    self.active_piece_col,
-                    &self.active_piece.get_blocks(next_orientation, false),
-                );
-
-                if !has_collision {
-                    self.active_piece_orientation = next_orientation;
-                }
-            }
-            Some(KeyCode::C) => {
-                self.swap_active_piece();
-            }
-            Some(KeyCode::Space) => {
-                self.hard_drop();
-            }
+            Some(KeyCode::Up) => self.try_rotate_right(),
+            Some(KeyCode::C) => self.swap_active_piece(),
+            Some(KeyCode::Space) => self.hard_drop(),
             _ => (),
         };
 
-        self.next_active_piece_col = self.active_piece_col + col_offset;
+        // Try and move the piece horizontally,
+        self.try_move_horizontal(col_offset);
 
-        // Horizontal collision check
-        if self.next_active_piece_col != self.active_piece_col {
-            let has_collision = self.grid_locked.collision_check(
-                self.active_piece_row,
-                self.next_active_piece_col,
-                &self
-                    .active_piece
-                    .get_blocks(self.active_piece_orientation, false),
-            );
-
-            if !has_collision {
-                self.active_piece_col = self.next_active_piece_col;
-            }
-        }
-
-        // Vertical collision check
-        if self.next_active_piece_row != self.active_piece_row {
-            let has_collision = self.grid_locked.collision_check(
-                self.next_active_piece_row,
-                self.active_piece_col,
-                &self
-                    .active_piece
-                    .get_blocks(self.active_piece_orientation, false),
-            );
-
-            if has_collision {
-                self.grid_locked.set_cells(
-                    self.active_piece_row,
-                    self.active_piece_col,
-                    &self
-                        .active_piece
-                        .get_blocks(self.active_piece_orientation, false),
-                );
-
-                self.active_piece = self.bag_manager.next();
-                self.active_piece_orientation = 0;
-                self.active_piece_col = self.active_piece.get_initial_col();
-                self.active_piece_row = 0;
-                self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
-            } else {
-                self.active_piece_row = self.next_active_piece_row;
-                self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
-            }
-        }
+        // Drop the piece, or lock it if dropping would cause a collision.
+        self.try_gravity_drop();
 
         let active_blocks = self
             .active_piece
@@ -246,7 +273,7 @@ impl GameState {
             .set_cells(ghost_row, self.active_piece_col, &active_blocks);
     }
 
-    fn update_score(&mut self) {
+    fn clear_filled_rows_and_update_score(&mut self) {
         match self.grid_locked.clear_all_filled_rows() {
             1 => self.score += 100,
             2 => self.score += 300,
