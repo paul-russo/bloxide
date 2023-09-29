@@ -16,38 +16,6 @@ enum ShiftDirection {
     Neither,
 }
 
-enum CollisionVar {
-    Row(isize),
-    Col(isize),
-    Orientation(usize),
-}
-
-impl CollisionVar {
-    fn row_or(&self, fallback: isize) -> isize {
-        match &self {
-            CollisionVar::Col(_) => fallback,
-            CollisionVar::Row(value) => *value,
-            CollisionVar::Orientation(_) => fallback,
-        }
-    }
-
-    fn col_or(&self, fallback: isize) -> isize {
-        match &self {
-            CollisionVar::Col(value) => *value,
-            CollisionVar::Row(_) => fallback,
-            CollisionVar::Orientation(_) => fallback,
-        }
-    }
-
-    fn orientation_or(&self, fallback: usize) -> usize {
-        match &self {
-            CollisionVar::Col(_) => fallback,
-            CollisionVar::Row(_) => fallback,
-            CollisionVar::Orientation(value) => *value,
-        }
-    }
-}
-
 pub struct GameState {
     grid_locked: Grid,
     grid_active: Grid,
@@ -199,24 +167,50 @@ impl GameState {
         }
     }
 
-    fn collision_check(&self, collision_var: CollisionVar) -> bool {
+    fn collide(
+        &self,
+        row_id: Option<isize>,
+        col_id: Option<isize>,
+        orientation: Option<usize>,
+    ) -> bool {
         self.grid_locked.collision_check(
-            collision_var.row_or(self.active_piece_row),
-            collision_var.col_or(self.active_piece_col),
-            &self.active_piece.get_blocks(
-                collision_var.orientation_or(self.active_piece_orientation),
-                false,
-            ),
+            row_id.unwrap_or(self.active_piece_row),
+            col_id.unwrap_or(self.active_piece_col),
+            &self
+                .active_piece
+                .get_blocks(orientation.unwrap_or(self.active_piece_orientation), false),
         )
     }
 
     fn try_rotate_right(&mut self) {
         let next_orientation = (self.active_piece_orientation + 1) % 4;
 
-        let has_collision = self.collision_check(CollisionVar::Orientation(next_orientation));
+        let offsets_a = self.active_piece.orientations[self.active_piece_orientation].offsets;
+        let offsets_b = self.active_piece.orientations[next_orientation].offsets;
 
-        if !has_collision {
-            self.active_piece_orientation = next_orientation;
+        for index in 0..offsets_a.len() {
+            let offset_col = offsets_a[index].0 - offsets_b[index].0;
+            let offset_row = offsets_a[index].1 - offsets_b[index].1;
+
+            // I'm subtracting the offset from active_piece_row instead of adding it here,
+            // because rows are counted from the bottom in the Guideline. They're counted
+            // in the other direction in my Grid implementation, so the offsets I copied
+            // from the Guideline have to get applied backwards here.
+            let next_active_piece_row = self.active_piece_row - offset_row;
+            let next_active_piece_col = self.active_piece_col + offset_col;
+
+            let has_collision = self.collide(
+                Some(next_active_piece_row),
+                Some(next_active_piece_col),
+                Some(next_orientation),
+            );
+
+            if !has_collision {
+                self.active_piece_orientation = next_orientation;
+                self.active_piece_row = next_active_piece_row;
+                self.active_piece_col = next_active_piece_col;
+                return;
+            }
         }
     }
 
@@ -281,7 +275,7 @@ impl GameState {
 
         // Horizontal collision check
         if next_active_piece_col != self.active_piece_col {
-            let has_collision = self.collision_check(CollisionVar::Col(next_active_piece_col));
+            let has_collision = self.collide(None, Some(next_active_piece_col), None);
 
             if !has_collision {
                 self.active_piece_col = next_active_piece_col;
@@ -289,7 +283,7 @@ impl GameState {
         }
     }
 
-    fn set_active_piece_row(&mut self, new_active_piece_row: isize) {
+    fn set_active_piece_row_and_reset_ticks(&mut self, new_active_piece_row: isize) {
         self.active_piece_row = new_active_piece_row;
         self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
     }
@@ -299,13 +293,13 @@ impl GameState {
 
         // Vertical collision check
         if next_active_piece_row != self.active_piece_row {
-            let has_collision = self.collision_check(CollisionVar::Row(next_active_piece_row));
+            let has_collision = self.collide(Some(next_active_piece_row), None, None);
 
             if has_collision {
                 self.lock_active_piece();
                 self.next_piece();
             } else {
-                self.set_active_piece_row(next_active_piece_row);
+                self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
             }
         }
     }
