@@ -5,6 +5,8 @@ use macroquad::prelude::KeyCode;
 use crate::{bag_manager::BagManager, grid::Grid, piece::Piece};
 
 const TICKS_PER_SECOND: f32 = 60.0;
+const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
+const G_SOFT_DROP: f32 = 30.0 / 60.0; // 1/2G. 30 rows per 60 ticks (1 second)
 
 enum CollisionVar {
     Row(isize),
@@ -44,17 +46,18 @@ pub struct GameState {
     grid_ghost: Grid,
     bag_manager: BagManager,
     active_piece: Piece,
-    gravity: f32,
-    score: u32,
-    tick: u32,
-    last_tick: u32,
+    score: usize,
+    tick: usize,
+    last_tick: usize,
     start: Instant,
     active_piece_col: isize,
     active_piece_row: isize,
     active_piece_orientation: usize,
-    ticks_to_next_row_inc: i32,
+    ticks_to_next_row_inc: isize,
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
+    rows_cleared: usize,
+    level: usize,
 }
 
 impl GameState {
@@ -64,14 +67,14 @@ impl GameState {
         let grid_ghost = Grid::new();
         let mut bag_manager = BagManager::new();
         let active_piece = bag_manager.next();
-        let gravity: f32 = 1.0 / 60.0; // 1 row per 60 ticks (1 second)
-        let score: u32 = 0;
-        let tick: u32 = 0;
-        let last_tick: u32 = 0;
+        let score: usize = 0;
+        let tick: usize = 0;
+        let last_tick: usize = 0;
         let active_piece_col = active_piece.get_initial_col();
-        let active_piece_row = 0;
+        let active_piece_row = 1;
         let active_piece_orientation: usize = 0;
-        let ticks_to_next_row_inc: i32 = (1.0 / gravity).ceil() as i32;
+        let gravity: f32 = INITIAL_GRAVITY;
+        let ticks_to_next_row_inc: isize = (1.0 / gravity).ceil() as isize;
         let start = Instant::now();
 
         Self {
@@ -80,7 +83,6 @@ impl GameState {
             grid_ghost,
             bag_manager,
             active_piece,
-            gravity,
             score,
             tick,
             last_tick,
@@ -91,11 +93,13 @@ impl GameState {
             ticks_to_next_row_inc,
             held_piece: None,
             last_piece_swapped: false,
+            rows_cleared: 0,
+            level: 1,
         }
     }
 
-    pub fn start_tick(&mut self) -> u32 {
-        self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as u32;
+    pub fn start_tick(&mut self) -> usize {
+        self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
         self.tick
     }
 
@@ -108,15 +112,19 @@ impl GameState {
 
     /// Returns the number of ticks elapsed between the last rendered tick and the current one.
     /// At 60fps or higher, this should be either 1 or 0. It may be more than 1 at lower frame rates.
-    pub fn get_tick_delta(&self) -> u32 {
+    pub fn get_tick_delta(&self) -> usize {
         self.tick - self.last_tick
+    }
+
+    fn get_new_ticks_to_next_row_inc(&self) -> isize {
+        (1.0 / self.get_gravity()).ceil() as isize
     }
 
     fn reset_piece_state(&mut self) {
         self.active_piece_orientation = 0;
         self.active_piece_col = self.active_piece.get_initial_col();
-        self.active_piece_row = 0;
-        self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
+        self.active_piece_row = 1;
+        self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
         self.last_piece_swapped = false;
     }
 
@@ -215,7 +223,7 @@ impl GameState {
 
     fn set_active_piece_row(&mut self, new_active_piece_row: isize) {
         self.active_piece_row = new_active_piece_row;
-        self.ticks_to_next_row_inc = (1.0 / self.gravity).ceil() as i32;
+        self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
     }
 
     fn try_gravity_drop(&mut self) {
@@ -235,9 +243,13 @@ impl GameState {
     }
 
     pub fn apply_input(&mut self, is_soft_drop: bool, last_key_pressed: Option<KeyCode>) {
-        let speed_modifier = if is_soft_drop { 5 } else { 1 };
+        let speed_modifier = if is_soft_drop {
+            (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
+        } else {
+            1
+        };
 
-        self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as i32;
+        self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as isize;
 
         let mut col_offset = 0;
 
@@ -273,14 +285,23 @@ impl GameState {
             .set_cells(ghost_row, self.active_piece_col, &active_blocks);
     }
 
+    fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
+        self.rows_cleared += new_rows_cleared;
+        self.level = (self.rows_cleared as f32 / 10.0).ceil().max(1.0) as usize;
+    }
+
     fn clear_filled_rows_and_update_score(&mut self) {
-        match self.grid_locked.clear_all_filled_rows() {
+        let rows_cleared = self.grid_locked.clear_all_filled_rows();
+
+        match rows_cleared {
             1 => self.score += 100,
             2 => self.score += 300,
             3 => self.score += 500,
             4 => self.score += 800,
             _ => (),
-        }
+        };
+
+        self.increase_rows_cleared(rows_cleared);
     }
 
     pub fn get_grid_locked(&self) -> &Grid {
@@ -295,8 +316,16 @@ impl GameState {
         &self.grid_ghost
     }
 
-    pub fn get_score(&self) -> u32 {
+    pub fn get_score(&self) -> usize {
         self.score
+    }
+
+    pub fn get_level(&self) -> usize {
+        self.level
+    }
+
+    pub fn get_gravity(&self) -> f32 {
+        self.level as f32 / 60.0
     }
 
     pub fn get_piece_previews(&self) -> Vec<Piece> {

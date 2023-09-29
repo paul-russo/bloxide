@@ -1,6 +1,8 @@
 use crate::block::Block;
 
-pub const GRID_COUNT_ROWS: usize = 20;
+pub const VISIBLE_GRID_COUNT_ROWS: usize = 20;
+pub const GRID_COUNT_ROWS: usize = 22;
+pub const FIRST_VISIBLE_ROW_ID: usize = GRID_COUNT_ROWS - VISIBLE_GRID_COUNT_ROWS;
 pub const GRID_COUNT_COLS: usize = 10;
 
 #[derive(Debug)]

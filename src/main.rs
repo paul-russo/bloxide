@@ -7,14 +7,14 @@ mod utils;
 
 use block::Block;
 use game_state::GameState;
-use grid::{Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS};
+use grid::{Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS, VISIBLE_GRID_COUNT_ROWS};
 use macroquad::prelude::*;
 use piece::Piece;
 
 const BLOCK_SIZE: f32 = 20.0;
 const PLAYFIELD_OFFSET_Y: f32 = 40.0;
 const PLAYFIELD_WIDTH: f32 = GRID_COUNT_COLS as f32 * BLOCK_SIZE + OUTLINE_WIDTH;
-const PLAYFIELD_HEIGHT: f32 = GRID_COUNT_ROWS as f32 * BLOCK_SIZE + OUTLINE_WIDTH;
+const PLAYFIELD_HEIGHT: f32 = VISIBLE_GRID_COUNT_ROWS as f32 * BLOCK_SIZE + OUTLINE_WIDTH;
 const OUTLINE_WIDTH: f32 = 2.0;
 const PREVIEW_WIDTH: f32 =
     PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_X * 2.0);
@@ -99,14 +99,14 @@ fn draw_block(
 }
 
 fn draw_grid(grid: &Grid, opacity: f32) {
-    for row_id in 0..GRID_COUNT_ROWS {
+    for row_id in FIRST_VISIBLE_ROW_ID..GRID_COUNT_ROWS {
         for col_id in 0..GRID_COUNT_COLS {
             let cell = grid.get_cell(row_id, col_id);
 
             match cell {
                 Some(block) => draw_block(
                     block,
-                    row_id,
+                    row_id - FIRST_VISIBLE_ROW_ID,
                     col_id,
                     OFFSET_INNER_X,
                     OFFSET_INNER_Y,
@@ -119,10 +119,10 @@ fn draw_grid(grid: &Grid, opacity: f32) {
 }
 
 fn draw_debug_info(
-    tick: u32,
+    tick: usize,
     gravity: f32,
     last_key_pressed: Option<KeyCode>,
-    speed_modifier: u32,
+    speed_modifier: usize,
 ) {
     draw_text(
         &format!("tick: {}", tick),
@@ -165,11 +165,21 @@ fn draw_debug_info(
     );
 }
 
-fn draw_score(score: u32) {
+fn draw_score(score: usize) {
     draw_text(
         &format!("score: {}", score),
         PLAYFIELD_OFFSET_X,
         PLAYFIELD_OFFSET_Y - 10.0,
+        32.0,
+        WHITE,
+    );
+}
+
+fn draw_level(level: usize) {
+    draw_text(
+        &format!("Level {}", level),
+        PREVIEW_OFFSET_X,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 10.0,
         32.0,
         WHITE,
     );
@@ -278,6 +288,7 @@ async fn main() {
 
         clear_background(BLACK);
         draw_score(game_state.get_score());
+        draw_level(game_state.get_level());
         draw_playfield();
         draw_grid(game_state.get_grid_locked(), 1.0);
         draw_grid(game_state.get_grid_active(), 1.0);
