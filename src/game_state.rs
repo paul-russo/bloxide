@@ -8,7 +8,7 @@ const TICKS_PER_SECOND: f32 = 60.0;
 const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
 const G_SOFT_DROP: f32 = 30.0 / 60.0; // 1/2G. 30 rows per 60 ticks (1 second)
 const REPEAT_DELAY_TICKS: isize = 11; // ~183ms. Delay before repeating horizontal movement.
-const REPEAT_INTERVAL_TICKS: isize = 3; // ~50ms. Repeat interval for horizontal movement.
+const REPEAT_INTERVAL_TICKS: isize = 4; // ~67ms, or 15 times per second. Repeat interval for horizontal movement.
 
 enum ShiftDirection {
     Left,
