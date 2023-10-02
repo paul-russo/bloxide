@@ -9,6 +9,8 @@ const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
 const G_SOFT_DROP: f32 = 30.0 / 60.0; // 1/2G. 30 rows per 60 ticks (1 second)
 const REPEAT_DELAY_TICKS: isize = 11; // ~183ms. Delay before repeating horizontal movement.
 const REPEAT_INTERVAL_TICKS: isize = 4; // ~67ms, or 15 times per second. Repeat interval for horizontal movement.
+const LOCK_DELAY_TICKS: isize = 30; // 30 ticks, 500ms. Delay after which the active piece is locked in place.
+const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before lock delay can no longer be reset.
 
 enum ShiftDirection {
     Left,
@@ -31,11 +33,12 @@ pub struct GameState {
     active_piece_orientation: usize,
     ticks_to_next_row_inc: isize,
     ticks_to_repeat: isize,
+    ticks_to_lock: isize,
+    lock_reset_moves_remaining: isize,
     shift_direction: ShiftDirection,
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
     rows_cleared: usize,
-    level: usize,
 }
 
 impl GameState {
@@ -70,11 +73,12 @@ impl GameState {
             active_piece_orientation,
             ticks_to_next_row_inc,
             ticks_to_repeat: REPEAT_DELAY_TICKS,
+            ticks_to_lock: LOCK_DELAY_TICKS,
+            lock_reset_moves_remaining: RESET_MOVES,
             shift_direction: ShiftDirection::Neither,
             held_piece: None,
             last_piece_swapped: false,
             rows_cleared: 0,
-            level: 1,
         }
     }
 
@@ -106,6 +110,20 @@ impl GameState {
         self.active_piece_row = 1;
         self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
         self.last_piece_swapped = false;
+        self.ticks_to_lock = LOCK_DELAY_TICKS;
+        self.lock_reset_moves_remaining = RESET_MOVES;
+    }
+
+    fn try_reset_lock_delay_for_move(&mut self) {
+        println!(
+            "moves: {}, ticks_to_lock: {}",
+            self.lock_reset_moves_remaining, self.ticks_to_lock
+        );
+
+        if self.lock_reset_moves_remaining > 0 {
+            self.lock_reset_moves_remaining -= 1;
+            self.ticks_to_lock = LOCK_DELAY_TICKS;
+        }
     }
 
     fn set_active_piece_and_reset_state(&mut self, active_piece: Piece) {
@@ -209,12 +227,14 @@ impl GameState {
                 self.active_piece_orientation = next_orientation;
                 self.active_piece_row = next_active_piece_row;
                 self.active_piece_col = next_active_piece_col;
+                self.try_reset_lock_delay_for_move();
+
                 return;
             }
         }
     }
 
-    fn set_shift_direction(&mut self, new_shift_direction: ShiftDirection) {
+    fn set_shift_direction_and_reset_ticks(&mut self, new_shift_direction: ShiftDirection) {
         self.ticks_to_repeat = REPEAT_DELAY_TICKS;
         self.shift_direction = new_shift_direction;
     }
@@ -224,14 +244,14 @@ impl GameState {
         let mut col_offset = 0;
 
         if !is_shift_left && !is_shift_right {
-            return self.set_shift_direction(ShiftDirection::Neither);
+            return self.set_shift_direction_and_reset_ticks(ShiftDirection::Neither);
         }
 
         match self.shift_direction {
             ShiftDirection::Left => {
                 if !is_shift_left {
                     if is_shift_right {
-                        self.set_shift_direction(ShiftDirection::Right);
+                        self.set_shift_direction_and_reset_ticks(ShiftDirection::Right);
                         col_offset = 1;
                     }
                 } else {
@@ -242,7 +262,7 @@ impl GameState {
             ShiftDirection::Right => {
                 if !is_shift_right {
                     if is_shift_left {
-                        self.set_shift_direction(ShiftDirection::Left);
+                        self.set_shift_direction_and_reset_ticks(ShiftDirection::Left);
                         col_offset = -1;
                     }
                 } else {
@@ -252,10 +272,10 @@ impl GameState {
 
             ShiftDirection::Neither => {
                 if is_shift_left {
-                    self.set_shift_direction(ShiftDirection::Left);
+                    self.set_shift_direction_and_reset_ticks(ShiftDirection::Left);
                     col_offset = -1;
                 } else if is_shift_right {
-                    self.set_shift_direction(ShiftDirection::Right);
+                    self.set_shift_direction_and_reset_ticks(ShiftDirection::Right);
                     col_offset = 1;
                 }
             }
@@ -279,6 +299,7 @@ impl GameState {
 
             if !has_collision {
                 self.active_piece_col = next_active_piece_col;
+                self.try_reset_lock_delay_for_move();
             }
         }
     }
@@ -286,6 +307,10 @@ impl GameState {
     fn set_active_piece_row_and_reset_ticks(&mut self, new_active_piece_row: isize) {
         self.active_piece_row = new_active_piece_row;
         self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
+        self.lock_reset_moves_remaining = RESET_MOVES;
+        self.ticks_to_lock = LOCK_DELAY_TICKS;
+
+        println!("RESET TICKS!");
     }
 
     fn try_gravity_drop(&mut self) {
@@ -296,8 +321,17 @@ impl GameState {
             let has_collision = self.collide(Some(next_active_piece_row), None, None);
 
             if has_collision {
-                self.lock_active_piece();
-                self.next_piece();
+                self.ticks_to_lock -= self.get_tick_delta() as isize;
+
+                // TODO: Need to mitigate "stalling" with certain pieces that can floor kick, as the gravity drop
+                // will reset the move counter and allow for infinite stalling.
+                // Tetra Legends seems to store the row at which contact was last made, and only reset the move
+                // counter when the piece descends below that row. This allows for spinning out of cliffs, but
+                // prevents stalling at a given row.
+                if self.ticks_to_lock <= 0 {
+                    self.lock_active_piece();
+                    self.next_piece();
+                }
             } else {
                 self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
             }
@@ -351,17 +385,17 @@ impl GameState {
 
     fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
         self.rows_cleared += new_rows_cleared;
-        self.level = (self.rows_cleared as f32 / 10.0).ceil().max(1.0) as usize;
     }
 
     fn clear_filled_rows_and_update_score(&mut self) {
         let rows_cleared = self.grid_locked.clear_all_filled_rows();
+        let level = self.get_level();
 
         match rows_cleared {
-            1 => self.score += 100,
-            2 => self.score += 300,
-            3 => self.score += 500,
-            4 => self.score += 800,
+            1 => self.score += 100 * level,
+            2 => self.score += 300 * level,
+            3 => self.score += 500 * level,
+            4 => self.score += 800 * level,
             _ => (),
         };
 
@@ -385,11 +419,18 @@ impl GameState {
     }
 
     pub fn get_level(&self) -> usize {
-        self.level
+        // Minimum level is 1. Maximum is 20.
+        (self.rows_cleared as f32 / 10.0).ceil().max(1.0).min(20.0) as usize
     }
 
     pub fn get_gravity(&self) -> f32 {
-        self.level as f32 / 60.0
+        let level = self.get_level();
+        let gravity_seconds = (0.8 - ((level - 1) as f32 * 0.007)).powi(level as i32 - 1);
+        let gravity_ticks_per_row = 1.0 / gravity_seconds;
+        let gravity = gravity_ticks_per_row / 60.0;
+
+        // Cap at 1G, or 1 row per tick.
+        gravity.min(1.0)
     }
 
     pub fn get_piece_previews(&self) -> Vec<Piece> {
