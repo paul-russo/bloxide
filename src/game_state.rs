@@ -165,13 +165,18 @@ impl GameState {
     }
 
     fn hard_drop(&mut self) {
-        self.active_piece_row = self.grid_locked.find_landing_row(
+        let landing_row = self.grid_locked.find_landing_row(
             self.active_piece_row,
             self.active_piece_col,
             &self
                 .active_piece
                 .get_blocks(self.active_piece_orientation, false),
         );
+
+        let lines_dropped = (landing_row - self.active_piece_row).max(0);
+        self.active_piece_row = landing_row;
+
+        self.score += 2 * lines_dropped as usize;
 
         self.lock_active_piece();
         self.next_piece();
@@ -313,7 +318,7 @@ impl GameState {
         println!("RESET TICKS!");
     }
 
-    fn try_gravity_drop(&mut self) {
+    fn try_gravity_drop(&mut self, is_soft_drop: bool) {
         let next_active_piece_row = self.get_next_active_piece_row();
 
         // Vertical collision check
@@ -333,6 +338,10 @@ impl GameState {
                     self.next_piece();
                 }
             } else {
+                if is_soft_drop {
+                    self.score += 1;
+                }
+
                 self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
             }
         }
@@ -364,7 +373,7 @@ impl GameState {
         self.try_move_horizontal(is_shift_left, is_shift_right);
 
         // Drop the piece, or lock it if dropping would cause a collision.
-        self.try_gravity_drop();
+        self.try_gravity_drop(is_soft_drop);
 
         let active_blocks = self
             .active_piece
