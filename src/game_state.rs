@@ -39,6 +39,7 @@ pub struct GameState {
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
     rows_cleared: usize,
+    is_game_over: bool,
 }
 
 impl GameState {
@@ -79,15 +80,24 @@ impl GameState {
             held_piece: None,
             last_piece_swapped: false,
             rows_cleared: 0,
+            is_game_over: false,
         }
     }
 
-    pub fn start_tick(&mut self) -> usize {
+    pub fn start_tick(&mut self) -> Option<usize> {
+        if self.is_game_over {
+            return None;
+        }
+
         self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
-        self.tick
+        Some(self.tick)
     }
 
     pub fn end_tick(&mut self) {
+        if self.is_game_over {
+            return;
+        }
+
         self.last_tick = self.tick;
         self.clear_filled_rows_and_update_score();
         self.grid_active.clear();
@@ -96,7 +106,7 @@ impl GameState {
 
     /// Returns the number of ticks elapsed between the last rendered tick and the current one.
     /// At 60fps or higher, this should be either 1 or 0. It may be more than 1 at lower frame rates.
-    pub fn get_tick_delta(&self) -> usize {
+    fn get_tick_delta(&self) -> usize {
         self.tick - self.last_tick
     }
 
@@ -126,9 +136,29 @@ impl GameState {
         }
     }
 
+    fn end_game(&mut self) {
+        self.end_tick();
+        self.is_game_over = true;
+    }
+
+    // Check for a piece spawned overlapping at least one block in the playfield (Block Out)
+    fn check_for_block_out(&self) -> bool {
+        self.collide(
+            Some(self.active_piece_row),
+            Some(self.active_piece_col),
+            Some(self.active_piece_orientation),
+        )
+    }
+
     fn set_active_piece_and_reset_state(&mut self, active_piece: Piece) {
         self.active_piece = active_piece;
         self.reset_piece_state();
+        let is_block_out = self.check_for_block_out();
+
+        if is_block_out {
+            println!("BLOCK OUT!!!!!!");
+            self.end_game();
+        }
     }
 
     fn next_piece(&mut self) {
@@ -354,6 +384,10 @@ impl GameState {
         is_shift_right: bool,
         last_key_pressed: Option<KeyCode>,
     ) {
+        if self.is_game_over {
+            return;
+        }
+
         let speed_modifier = if is_soft_drop {
             (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
         } else {
@@ -452,5 +486,9 @@ impl GameState {
 
     pub fn get_held_piece(&self) -> Option<Piece> {
         self.held_piece
+    }
+
+    pub fn get_is_game_over(&self) -> bool {
+        self.is_game_over
     }
 }

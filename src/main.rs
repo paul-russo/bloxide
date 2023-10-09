@@ -185,6 +185,24 @@ fn draw_level(level: usize) {
     );
 }
 
+fn draw_game_over_screen() {
+    draw_rectangle(
+        PLAYFIELD_OFFSET_X,
+        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) - 32.0,
+        PLAYFIELD_WIDTH,
+        64.0,
+        color_u8!(80, 80, 80, 255),
+    );
+
+    draw_text(
+        "GAME OVER",
+        PLAYFIELD_OFFSET_X + 38.0,
+        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) + 8.0,
+        32.0,
+        WHITE,
+    );
+}
+
 fn draw_piece(piece: Piece, orientation: usize, offset_x: f32, offset_y: f32) {
     let blocks = piece.get_blocks(orientation, true);
 
@@ -303,7 +321,11 @@ async fn main() {
 
         // draw_debug_info(tick, gravity, last_key_pressed, speed_modifier);
 
-        game_state.end_tick(); // new
+        if game_state.get_is_game_over() {
+            draw_game_over_screen();
+        }
+
+        game_state.end_tick();
 
         next_frame().await
     }
