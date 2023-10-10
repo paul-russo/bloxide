@@ -90,6 +90,26 @@ impl Grid {
         false
     }
 
+    /// Check if the given canvas, positioned at the given row_offset, would be entirely outside of
+    /// the visible bounds of the playfield.
+    pub fn invisible_check(&self, row_offset: isize, canvas: &Vec<Vec<Option<Block>>>) -> bool {
+        for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
+            for (_canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
+                if canvas_cell.is_some() {
+                    let grid_row_id = canvas_row_id as isize + row_offset;
+
+                    // If any row ID would be at or below the first visible row, then this canvas would not be
+                    // entirely invisible, and we can return false.
+                    if grid_row_id >= FIRST_VISIBLE_ROW_ID as isize {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
     pub fn find_landing_row(
         &self,
         row_offset: isize,

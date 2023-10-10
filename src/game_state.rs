@@ -141,19 +141,22 @@ impl GameState {
         self.is_game_over = true;
     }
 
-    // Check for a piece spawned overlapping at least one block in the playfield (Block Out)
-    fn check_for_block_out(&self) -> bool {
-        self.collide(
-            Some(self.active_piece_row),
-            Some(self.active_piece_col),
-            Some(self.active_piece_orientation),
+    /// Check if the active piece, if it were locked, would be entirely outside the visible bounds of the playfield.
+    fn check_for_lock_out(&self) -> bool {
+        self.grid_locked.invisible_check(
+            self.active_piece_row,
+            &self
+                .active_piece
+                .get_blocks(self.active_piece_orientation, false),
         )
     }
 
     fn set_active_piece_and_reset_state(&mut self, active_piece: Piece) {
         self.active_piece = active_piece;
         self.reset_piece_state();
-        let is_block_out = self.check_for_block_out();
+
+        // Check for a piece spawned overlapping at least one block in the playfield (Block Out)
+        let is_block_out = self.collide(None, None, None);
 
         if is_block_out {
             println!("BLOCK OUT!!!!!!");
@@ -184,7 +187,13 @@ impl GameState {
         self.last_piece_swapped = true;
     }
 
-    fn lock_active_piece(&mut self) {
+    fn lock_active_piece_and_get_next(&mut self) {
+        if self.check_for_lock_out() {
+            println!("LOCK OUT!!!!!!");
+            self.end_game();
+            return;
+        }
+
         self.grid_locked.set_cells(
             self.active_piece_row,
             self.active_piece_col,
@@ -192,6 +201,8 @@ impl GameState {
                 .active_piece
                 .get_blocks(self.active_piece_orientation, false),
         );
+
+        self.next_piece();
     }
 
     fn hard_drop(&mut self) {
@@ -208,8 +219,7 @@ impl GameState {
 
         self.score += 2 * lines_dropped as usize;
 
-        self.lock_active_piece();
-        self.next_piece();
+        self.lock_active_piece_and_get_next();
     }
 
     fn get_next_active_piece_row(&self) -> isize {
@@ -364,8 +374,7 @@ impl GameState {
                 // counter when the piece descends below that row. This allows for spinning out of cliffs, but
                 // prevents stalling at a given row.
                 if self.ticks_to_lock <= 0 {
-                    self.lock_active_piece();
-                    self.next_piece();
+                    self.lock_active_piece_and_get_next();
                 }
             } else {
                 if is_soft_drop {
