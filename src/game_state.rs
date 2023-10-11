@@ -12,6 +12,16 @@ const REPEAT_INTERVAL_TICKS: isize = 4; // ~67ms, or 15 times per second. Repeat
 const LOCK_DELAY_TICKS: isize = 30; // 30 ticks, 500ms. Delay after which the active piece is locked in place.
 const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before lock delay can no longer be reset.
 
+#[derive(Debug, Default)]
+pub struct GameInput {
+    pub soft_drop: bool,
+    pub shift_left: bool,
+    pub shift_right: bool,
+    pub rotate_right: bool,
+    pub hard_drop: bool,
+    pub hold_piece: bool,
+}
+
 enum ShiftDirection {
     Left,
     Right,
@@ -40,6 +50,7 @@ pub struct GameState {
     last_piece_swapped: bool,
     rows_cleared: usize,
     is_game_over: bool,
+    is_paused: bool,
 }
 
 impl GameState {
@@ -81,19 +92,11 @@ impl GameState {
             last_piece_swapped: false,
             rows_cleared: 0,
             is_game_over: false,
+            is_paused: false,
         }
     }
 
-    pub fn start_tick(&mut self) -> Option<usize> {
-        if self.is_game_over {
-            return None;
-        }
-
-        self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
-        Some(self.tick)
-    }
-
-    pub fn end_tick(&mut self) {
+    pub fn clean_up(&mut self) {
         if self.is_game_over {
             return;
         }
@@ -137,7 +140,7 @@ impl GameState {
     }
 
     fn end_game(&mut self) {
-        self.end_tick();
+        self.clean_up();
         self.is_game_over = true;
     }
 
@@ -386,18 +389,14 @@ impl GameState {
         }
     }
 
-    pub fn apply_input(
-        &mut self,
-        is_soft_drop: bool,
-        is_shift_left: bool,
-        is_shift_right: bool,
-        last_key_pressed: Option<KeyCode>,
-    ) {
+    pub fn update(&mut self, input: GameInput) {
         if self.is_game_over {
             return;
         }
 
-        let speed_modifier = if is_soft_drop {
+        self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
+
+        let speed_modifier = if input.soft_drop {
             (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
         } else {
             1
@@ -405,18 +404,23 @@ impl GameState {
 
         self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as isize;
 
-        match last_key_pressed {
-            Some(KeyCode::Up) => self.try_rotate_right(),
-            Some(KeyCode::C) => self.swap_active_piece(),
-            Some(KeyCode::Space) => self.hard_drop(),
-            _ => (),
-        };
+        if input.hold_piece {
+            self.swap_active_piece();
+        }
+
+        if input.rotate_right {
+            self.try_rotate_right();
+        }
+
+        if input.hard_drop {
+            self.hard_drop();
+        }
 
         // Try and move the piece horizontally,
-        self.try_move_horizontal(is_shift_left, is_shift_right);
+        self.try_move_horizontal(input.shift_left, input.shift_right);
 
         // Drop the piece, or lock it if dropping would cause a collision.
-        self.try_gravity_drop(is_soft_drop);
+        self.try_gravity_drop(input.soft_drop);
 
         let active_blocks = self
             .active_piece

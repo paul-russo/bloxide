@@ -6,7 +6,7 @@ mod piece;
 mod utils;
 
 use block::Block;
-use game_state::GameState;
+use game_state::{GameInput, GameState};
 use grid::{Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS, VISIBLE_GRID_COUNT_ROWS};
 use macroquad::prelude::*;
 use piece::Piece;
@@ -298,16 +298,14 @@ async fn main() {
     let mut game_state = GameState::new();
 
     loop {
-        game_state.start_tick();
-
-        let last_key_pressed = get_last_key_pressed();
-
-        game_state.apply_input(
-            is_key_down(KeyCode::Down),
-            is_key_down(KeyCode::Left),
-            is_key_down(KeyCode::Right),
-            last_key_pressed,
-        );
+        game_state.update(GameInput {
+            soft_drop: is_key_down(KeyCode::Down),
+            shift_left: is_key_down(KeyCode::Left),
+            shift_right: is_key_down(KeyCode::Right),
+            rotate_right: is_key_pressed(KeyCode::Up),
+            hard_drop: is_key_pressed(KeyCode::Space),
+            hold_piece: is_key_pressed(KeyCode::C),
+        });
 
         clear_background(BLACK);
         draw_score(game_state.get_score());
@@ -325,8 +323,7 @@ async fn main() {
             draw_game_over_screen();
         }
 
-        game_state.end_tick();
-
+        game_state.clean_up();
         next_frame().await
     }
 }
