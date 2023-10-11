@@ -18,20 +18,23 @@ impl Grid {
         Self { rows }
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> &mut Self {
         for row_id in 0..GRID_COUNT_ROWS {
             for col_id in 0..GRID_COUNT_COLS {
                 self.rows[row_id][col_id] = None
             }
         }
+
+        self
     }
 
-    pub fn set_cell(&mut self, row_id: usize, col_id: usize, value: Option<Block>) {
+    pub fn set_cell(&mut self, row_id: usize, col_id: usize, value: Option<Block>) -> &mut Self {
         if row_id >= GRID_COUNT_ROWS || col_id >= GRID_COUNT_COLS {
-            return;
+            return self;
         }
 
         self.rows[row_id][col_id] = value;
+        self
     }
 
     pub fn set_cells(
@@ -39,7 +42,7 @@ impl Grid {
         row_offset: isize,
         col_offset: isize,
         canvas: &Vec<Vec<Option<Block>>>,
-    ) {
+    ) -> &mut Self {
         for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
             for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
                 if canvas_cell.is_some() {
@@ -61,6 +64,8 @@ impl Grid {
                 }
             }
         }
+
+        self
     }
 
     pub fn collision_check(
@@ -143,12 +148,14 @@ impl Grid {
         self.rows[row_id][col_id].is_some()
     }
 
-    pub fn clear_row(&mut self, row_id: usize) {
+    pub fn clear_row(&mut self, row_id: usize) -> &mut Self {
         if row_id >= GRID_COUNT_ROWS {
-            return;
+            return self;
         }
 
         self.rows[row_id].fill(None);
+
+        self
     }
 
     pub fn is_row_filled(&self, row_id: usize) -> bool {

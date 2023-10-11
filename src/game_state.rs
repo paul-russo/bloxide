@@ -20,6 +20,7 @@ pub struct GameInput {
     pub rotate_right: bool,
     pub hard_drop: bool,
     pub hold_piece: bool,
+    pub toggle_pause: bool,
 }
 
 enum ShiftDirection {
@@ -97,14 +98,11 @@ impl GameState {
     }
 
     pub fn clean_up(&mut self) {
-        if self.is_game_over {
+        if self.is_game_over || self.is_paused {
             return;
         }
 
         self.last_tick = self.tick;
-        self.clear_filled_rows_and_update_score();
-        self.grid_active.clear();
-        self.grid_ghost.clear();
     }
 
     /// Returns the number of ticks elapsed between the last rendered tick and the current one.
@@ -144,6 +142,17 @@ impl GameState {
         self.is_game_over = true;
     }
 
+    fn toggle_pause(&mut self) {
+        if self.is_paused {
+            self.tick = 0;
+            self.last_tick = 0;
+            self.start = Instant::now();
+            self.is_paused = false;
+        } else {
+            self.is_paused = true;
+        }
+    }
+
     /// Check if the active piece, if it were locked, would be entirely outside the visible bounds of the playfield.
     fn check_for_lock_out(&self) -> bool {
         self.grid_locked.invisible_check(
@@ -154,8 +163,8 @@ impl GameState {
         )
     }
 
-    fn set_active_piece_and_reset_state(&mut self, active_piece: Piece) {
-        self.active_piece = active_piece;
+    fn set_active_piece_and_reset_state(&mut self, next_active_piece: Piece) {
+        self.active_piece = next_active_piece;
         self.reset_piece_state();
 
         // Check for a piece spawned overlapping at least one block in the playfield (Block Out)
@@ -168,8 +177,8 @@ impl GameState {
     }
 
     fn next_piece(&mut self) {
-        let active_piece = self.bag_manager.next();
-        self.set_active_piece_and_reset_state(active_piece);
+        let next_active_piece = self.bag_manager.next();
+        self.set_active_piece_and_reset_state(next_active_piece);
     }
 
     fn swap_active_piece(&mut self) {
@@ -204,6 +213,8 @@ impl GameState {
                 .active_piece
                 .get_blocks(self.active_piece_orientation, false),
         );
+
+        self.clear_filled_rows_and_update_score();
 
         self.next_piece();
     }
@@ -390,7 +401,11 @@ impl GameState {
     }
 
     pub fn update(&mut self, input: GameInput) {
-        if self.is_game_over {
+        if input.toggle_pause {
+            self.toggle_pause();
+        }
+
+        if self.is_game_over || self.is_paused {
             return;
         }
 
@@ -426,8 +441,11 @@ impl GameState {
             .active_piece
             .get_blocks(self.active_piece_orientation, false);
 
-        self.grid_active
-            .set_cells(self.active_piece_row, self.active_piece_col, &active_blocks);
+        self.grid_active.clear().set_cells(
+            self.active_piece_row,
+            self.active_piece_col,
+            &active_blocks,
+        );
 
         let ghost_row = self.grid_locked.find_landing_row(
             self.active_piece_row,
@@ -436,6 +454,7 @@ impl GameState {
         );
 
         self.grid_ghost
+            .clear()
             .set_cells(ghost_row, self.active_piece_col, &active_blocks);
     }
 
