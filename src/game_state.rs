@@ -523,4 +523,8 @@ impl GameState {
     pub fn get_is_game_over(&self) -> bool {
         self.is_game_over
     }
+
+    pub fn get_is_paused(&self) -> bool {
+        self.is_paused
+    }
 }

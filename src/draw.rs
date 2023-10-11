@@ -8,9 +8,9 @@ use macroquad::prelude::*;
 
 const BLOCK_SIZE: f32 = 20.0;
 const PLAYFIELD_OFFSET_Y: f32 = 40.0;
+const OUTLINE_WIDTH: f32 = 2.0;
 const PLAYFIELD_WIDTH: f32 = GRID_COUNT_COLS as f32 * BLOCK_SIZE + OUTLINE_WIDTH;
 const PLAYFIELD_HEIGHT: f32 = VISIBLE_GRID_COUNT_ROWS as f32 * BLOCK_SIZE + OUTLINE_WIDTH;
-const OUTLINE_WIDTH: f32 = 2.0;
 const PREVIEW_WIDTH: f32 =
     PREVIEW_PIECE_MAX_BLOCKS_W * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_X * 2.0);
 
@@ -46,6 +46,28 @@ const PREVIEW_OFFSET_INNER_Y: f32 = PREVIEW_OFFSET_Y + (OUTLINE_WIDTH / 2.0) + P
 const HOLD_HEIGHT: f32 =
     PREVIEW_PIECE_MAX_BLOCKS_H * BLOCK_SIZE + OUTLINE_WIDTH + (PREVIEW_PADDING_Y * 2.0);
 
+// Text is ~14 pixels wide per character at 32 pixels tall. 14/32 = 0.4375
+const TEXT_HEIGHT_WIDTH_RATIO: f32 = 0.4375;
+
+fn draw_text_centered(
+    container_width: f32,
+    container_height: f32,
+    text: &str,
+    offset_x: f32,
+    offset_y: f32,
+    text_size: f32,
+    color: Color,
+) {
+    draw_text(
+        text,
+        offset_x
+            + ((container_width - (text.len() as f32 * text_size * TEXT_HEIGHT_WIDTH_RATIO)) / 2.0),
+        offset_y + (container_height / 2.0) + 8.0,
+        text_size,
+        color,
+    );
+}
+
 fn draw_playfield() {
     draw_rectangle_lines(
         PLAYFIELD_OFFSET_X,
@@ -77,7 +99,7 @@ fn draw_level(level: usize) {
     );
 }
 
-fn draw_game_over_screen() {
+fn draw_banner(text: &str) {
     draw_rectangle(
         PLAYFIELD_OFFSET_X,
         PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) - 32.0,
@@ -86,10 +108,12 @@ fn draw_game_over_screen() {
         color_u8!(80, 80, 80, 255),
     );
 
-    draw_text(
-        "GAME OVER",
-        PLAYFIELD_OFFSET_X + 38.0,
-        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) + 8.0,
+    draw_text_centered(
+        PLAYFIELD_WIDTH,
+        PLAYFIELD_HEIGHT,
+        text,
+        PLAYFIELD_OFFSET_X,
+        PLAYFIELD_OFFSET_Y,
         32.0,
         WHITE,
     );
@@ -178,7 +202,11 @@ impl Drawable for GameState {
         draw_held_piece(self.get_held_piece());
 
         if self.get_is_game_over() {
-            draw_game_over_screen();
+            draw_banner("GAME OVER");
+        }
+
+        if self.get_is_paused() {
+            draw_banner("PAUSED");
         }
     }
 }
