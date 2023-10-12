@@ -5,6 +5,7 @@ use crate::grid::{
 };
 use crate::piece::Piece;
 use macroquad::prelude::*;
+use num_format::{Locale, ToFormattedString};
 
 const BLOCK_SIZE: f32 = 20.0;
 const PLAYFIELD_OFFSET_Y: f32 = 40.0;
@@ -51,7 +52,7 @@ const TEXT_HEIGHT_WIDTH_RATIO: f32 = 0.4375;
 
 fn draw_text_centered(
     container_width: f32,
-    container_height: f32,
+    container_height: Option<f32>,
     text: &str,
     offset_x: f32,
     offset_y: f32,
@@ -62,7 +63,7 @@ fn draw_text_centered(
         text,
         offset_x
             + ((container_width - (text.len() as f32 * text_size * TEXT_HEIGHT_WIDTH_RATIO)) / 2.0),
-        offset_y + (container_height / 2.0) + 8.0,
+        offset_y + (container_height.unwrap_or(0.0) / 2.0),
         text_size,
         color,
     );
@@ -80,11 +81,25 @@ fn draw_playfield() {
 }
 
 fn draw_score(score: usize) {
-    draw_text(
-        &format!("score: {}", score),
+    let text = &(score * 100).to_formatted_string(&Locale::en);
+
+    draw_text_centered(
+        PLAYFIELD_WIDTH,
+        None,
+        text,
+        PLAYFIELD_OFFSET_X + 1.0,
+        PLAYFIELD_OFFSET_Y - 9.0,
+        40.0,
+        color_u8!(224, 127, 58, 255),
+    );
+
+    draw_text_centered(
+        PLAYFIELD_WIDTH,
+        None,
+        text,
         PLAYFIELD_OFFSET_X,
         PLAYFIELD_OFFSET_Y - 10.0,
-        32.0,
+        40.0,
         WHITE,
     );
 }
@@ -110,10 +125,10 @@ fn draw_banner(text: &str) {
 
     draw_text_centered(
         PLAYFIELD_WIDTH,
-        PLAYFIELD_HEIGHT,
+        Some(PLAYFIELD_HEIGHT),
         text,
         PLAYFIELD_OFFSET_X,
-        PLAYFIELD_OFFSET_Y,
+        PLAYFIELD_OFFSET_Y + 8.0,
         32.0,
         WHITE,
     );

@@ -1,8 +1,5 @@
-use std::time::Instant;
-
-use macroquad::prelude::KeyCode;
-
 use crate::{bag_manager::BagManager, grid::Grid, piece::Piece};
+use std::time::Instant;
 
 const TICKS_PER_SECOND: f32 = 60.0;
 const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
