@@ -123,6 +123,15 @@ fn draw_banner(text: &str) {
         color_u8!(80, 80, 80, 255),
     );
 
+    draw_rectangle_lines(
+        PLAYFIELD_OFFSET_X,
+        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) - 32.0,
+        PLAYFIELD_WIDTH,
+        64.0,
+        8.0,
+        color_u8!(224, 127, 58, 255),
+    );
+
     draw_text_centered(
         PLAYFIELD_WIDTH,
         Some(PLAYFIELD_HEIGHT),
