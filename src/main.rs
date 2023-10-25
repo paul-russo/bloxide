@@ -5,7 +5,6 @@ mod game_state;
 mod grid;
 mod menu;
 mod piece;
-mod utils;
 
 use draw::Drawable;
 use game_state::{GameInput, GameState};
