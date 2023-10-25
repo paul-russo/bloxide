@@ -3,7 +3,8 @@ use crate::game_state::GameState;
 use crate::grid::{
     Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS, VISIBLE_GRID_COUNT_ROWS,
 };
-use crate::piece::Piece;
+use crate::menu::Menu;
+use crate::piece::{pieces, Piece};
 use macroquad::prelude::*;
 use num_format::{Locale, ToFormattedString};
 
@@ -50,7 +51,9 @@ const HOLD_HEIGHT: f32 =
 // Text is ~14 pixels wide per character at 32 pixels tall. 14/32 = 0.4375
 const TEXT_HEIGHT_WIDTH_RATIO: f32 = 0.4375;
 
-fn draw_text_centered(
+const MENU_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y + 32.0 + 8.0;
+
+pub fn draw_text_centered(
     container_width: f32,
     container_height: Option<f32>,
     text: &str,
@@ -81,7 +84,7 @@ fn draw_playfield() {
 }
 
 fn draw_score(score: usize) {
-    let text = &(score * 100).to_formatted_string(&Locale::en);
+    let text = &score.to_formatted_string(&Locale::en);
 
     draw_text_centered(
         PLAYFIELD_WIDTH,
@@ -90,7 +93,7 @@ fn draw_score(score: usize) {
         PLAYFIELD_OFFSET_X + 1.0,
         PLAYFIELD_OFFSET_Y - 9.0,
         40.0,
-        color_u8!(224, 127, 58, 255),
+        pieces::PIECE_COLOR_L,
     );
 
     draw_text_centered(
@@ -109,35 +112,6 @@ fn draw_level(level: usize) {
         &format!("Level {}", level),
         PREVIEW_OFFSET_X,
         PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 10.0,
-        32.0,
-        WHITE,
-    );
-}
-
-fn draw_banner(text: &str) {
-    draw_rectangle(
-        PLAYFIELD_OFFSET_X,
-        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) - 32.0,
-        PLAYFIELD_WIDTH,
-        64.0,
-        color_u8!(80, 80, 80, 255),
-    );
-
-    draw_rectangle_lines(
-        PLAYFIELD_OFFSET_X,
-        PLAYFIELD_OFFSET_Y + (PLAYFIELD_HEIGHT / 2.0) - 32.0,
-        PLAYFIELD_WIDTH,
-        64.0,
-        8.0,
-        color_u8!(224, 127, 58, 255),
-    );
-
-    draw_text_centered(
-        PLAYFIELD_WIDTH,
-        Some(PLAYFIELD_HEIGHT),
-        text,
-        PLAYFIELD_OFFSET_X,
-        PLAYFIELD_OFFSET_Y + 8.0,
         32.0,
         WHITE,
     );
@@ -224,14 +198,6 @@ impl Drawable for GameState {
         self.get_grid_ghost().draw(0.5);
         draw_piece_previews(self.get_piece_previews());
         draw_held_piece(self.get_held_piece());
-
-        if self.get_is_game_over() {
-            draw_banner("GAME OVER");
-        }
-
-        if self.get_is_paused() {
-            draw_banner("PAUSED");
-        }
     }
 }
 
@@ -341,5 +307,60 @@ impl Drawable for Block {
                 a: opacity,
             },
         );
+    }
+}
+
+impl<'a> Drawable for Menu<'a> {
+    type Args = ();
+
+    fn draw(&self, _args: ()) {
+        if !self.is_visible {
+            return;
+        }
+
+        let container_height = 64.0 + (32.0 * self.items.len() as f32);
+
+        draw_rectangle(
+            PLAYFIELD_OFFSET_X,
+            PLAYFIELD_OFFSET_Y,
+            PLAYFIELD_WIDTH,
+            container_height,
+            color_u8!(80, 80, 80, 255),
+        );
+
+        draw_rectangle_lines(
+            PLAYFIELD_OFFSET_X,
+            PLAYFIELD_OFFSET_Y,
+            PLAYFIELD_WIDTH,
+            container_height,
+            4.0,
+            pieces::PIECE_COLOR_L,
+        );
+
+        draw_text_centered(
+            PLAYFIELD_WIDTH,
+            None,
+            self.title,
+            PLAYFIELD_OFFSET_X,
+            MENU_OFFSET_Y,
+            32.0,
+            WHITE,
+        );
+
+        for (index, item) in self.items.iter().enumerate() {
+            draw_text_centered(
+                PLAYFIELD_WIDTH,
+                None,
+                item.label,
+                PLAYFIELD_OFFSET_X,
+                MENU_OFFSET_Y + (32.0 * (index + 1) as f32),
+                24.0,
+                if self.active_index == index {
+                    pieces::PIECE_COLOR_L
+                } else {
+                    WHITE
+                },
+            )
+        }
     }
 }

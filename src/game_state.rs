@@ -20,12 +20,14 @@ pub struct GameInput {
     pub toggle_pause: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
 enum ShiftDirection {
     Left,
     Right,
     Neither,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct GameState {
     grid_locked: Grid,
     grid_active: Grid,
@@ -139,7 +141,7 @@ impl GameState {
         self.is_game_over = true;
     }
 
-    fn toggle_pause(&mut self) {
+    pub fn toggle_pause(&mut self) {
         if self.is_paused {
             self.tick = 0;
             self.last_tick = 0;

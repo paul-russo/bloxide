@@ -5,7 +5,7 @@ pub const GRID_COUNT_ROWS: usize = 22;
 pub const FIRST_VISIBLE_ROW_ID: usize = GRID_COUNT_ROWS - VISIBLE_GRID_COUNT_ROWS;
 pub const GRID_COUNT_COLS: usize = 10;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Grid {
     rows: [[Option<Block>; GRID_COUNT_COLS]; GRID_COUNT_ROWS],
 }

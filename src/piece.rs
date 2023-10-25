@@ -69,9 +69,17 @@ pub mod pieces {
     use super::{OrientationDef, Piece};
     use macroquad::{color_u8, prelude::Color};
 
+    pub const PIECE_COLOR_I: Color = color_u8!(100, 196, 235, 255);
+    pub const PIECE_COLOR_J: Color = color_u8!(92, 101, 168, 255);
+    pub const PIECE_COLOR_L: Color = color_u8!(224, 127, 58, 255);
+    pub const PIECE_COLOR_O: Color = color_u8!(241, 212, 72, 255);
+    pub const PIECE_COLOR_S: Color = color_u8!(100, 180, 82, 255);
+    pub const PIECE_COLOR_T: Color = color_u8!(140, 26, 245, 255);
+    pub const PIECE_COLOR_Z: Color = color_u8!(234, 51, 35, 255);
+
     pub const I: Piece = Piece {
         name: "I",
-        color: color_u8!(100, 196, 235, 255),
+        color: PIECE_COLOR_I,
         bounds_width: 5,
         bounds_height: 5,
         orientations: [
@@ -128,7 +136,7 @@ pub mod pieces {
 
     pub const J: Piece = Piece {
         name: "J",
-        color: color_u8!(92, 101, 168, 255),
+        color: PIECE_COLOR_J,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [
@@ -185,7 +193,7 @@ pub mod pieces {
 
     pub const L: Piece = Piece {
         name: "L",
-        color: color_u8!(224, 127, 58, 255),
+        color: PIECE_COLOR_L,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [
@@ -242,7 +250,7 @@ pub mod pieces {
 
     pub const O: Piece = Piece {
         name: "O",
-        color: color_u8!(241, 212, 72, 255),
+        color: PIECE_COLOR_O,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [
@@ -299,7 +307,7 @@ pub mod pieces {
 
     pub const S: Piece = Piece {
         name: "S",
-        color: color_u8!(100, 180, 82, 255),
+        color: PIECE_COLOR_S,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [
@@ -356,7 +364,7 @@ pub mod pieces {
 
     pub const T: Piece = Piece {
         name: "T",
-        color: color_u8!(140, 26, 245, 255),
+        color: PIECE_COLOR_T,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [
@@ -413,7 +421,7 @@ pub mod pieces {
 
     pub const Z: Piece = Piece {
         name: "Z",
-        color: color_u8!(234, 51, 35, 255),
+        color: PIECE_COLOR_Z,
         bounds_width: 3,
         bounds_height: 3,
         orientations: [

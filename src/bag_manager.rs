@@ -21,7 +21,7 @@ fn get_random_bag() -> [Piece; 7] {
     bag
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct BagManager {
     index: isize,
     current_bag: [Piece; 7],
