@@ -6,6 +6,8 @@ mod grid;
 mod menu;
 mod piece;
 
+use std::cell::Cell;
+
 use draw::Drawable;
 use game_state::{GameInput, GameState};
 use macroquad::{miniquad::window::quit, prelude::*};
@@ -20,8 +22,29 @@ fn window_conf() -> Conf {
     }
 }
 
+#[derive(PartialEq)]
+enum CurrentScreen {
+    Game,
+    MainMenu,
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
+    // Putting this value inside of a Cell allows us to mutate the inner value without
+    // needing to use a mutable reference, which would cause on_end to be an FnMut instead
+    // of an Fn.
+    let high_score: Cell<usize> = Cell::new(0);
+
+    let on_end = |score: usize| {
+        if score > high_score.get() {
+            high_score.set(score);
+        }
+
+        println!("HIGH SCORE: {}", high_score.get());
+    };
+
+    let mut current_screen = CurrentScreen::MainMenu;
+
     // Game state
     let mut maybe_game_state: Option<GameState> = None;
 
@@ -49,6 +72,10 @@ async fn main() {
                 id: "new_game",
             },
             MenuItem {
+                label: "Main Menu",
+                id: "back_to_main_menu",
+            },
+            MenuItem {
                 label: "Quit",
                 id: "quit",
             },
@@ -61,6 +88,10 @@ async fn main() {
             MenuItem {
                 label: "Resume",
                 id: "resume",
+            },
+            MenuItem {
+                label: "Main Menu",
+                id: "back_to_main_menu",
             },
             MenuItem {
                 label: "Quit",
@@ -78,7 +109,8 @@ async fn main() {
             select: is_key_pressed(KeyCode::Enter),
         };
 
-        if let Some(game_state) = maybe_game_state.as_mut() {
+        if current_screen == CurrentScreen::Game && maybe_game_state.is_some() {
+            let game_state = maybe_game_state.as_mut().unwrap();
             game_state.update(GameInput {
                 soft_drop: is_key_down(KeyCode::Down),
                 shift_left: is_key_down(KeyCode::Left),
@@ -93,13 +125,15 @@ async fn main() {
             menu_paused.is_visible = game_state.get_is_paused();
 
             match menu_game_over.update(menu_input) {
-                Some("new_game") => *game_state = GameState::new(),
+                Some("new_game") => *game_state = GameState::new(&on_end),
+                Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
             }
 
             match menu_paused.update(menu_input) {
                 Some("resume") => game_state.toggle_pause(),
+                Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
             }
@@ -111,7 +145,10 @@ async fn main() {
             game_state.clean_up();
         } else {
             match menu_main.update(menu_input) {
-                Some("new_game") => maybe_game_state = Some(GameState::new()),
+                Some("new_game") => {
+                    current_screen = CurrentScreen::Game;
+                    maybe_game_state = Some(GameState::new(&on_end));
+                }
                 Some("quit") => quit(),
                 _ => (),
             }

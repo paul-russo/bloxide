@@ -186,7 +186,7 @@ pub trait Drawable {
     fn draw(&self, args: Self::Args);
 }
 
-impl Drawable for GameState {
+impl<'a> Drawable for GameState<'a> {
     type Args = ();
 
     fn draw(&self, _args: ()) {

@@ -27,8 +27,8 @@ enum ShiftDirection {
     Neither,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct GameState {
+#[derive(Copy, Clone)]
+pub struct GameState<'a> {
     grid_locked: Grid,
     grid_active: Grid,
     grid_ghost: Grid,
@@ -51,10 +51,11 @@ pub struct GameState {
     rows_cleared: usize,
     is_game_over: bool,
     is_paused: bool,
+    on_end: &'a dyn Fn(usize),
 }
 
-impl GameState {
-    pub fn new() -> Self {
+impl<'a> GameState<'a> {
+    pub fn new(on_end: &'a dyn Fn(usize)) -> Self {
         let grid_locked = Grid::new();
         let grid_active = Grid::new();
         let grid_ghost = Grid::new();
@@ -93,6 +94,7 @@ impl GameState {
             rows_cleared: 0,
             is_game_over: false,
             is_paused: false,
+            on_end,
         }
     }
 
@@ -139,6 +141,7 @@ impl GameState {
     fn end_game(&mut self) {
         self.clean_up();
         self.is_game_over = true;
+        (self.on_end)(self.score);
     }
 
     pub fn toggle_pause(&mut self) {
