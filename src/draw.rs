@@ -3,6 +3,7 @@ use crate::game_state::GameState;
 use crate::grid::{
     Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS, VISIBLE_GRID_COUNT_ROWS,
 };
+use crate::high_score_manager::HighScoreManager;
 use crate::menu::Menu;
 use crate::piece::{pieces, Piece};
 use macroquad::prelude::*;
@@ -362,5 +363,24 @@ impl<'a> Drawable for Menu<'a> {
                 },
             )
         }
+    }
+}
+
+impl Drawable for HighScoreManager {
+    type Args = ();
+
+    fn draw(&self, _args: ()) {
+        draw_text_centered(
+            PLAYFIELD_WIDTH,
+            None,
+            &format!(
+                "High Score: {}",
+                self.get_high_score().to_formatted_string(&Locale::en)
+            ),
+            PLAYFIELD_OFFSET_X,
+            28.0,
+            32.0,
+            WHITE,
+        );
     }
 }

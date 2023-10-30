@@ -3,13 +3,13 @@ mod block;
 mod draw;
 mod game_state;
 mod grid;
+mod high_score_manager;
 mod menu;
 mod piece;
 
-use std::cell::Cell;
-
 use draw::Drawable;
 use game_state::{GameInput, GameState};
+use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
 use menu::{Menu, MenuInput, MenuItem};
 
@@ -30,19 +30,7 @@ enum CurrentScreen {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    // Putting this value inside of a Cell allows us to mutate the inner value without
-    // needing to use a mutable reference, which would cause on_end to be an FnMut instead
-    // of an Fn.
-    let high_score: Cell<usize> = Cell::new(0);
-
-    let on_end = |score: usize| {
-        if score > high_score.get() {
-            high_score.set(score);
-        }
-
-        println!("HIGH SCORE: {}", high_score.get());
-    };
-
+    let high_score_manager = HighScoreManager::new();
     let mut current_screen = CurrentScreen::MainMenu;
 
     // Game state
@@ -125,7 +113,7 @@ async fn main() {
             menu_paused.is_visible = game_state.get_is_paused();
 
             match menu_game_over.update(menu_input) {
-                Some("new_game") => *game_state = GameState::new(&on_end),
+                Some("new_game") => *game_state = GameState::new(&high_score_manager),
                 Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
@@ -147,12 +135,13 @@ async fn main() {
             match menu_main.update(menu_input) {
                 Some("new_game") => {
                     current_screen = CurrentScreen::Game;
-                    maybe_game_state = Some(GameState::new(&on_end));
+                    maybe_game_state = Some(GameState::new(&high_score_manager));
                 }
                 Some("quit") => quit(),
                 _ => (),
             }
 
+            high_score_manager.draw(());
             menu_main.draw(());
         }
 

@@ -1,4 +1,6 @@
-use crate::{bag_manager::BagManager, grid::Grid, piece::Piece};
+use crate::{
+    bag_manager::BagManager, grid::Grid, high_score_manager::HighScoreManager, piece::Piece,
+};
 use std::time::Instant;
 
 const TICKS_PER_SECOND: f32 = 60.0;
@@ -51,11 +53,11 @@ pub struct GameState<'a> {
     rows_cleared: usize,
     is_game_over: bool,
     is_paused: bool,
-    on_end: &'a dyn Fn(usize),
+    high_score_manager: &'a HighScoreManager,
 }
 
 impl<'a> GameState<'a> {
-    pub fn new(on_end: &'a dyn Fn(usize)) -> Self {
+    pub fn new(high_score_manager: &'a HighScoreManager) -> Self {
         let grid_locked = Grid::new();
         let grid_active = Grid::new();
         let grid_ghost = Grid::new();
@@ -94,7 +96,7 @@ impl<'a> GameState<'a> {
             rows_cleared: 0,
             is_game_over: false,
             is_paused: false,
-            on_end,
+            high_score_manager,
         }
     }
 
@@ -141,7 +143,7 @@ impl<'a> GameState<'a> {
     fn end_game(&mut self) {
         self.clean_up();
         self.is_game_over = true;
-        (self.on_end)(self.score);
+        self.high_score_manager.add_score(self.score);
     }
 
     pub fn toggle_pause(&mut self) {
