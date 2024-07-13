@@ -54,6 +54,9 @@ const TEXT_HEIGHT_WIDTH_RATIO: f32 = 0.4375;
 
 const MENU_OFFSET_Y: f32 = PLAYFIELD_OFFSET_Y + 32.0 + 8.0;
 
+pub const WINDOW_WIDTH: f32 = PREVIEW_OFFSET_X + PREVIEW_WIDTH + PLAYFIELD_MARGIN;
+pub const WINDOW_HEIGHT: f32 = PLAYFIELD_OFFSET_Y + PLAYFIELD_HEIGHT + PLAYFIELD_MARGIN;
+
 pub fn draw_text_centered(
     container_width: f32,
     container_height: Option<f32>,
@@ -108,11 +111,44 @@ fn draw_score(score: usize) {
     );
 }
 
-fn draw_level(level: usize) {
+fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
     draw_text(
-        &format!("Level {}", level),
+        "Level:",
         PREVIEW_OFFSET_X,
         PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 10.0,
+        32.0,
+        WHITE,
+    );
+
+    draw_text(
+        &level.to_string(),
+        PREVIEW_OFFSET_X,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 42.0,
+        32.0,
+        WHITE,
+    );
+
+    draw_line(
+        PREVIEW_OFFSET_X,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 52.0,
+        PREVIEW_OFFSET_X + PREVIEW_WIDTH,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 52.0,
+        2.0,
+        WHITE,
+    );
+
+    draw_text(
+        "Lines:",
+        PREVIEW_OFFSET_X,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 78.0,
+        32.0,
+        WHITE,
+    );
+
+    draw_text(
+        &rows_cleared.to_string(),
+        PREVIEW_OFFSET_X,
+        PREVIEW_OFFSET_Y + PREVIEW_HEIGHT + PLAYFIELD_MARGIN + 110.0,
         32.0,
         WHITE,
     );
@@ -193,7 +229,7 @@ impl<'a> Drawable for GameState<'a> {
     fn draw(&self, _args: ()) {
         draw_playfield();
         draw_score(self.get_score());
-        draw_level(self.get_level());
+        draw_level_and_rows_cleared(self.get_level(), self.get_rows_cleared());
         self.get_grid_locked().draw(1.0);
         self.get_grid_active().draw(1.0);
         self.get_grid_ghost().draw(0.5);

@@ -7,7 +7,7 @@ mod high_score_manager;
 mod menu;
 mod piece;
 
-use draw::Drawable;
+use draw::{Drawable, WINDOW_HEIGHT, WINDOW_WIDTH};
 use game_state::{GameInput, GameState};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
@@ -18,6 +18,8 @@ fn window_conf() -> Conf {
         window_title: String::from("Retris"),
         high_dpi: true,
         window_resizable: false,
+        window_height: WINDOW_HEIGHT as i32,
+        window_width: WINDOW_WIDTH as i32,
         ..Default::default()
     }
 }

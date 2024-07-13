@@ -497,6 +497,10 @@ impl<'a> GameState<'a> {
         self.score
     }
 
+    pub fn get_rows_cleared(&self) -> usize {
+        self.rows_cleared
+    }
+
     pub fn get_level(&self) -> usize {
         // Minimum level is 1. Maximum is 20.
         (self.rows_cleared as f32 / 10.0).ceil().max(1.0).min(20.0) as usize
