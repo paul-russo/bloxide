@@ -33,3 +33,8 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.platform.target }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.platform.target }}/release/retris
