@@ -15,7 +15,7 @@ use menu::{Menu, MenuInput, MenuItem};
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: String::from("Retris"),
+        window_title: String::from("bloxide"),
         high_dpi: true,
         window_resizable: false,
         window_height: WINDOW_HEIGHT as i32,
@@ -39,7 +39,7 @@ async fn main() {
     let mut maybe_game_state: Option<GameState> = None;
 
     let mut menu_main = Menu::new(
-        "RETRIS",
+        "bloxide",
         vec![
             MenuItem {
                 label: "New Game",
