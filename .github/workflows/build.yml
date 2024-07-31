@@ -36,8 +36,11 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.platform.target }}
 
+      - name: Rename binary (for windows)
+        run: mv target/${{ matrix.platform.target }}/release/bloxide target/${{ matrix.platform.target }}/release/bloxide-${{ matrix.platform.target }}${{matrix.platform.os == 'windows-latest' && '.exe' || ''}}
+
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.platform.target }}/release/bloxide
+          files: target/${{ matrix.platform.target }}/release/bloxide-${{ matrix.platform.target }}${{matrix.platform.os == 'windows-latest' && '.exe' || ''}}
