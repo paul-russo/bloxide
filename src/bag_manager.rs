@@ -46,8 +46,6 @@ impl BagManager {
             self.index = 0;
         }
 
-        println!("{}", self);
-
         self.current_bag[self.index as usize]
     }
 

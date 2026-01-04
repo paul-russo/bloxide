@@ -1,4 +1,5 @@
 use crate::block::Block;
+use crate::piece::BlockCanvas;
 
 pub const VISIBLE_GRID_COUNT_ROWS: usize = 20;
 pub const GRID_COUNT_ROWS: usize = 22;
@@ -41,10 +42,13 @@ impl Grid {
         &mut self,
         row_offset: isize,
         col_offset: isize,
-        canvas: &Vec<Vec<Option<Block>>>,
+        canvas: &BlockCanvas,
+        bounds_height: usize,
+        bounds_width: usize,
     ) -> &mut Self {
-        for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
-            for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
+        for canvas_row_id in 0..bounds_height {
+            for canvas_col_id in 0..bounds_width {
+                let canvas_cell = canvas[canvas_row_id][canvas_col_id];
                 if canvas_cell.is_some() {
                     let grid_col_id = canvas_col_id as isize + col_offset;
                     let grid_row_id = canvas_row_id as isize + row_offset;
@@ -60,7 +64,7 @@ impl Grid {
                         );
                     }
 
-                    self.set_cell(grid_row_id as usize, grid_col_id as usize, *canvas_cell);
+                    self.set_cell(grid_row_id as usize, grid_col_id as usize, canvas_cell);
                 }
             }
         }
@@ -72,11 +76,13 @@ impl Grid {
         &self,
         row_offset: isize,
         col_offset: isize,
-        canvas: &Vec<Vec<Option<Block>>>,
+        canvas: &BlockCanvas,
+        bounds_height: usize,
+        bounds_width: usize,
     ) -> bool {
-        for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
-            for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
-                if canvas_cell.is_some() {
+        for canvas_row_id in 0..bounds_height {
+            for canvas_col_id in 0..bounds_width {
+                if canvas[canvas_row_id][canvas_col_id].is_some() {
                     let grid_col_id = canvas_col_id as isize + col_offset;
                     let grid_row_id = canvas_row_id as isize + row_offset;
 
@@ -97,10 +103,16 @@ impl Grid {
 
     /// Check if the given canvas, positioned at the given row_offset, would be entirely outside of
     /// the visible bounds of the playfield.
-    pub fn invisible_check(&self, row_offset: isize, canvas: &Vec<Vec<Option<Block>>>) -> bool {
-        for (canvas_row_id, canvas_row) in canvas.iter().enumerate() {
-            for (_canvas_col_id, canvas_cell) in canvas_row.iter().enumerate() {
-                if canvas_cell.is_some() {
+    pub fn invisible_check(
+        &self,
+        row_offset: isize,
+        canvas: &BlockCanvas,
+        bounds_height: usize,
+        bounds_width: usize,
+    ) -> bool {
+        for canvas_row_id in 0..bounds_height {
+            for canvas_col_id in 0..bounds_width {
+                if canvas[canvas_row_id][canvas_col_id].is_some() {
                     let grid_row_id = canvas_row_id as isize + row_offset;
 
                     // If any row ID would be at or below the first visible row, then this canvas would not be
@@ -119,17 +131,20 @@ impl Grid {
         &self,
         row_offset: isize,
         col_offset: isize,
-        canvas: &Vec<Vec<Option<Block>>>,
+        canvas: &BlockCanvas,
+        bounds_height: usize,
+        bounds_width: usize,
     ) -> isize {
         for next_row_offset in row_offset..GRID_COUNT_ROWS as isize {
-            let has_collision = self.collision_check(next_row_offset, col_offset, canvas);
+            let has_collision =
+                self.collision_check(next_row_offset, col_offset, canvas, bounds_height, bounds_width);
 
             if has_collision {
                 return next_row_offset - 1;
             }
         }
 
-        return GRID_COUNT_ROWS as isize;
+        GRID_COUNT_ROWS as isize
     }
 
     pub fn get_cell(&self, row_id: usize, col_id: usize) -> Option<Block> {

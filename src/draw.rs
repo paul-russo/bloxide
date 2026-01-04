@@ -154,7 +154,7 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
     );
 }
 
-fn draw_piece_previews(piece_previews: Vec<Piece>) {
+fn draw_piece_previews(piece_previews: [Piece; 3]) {
     draw_text(
         &format!("Next"),
         PREVIEW_OFFSET_X,
@@ -277,21 +277,19 @@ impl Drawable for Piece {
             orientation,
         } = args;
 
-        let blocks = self.get_blocks(orientation, true);
+        let (blocks, _, _) = self.get_blocks(orientation);
+        let (min_row, max_row, min_col, max_col) = self.get_trimmed_bounds(orientation);
 
-        for row_id in 0..blocks.len() {
-            for col_id in 0..blocks[row_id].len() {
-                let cell = blocks[row_id][col_id];
-
-                match cell {
-                    Some(block) => block.draw(DrawBlockArgs {
-                        row_id,
-                        col_id,
+        for row_id in min_row..max_row {
+            for col_id in min_col..max_col {
+                if let Some(block) = blocks[row_id][col_id] {
+                    block.draw(DrawBlockArgs {
+                        row_id: row_id - min_row,
+                        col_id: col_id - min_col,
                         offset_x,
                         offset_y,
                         opacity: 1.0,
-                    }),
-                    None => (),
+                    });
                 }
             }
         }

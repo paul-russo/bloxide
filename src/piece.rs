@@ -3,6 +3,9 @@ use crate::grid::GRID_COUNT_COLS;
 use macroquad::prelude::Color;
 use std::fmt::Display;
 
+/// Fixed-size block canvas - avoids heap allocation
+pub type BlockCanvas = [[Option<Block>; 5]; 5];
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct OrientationDef {
     pub blocks: [[usize; 5]; 5],
@@ -21,37 +24,33 @@ pub struct Piece {
 }
 
 impl Piece {
-    /// Get a new 2d vector of the Blocks contained in the Piece.
-    pub fn get_blocks(&self, orientation: usize, trimmed: bool) -> Vec<Vec<Option<Block>>> {
+    /// Get blocks as a fixed-size array (no heap allocation).
+    /// Returns the block canvas along with the actual bounds to iterate over.
+    pub fn get_blocks(&self, orientation: usize) -> (BlockCanvas, usize, usize) {
         let orientation_def = self.orientations[orientation % 4];
-        let mut blocks_vec: Vec<Vec<Option<Block>>> = Vec::new();
+        let mut canvas: BlockCanvas = [[None; 5]; 5];
 
-        let canvas_bounds_y = if trimmed {
-            orientation_def.bounds_y
-        } else {
-            (0, self.bounds_height)
-        };
-
-        let canvas_bounds_x = if trimmed {
-            orientation_def.bounds_x
-        } else {
-            (0, self.bounds_width)
-        };
-
-        for canvas_row_id in canvas_bounds_y.0..canvas_bounds_y.1 {
-            let mut blocks_vec_row: Vec<Option<Block>> = Vec::new();
-
-            for canvas_col_id in canvas_bounds_x.0..canvas_bounds_x.1 {
-                blocks_vec_row.push(match orientation_def.blocks[canvas_row_id][canvas_col_id] {
+        for row in 0..self.bounds_height {
+            for col in 0..self.bounds_width {
+                canvas[row][col] = match orientation_def.blocks[row][col] {
                     0 => None,
                     _ => Some(Block::new(self.color)),
-                })
+                };
             }
-
-            blocks_vec.push(blocks_vec_row);
         }
 
-        blocks_vec
+        (canvas, self.bounds_height, self.bounds_width)
+    }
+
+    /// Get the trimmed bounds for drawing (used for previews/held piece)
+    pub fn get_trimmed_bounds(&self, orientation: usize) -> (usize, usize, usize, usize) {
+        let orientation_def = self.orientations[orientation % 4];
+        (
+            orientation_def.bounds_y.0,
+            orientation_def.bounds_y.1,
+            orientation_def.bounds_x.0,
+            orientation_def.bounds_x.1,
+        )
     }
 
     pub fn get_initial_col(&self) -> isize {

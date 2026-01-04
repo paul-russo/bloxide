@@ -1,5 +1,8 @@
 use crate::{
-    bag_manager::BagManager, grid::Grid, high_score_manager::HighScoreManager, piece::Piece,
+    bag_manager::BagManager,
+    grid::Grid,
+    high_score_manager::HighScoreManager,
+    piece::{BlockCanvas, Piece},
 };
 use std::time::Instant;
 
@@ -54,6 +57,14 @@ pub struct GameState<'a> {
     is_game_over: bool,
     is_paused: bool,
     high_score_manager: &'a HighScoreManager,
+    // Cached block canvas to avoid repeated allocations
+    cached_blocks: BlockCanvas,
+    cached_bounds_height: usize,
+    cached_bounds_width: usize,
+    // Dirty flag to track if piece state changed
+    piece_dirty: bool,
+    // Cached ghost row
+    cached_ghost_row: isize,
 }
 
 impl<'a> GameState<'a> {
@@ -72,6 +83,10 @@ impl<'a> GameState<'a> {
         let gravity: f32 = INITIAL_GRAVITY;
         let ticks_to_next_row_inc: isize = (1.0 / gravity).ceil() as isize;
         let start = Instant::now();
+
+        // Initialize cached blocks
+        let (cached_blocks, cached_bounds_height, cached_bounds_width) =
+            active_piece.get_blocks(active_piece_orientation);
 
         Self {
             grid_locked,
@@ -97,6 +112,11 @@ impl<'a> GameState<'a> {
             is_game_over: false,
             is_paused: false,
             high_score_manager,
+            cached_blocks,
+            cached_bounds_height,
+            cached_bounds_width,
+            piece_dirty: true,
+            cached_ghost_row: 0,
         }
     }
 
@@ -126,14 +146,18 @@ impl<'a> GameState<'a> {
         self.last_piece_swapped = false;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
         self.lock_reset_moves_remaining = RESET_MOVES;
+        self.refresh_cached_blocks();
+    }
+
+    fn refresh_cached_blocks(&mut self) {
+        let (blocks, height, width) = self.active_piece.get_blocks(self.active_piece_orientation);
+        self.cached_blocks = blocks;
+        self.cached_bounds_height = height;
+        self.cached_bounds_width = width;
+        self.piece_dirty = true;
     }
 
     fn try_reset_lock_delay_for_move(&mut self) {
-        println!(
-            "moves: {}, ticks_to_lock: {}",
-            self.lock_reset_moves_remaining, self.ticks_to_lock
-        );
-
         if self.lock_reset_moves_remaining > 0 {
             self.lock_reset_moves_remaining -= 1;
             self.ticks_to_lock = LOCK_DELAY_TICKS;
@@ -161,9 +185,9 @@ impl<'a> GameState<'a> {
     fn check_for_lock_out(&self) -> bool {
         self.grid_locked.invisible_check(
             self.active_piece_row,
-            &self
-                .active_piece
-                .get_blocks(self.active_piece_orientation, false),
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
         )
     }
 
@@ -175,7 +199,6 @@ impl<'a> GameState<'a> {
         let is_block_out = self.collide(None, None, None);
 
         if is_block_out {
-            println!("BLOCK OUT!!!!!!");
             self.end_game();
         }
     }
@@ -205,7 +228,6 @@ impl<'a> GameState<'a> {
 
     fn lock_active_piece_and_get_next(&mut self) {
         if self.check_for_lock_out() {
-            println!("LOCK OUT!!!!!!");
             self.end_game();
             return;
         }
@@ -213,9 +235,9 @@ impl<'a> GameState<'a> {
         self.grid_locked.set_cells(
             self.active_piece_row,
             self.active_piece_col,
-            &self
-                .active_piece
-                .get_blocks(self.active_piece_orientation, false),
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
         );
 
         self.clear_filled_rows_and_update_score();
@@ -227,9 +249,9 @@ impl<'a> GameState<'a> {
         let landing_row = self.grid_locked.find_landing_row(
             self.active_piece_row,
             self.active_piece_col,
-            &self
-                .active_piece
-                .get_blocks(self.active_piece_orientation, false),
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
         );
 
         let lines_dropped = (landing_row - self.active_piece_row).max(0);
@@ -254,13 +276,27 @@ impl<'a> GameState<'a> {
         col_id: Option<isize>,
         orientation: Option<usize>,
     ) -> bool {
-        self.grid_locked.collision_check(
-            row_id.unwrap_or(self.active_piece_row),
-            col_id.unwrap_or(self.active_piece_col),
-            &self
-                .active_piece
-                .get_blocks(orientation.unwrap_or(self.active_piece_orientation), false),
-        )
+        let orientation = orientation.unwrap_or(self.active_piece_orientation);
+
+        // Use cached blocks if orientation matches, otherwise compute fresh
+        if orientation == self.active_piece_orientation {
+            self.grid_locked.collision_check(
+                row_id.unwrap_or(self.active_piece_row),
+                col_id.unwrap_or(self.active_piece_col),
+                &self.cached_blocks,
+                self.cached_bounds_height,
+                self.cached_bounds_width,
+            )
+        } else {
+            let (blocks, height, width) = self.active_piece.get_blocks(orientation);
+            self.grid_locked.collision_check(
+                row_id.unwrap_or(self.active_piece_row),
+                col_id.unwrap_or(self.active_piece_col),
+                &blocks,
+                height,
+                width,
+            )
+        }
     }
 
     fn try_rotate_right(&mut self) {
@@ -290,6 +326,7 @@ impl<'a> GameState<'a> {
                 self.active_piece_orientation = next_orientation;
                 self.active_piece_row = next_active_piece_row;
                 self.active_piece_col = next_active_piece_col;
+                self.refresh_cached_blocks();
                 self.try_reset_lock_delay_for_move();
 
                 return;
@@ -362,6 +399,7 @@ impl<'a> GameState<'a> {
 
             if !has_collision {
                 self.active_piece_col = next_active_piece_col;
+                self.piece_dirty = true;
                 self.try_reset_lock_delay_for_move();
             }
         }
@@ -372,8 +410,7 @@ impl<'a> GameState<'a> {
         self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
         self.lock_reset_moves_remaining = RESET_MOVES;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
-
-        println!("RESET TICKS!");
+        self.piece_dirty = true;
     }
 
     fn try_gravity_drop(&mut self, is_soft_drop: bool) {
@@ -441,25 +478,34 @@ impl<'a> GameState<'a> {
         // Drop the piece, or lock it if dropping would cause a collision.
         self.try_gravity_drop(input.soft_drop);
 
-        let active_blocks = self
-            .active_piece
-            .get_blocks(self.active_piece_orientation, false);
+        // Only update grids if piece state changed
+        if self.piece_dirty {
+            self.grid_active.clear().set_cells(
+                self.active_piece_row,
+                self.active_piece_col,
+                &self.cached_blocks,
+                self.cached_bounds_height,
+                self.cached_bounds_width,
+            );
 
-        self.grid_active.clear().set_cells(
-            self.active_piece_row,
-            self.active_piece_col,
-            &active_blocks,
-        );
+            self.cached_ghost_row = self.grid_locked.find_landing_row(
+                self.active_piece_row,
+                self.active_piece_col,
+                &self.cached_blocks,
+                self.cached_bounds_height,
+                self.cached_bounds_width,
+            );
 
-        let ghost_row = self.grid_locked.find_landing_row(
-            self.active_piece_row,
-            self.active_piece_col,
-            &active_blocks,
-        );
+            self.grid_ghost.clear().set_cells(
+                self.cached_ghost_row,
+                self.active_piece_col,
+                &self.cached_blocks,
+                self.cached_bounds_height,
+                self.cached_bounds_width,
+            );
 
-        self.grid_ghost
-            .clear()
-            .set_cells(ghost_row, self.active_piece_col, &active_blocks);
+            self.piece_dirty = false;
+        }
     }
 
     fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
@@ -516,8 +562,8 @@ impl<'a> GameState<'a> {
         gravity.min(1.0)
     }
 
-    pub fn get_piece_previews(&self) -> Vec<Piece> {
-        vec![
+    pub fn get_piece_previews(&self) -> [Piece; 3] {
+        [
             self.bag_manager.peek(1),
             self.bag_manager.peek(2),
             self.bag_manager.peek(3),
