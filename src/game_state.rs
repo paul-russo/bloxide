@@ -54,6 +54,8 @@ pub struct GameState<'a> {
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
     rows_cleared: usize,
+    // -1 means no active combo; incremented on each consecutive line-clearing lock
+    combo_counter: isize,
     is_game_over: bool,
     is_paused: bool,
     high_score_manager: &'a HighScoreManager,
@@ -109,6 +111,7 @@ impl<'a> GameState<'a> {
             held_piece: None,
             last_piece_swapped: false,
             rows_cleared: 0,
+            combo_counter: -1,
             is_game_over: false,
             is_paused: false,
             high_score_manager,
@@ -523,6 +526,15 @@ impl<'a> GameState<'a> {
             4 => self.score += 800 * level,
             _ => (),
         };
+
+        if rows_cleared > 0 {
+            self.combo_counter += 1;
+            if self.combo_counter > 0 {
+                self.score += 50 * self.combo_counter as usize * level;
+            }
+        } else {
+            self.combo_counter = -1;
+        }
 
         self.increase_rows_cleared(rows_cleared);
     }
