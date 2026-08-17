@@ -6,8 +6,9 @@ mod grid;
 mod high_score_manager;
 mod menu;
 mod piece;
+mod render3d;
 
-use draw::{Drawable, WINDOW_HEIGHT, WINDOW_WIDTH};
+use draw::{draw_backdrop, draw_background, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
 use game_state::{GameInput, GameState};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
@@ -15,7 +16,7 @@ use menu::{Menu, MenuInput, MenuItem};
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: String::from("bloxide"),
+        window_title: String::from("BLOXIDE // Software Carnage"),
         high_dpi: true,
         window_resizable: false,
         window_height: WINDOW_HEIGHT as i32,
@@ -33,6 +34,7 @@ enum CurrentScreen {
 #[macroquad::main(window_conf)]
 async fn main() {
     let high_score_manager = HighScoreManager::new();
+    let render_surface = RenderSurface::new();
     let mut current_screen = CurrentScreen::MainMenu;
 
     // Game state
@@ -42,7 +44,7 @@ async fn main() {
         "bloxide",
         vec![
             MenuItem {
-                label: "New Game",
+                label: "Start Run",
                 id: "new_game",
             },
             MenuItem {
@@ -91,7 +93,8 @@ async fn main() {
     );
 
     loop {
-        clear_background(BLACK);
+        render_surface.begin_frame();
+        draw_background();
 
         let menu_input = MenuInput {
             up: is_key_pressed(KeyCode::Up),
@@ -128,7 +131,7 @@ async fn main() {
                 _ => (),
             }
 
-            game_state.draw(());
+            game_state.draw(render_surface.clone());
             menu_game_over.draw(());
             menu_paused.draw(());
 
@@ -143,10 +146,15 @@ async fn main() {
                 _ => (),
             }
 
-            high_score_manager.draw(());
+            // The empty well is drawn behind the main menu so the 3D playfield
+            // frames the menu screen too, rather than it floating on a void.
+            draw_backdrop(&render_surface);
+
             menu_main.draw(());
+            high_score_manager.draw(());
         }
 
+        render_surface.present();
         next_frame().await
     }
 }
