@@ -5,9 +5,9 @@ use crate::high_score_manager::HighScoreManager;
 use crate::menu::Menu;
 use crate::piece::Piece;
 use crate::render3d::{
-    cell_center, draw_block_cube, draw_block_cube_scaled, draw_block_outline, draw_well,
-    well_camera, world_to_screen, world_to_screen_with_shake, BlockTextures, BLOCK_INSET,
-    RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
+    cell_center, draw_block_cube, draw_block_cube_scaled, draw_block_outline, draw_shrapnel,
+    draw_well, well_camera, world_to_screen, world_to_screen_with_shake, BlockTextures,
+    BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
 };
 use macroquad::prelude::*;
 use macroquad::texture::{render_target_ex, RenderTargetParams};
@@ -25,8 +25,8 @@ pub const BACKGROUND_COLOR: Color = color_u8!(10, 9, 7, 255);
 
 #[derive(Clone)]
 pub struct RenderSurface {
-    target: RenderTarget,
-    block_textures: BlockTextures,
+    pub target: RenderTarget,
+    pub block_textures: BlockTextures,
 }
 
 impl RenderSurface {
@@ -1250,7 +1250,14 @@ impl<'a> Drawable for GameState<'a> {
     /// text first would leave it to be overwritten by the well.
     fn draw(&self, args: RenderSurface) {
         draw_game_chrome();
-        let shake_amount = self.get_impact_effect().powi(2) * 0.08;
+        let impact_shake = self.get_impact_effect().powi(2) * 0.08;
+        let (clear_count, clear_remaining) = self.get_clear_effect();
+        let clear_shake = if clear_remaining > 0.0 {
+            clear_remaining.powi(2) * 0.05 * (clear_count as f32)
+        } else {
+            0.0
+        };
+        let shake_amount = (impact_shake + clear_shake).min(0.25);
         let shake = vec2(
             (get_time() as f32 * 91.0).sin() * shake_amount,
             (get_time() as f32 * 73.0).cos() * shake_amount,
@@ -1272,6 +1279,7 @@ impl<'a> Drawable for GameState<'a> {
         });
         draw_piece_previews(self.get_piece_previews(), &args.block_textures);
         draw_held_piece(self.get_held_piece(), &args.block_textures);
+        draw_shrapnel(self.get_shrapnel(), &args.block_textures);
 
         args.restore_2d();
 

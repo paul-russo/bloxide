@@ -453,6 +453,143 @@ pub fn draw_block_cube_scaled(center: Vec3, color: Color, scale: f32, textures: 
     }
 }
 
+/// Maximum simultaneous active shrapnel voxels across all clearing rows.
+pub const MAX_SHRAPNEL_VOXELS: usize = 320;
+
+/// A 3D tumbling sub-voxel spawned when rows are cleared.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ShrapnelVoxel {
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub rotation: Vec3,
+    pub angular_velocity: Vec3,
+    pub color: Color,
+    pub size: f32,
+    pub age: f32,
+    pub max_life: f32,
+    pub bounce_count: u8,
+    pub is_carnage: bool,
+    pub active: bool,
+}
+
+/// Draw a single tumbling shrapnel voxel with dynamic directional shading,
+/// point-sampled texture, and optional hot-metal carnages.
+pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &BlockTextures) {
+    if !voxel.active {
+        return;
+    }
+
+    let progress = (voxel.age / voxel.max_life).clamp(0.0, 1.0);
+    let fade = ((1.0 - progress) / 0.15).clamp(0.0, 1.0);
+    let scale = voxel.size * (0.25 + 0.75 * fade);
+    if scale <= 0.001 {
+        return;
+    }
+
+    // Four-line clears briefly superheat the shrapnel to molten amber/red before cooling.
+    let color = if voxel.is_carnage && progress < 0.45 {
+        let heat = (1.0 - (progress / 0.45)).powi(2);
+        Color::new(
+            (voxel.color.r * (1.0 - heat) + 1.0 * heat).clamp(0.0, 1.0),
+            (voxel.color.g * (1.0 - heat) + 0.72 * heat).clamp(0.0, 1.0),
+            (voxel.color.b * (1.0 - heat) + 0.22 * heat).clamp(0.0, 1.0),
+            1.0,
+        )
+    } else {
+        voxel.color
+    };
+
+    let rot = Quat::from_euler(
+        EulerRot::XYZ,
+        voxel.rotation.x,
+        voxel.rotation.y,
+        voxel.rotation.z,
+    );
+    let edge_x = rot * Vec3::new(scale, 0.0, 0.0);
+    let edge_y = rot * Vec3::new(0.0, scale, 0.0);
+    let edge_z = rot * Vec3::new(0.0, 0.0, scale);
+    let min = voxel.position - 0.5 * (edge_x + edge_y + edge_z);
+
+    let light_dir = Vec3::new(-0.35, 0.75, 0.55).normalize();
+    let texture = textures.for_color(color);
+
+    let face_normals = [
+        -rot * Vec3::Z,
+        rot * Vec3::Z,
+        -rot * Vec3::Y,
+        rot * Vec3::Y,
+        -rot * Vec3::X,
+        rot * Vec3::X,
+    ];
+
+    let face_origins = [
+        min,
+        min + edge_z,
+        min,
+        min + edge_y,
+        min,
+        min + edge_x,
+    ];
+
+    let face_e1_e2 = [
+        (edge_x, edge_y),
+        (edge_x, edge_y),
+        (edge_x, edge_z),
+        (edge_x, edge_z),
+        (edge_y, edge_z),
+        (edge_y, edge_z),
+    ];
+
+    let corners = [
+        min,
+        min + edge_x,
+        min + edge_x + edge_y,
+        min + edge_y,
+        min + edge_z,
+        min + edge_x + edge_z,
+        min + edge_x + edge_y + edge_z,
+        min + edge_y + edge_z,
+    ];
+
+    let mut visible_faces = [false; 6];
+    for index in 0..6 {
+        let normal = face_normals[index];
+        let face_center = face_origins[index] + 0.5 * (face_e1_e2[index].0 + face_e1_e2[index].1);
+        let cam_dir = CAMERA_POSITION - face_center;
+
+        if normal.dot(cam_dir) > 0.0 {
+            visible_faces[index] = true;
+            let ndotl = normal.dot(light_dir).max(0.0);
+            let shade = 0.42 + 0.88 * ndotl;
+            draw_affine_parallelogram(
+                face_origins[index],
+                face_e1_e2[index].0,
+                face_e1_e2[index].1,
+                Some(texture),
+                shaded(color, shade, 1.0),
+            );
+        }
+    }
+
+    let visible_edges = visible_block_edges(visible_faces);
+    for (index, &(start, end, adjacent_a, adjacent_b)) in BLOCK_EDGES.iter().enumerate() {
+        let visible_count = visible_faces[adjacent_a] as u8 + visible_faces[adjacent_b] as u8;
+        if visible_edges[index] {
+            let shade = if visible_count == 2 { 0.45 } else { 0.28 };
+            draw_line_3d(corners[start], corners[end], shaded(color, shade, 1.0));
+        }
+    }
+}
+
+/// Draw all active 3D shrapnel voxels.
+pub fn draw_shrapnel(voxels: &[ShrapnelVoxel], textures: &BlockTextures) {
+    for voxel in voxels {
+        if voxel.active {
+            draw_shrapnel_voxel(voxel, textures);
+        }
+    }
+}
+
 /// Draw a single playfield block as an inset shaded cube centred on `center`.
 pub fn draw_block_cube(center: Vec3, color: Color, textures: &BlockTextures) {
     draw_block_cube_scaled(center, color, 1.0, textures);
@@ -765,5 +902,12 @@ mod tests {
 
         assert!(BEZEL_THROAT_Z > BLOCK_INSET * 0.5);
         assert!(BEZEL_FRONT_Z > BEZEL_THROAT_Z);
+    }
+
+    #[test]
+    fn shrapnel_voxel_defaults_to_inactive() {
+        let voxel = ShrapnelVoxel::default();
+        assert!(!voxel.active);
+        assert_eq!(voxel.age, 0.0);
     }
 }
