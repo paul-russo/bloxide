@@ -68,13 +68,16 @@ pub mod pieces {
     use super::{OrientationDef, Piece};
     use macroquad::{color_u8, prelude::Color};
 
-    pub const PIECE_COLOR_I: Color = color_u8!(100, 196, 235, 255);
-    pub const PIECE_COLOR_J: Color = color_u8!(92, 101, 168, 255);
-    pub const PIECE_COLOR_L: Color = color_u8!(224, 127, 58, 255);
-    pub const PIECE_COLOR_O: Color = color_u8!(241, 212, 72, 255);
-    pub const PIECE_COLOR_S: Color = color_u8!(100, 180, 82, 255);
-    pub const PIECE_COLOR_T: Color = color_u8!(140, 26, 245, 255);
-    pub const PIECE_COLOR_Z: Color = color_u8!(234, 51, 35, 255);
+    // Restricted, earthy arena-shooter palette. The hues remain instantly
+    // distinguishable, but every colour feels like it came from the same 1997
+    // software renderer instead of a modern emissive display.
+    pub const PIECE_COLOR_I: Color = color_u8!(65, 151, 153, 255);
+    pub const PIECE_COLOR_J: Color = color_u8!(73, 91, 132, 255);
+    pub const PIECE_COLOR_L: Color = color_u8!(196, 99, 38, 255);
+    pub const PIECE_COLOR_O: Color = color_u8!(202, 160, 48, 255);
+    pub const PIECE_COLOR_S: Color = color_u8!(89, 132, 62, 255);
+    pub const PIECE_COLOR_T: Color = color_u8!(125, 69, 127, 255);
+    pub const PIECE_COLOR_Z: Color = color_u8!(164, 48, 37, 255);
 
     pub const I: Piece = Piece {
         name: "I",

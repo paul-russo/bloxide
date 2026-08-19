@@ -1,9 +1,15 @@
 use crate::{
     bag_manager::BagManager,
-    grid::Grid,
+    grid::{
+        ClearedBlock, Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS, MAX_CLEARED_CELLS,
+        VISIBLE_GRID_COUNT_ROWS,
+    },
     high_score_manager::HighScoreManager,
     piece::{BlockCanvas, Piece},
+    render3d::{cell_center, ShrapnelVoxel, MAX_SHRAPNEL_VOXELS},
 };
+use macroquad::prelude::{Color, Vec3};
+use rand::Rng;
 use std::time::Instant;
 
 const TICKS_PER_SECOND: f32 = 60.0;
@@ -13,6 +19,68 @@ const REPEAT_DELAY_TICKS: isize = 11; // ~183ms. Delay before repeating horizont
 const REPEAT_INTERVAL_TICKS: isize = 4; // ~67ms, or 15 times per second. Repeat interval for horizontal movement.
 const LOCK_DELAY_TICKS: isize = 30; // 30 ticks, 500ms. Delay after which the active piece is locked in place.
 const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before lock delay can no longer be reset.
+const LOCK_IMPACT_TICKS: usize = 10;
+const LINE_CLEAR_EFFECT_TICKS: usize = 40;
+const MAX_IMPACT_CONTACTS: usize = 4;
+
+/// Find every downward contact made by the active piece. Coordinates are in
+/// grid space: columns use cell centres and rows identify the supporting block
+/// (or the floor boundary at [`GRID_COUNT_ROWS`]). A tetromino can contribute at
+/// most four independent contacts.
+fn impact_contact_origins(
+    grid_locked: &Grid,
+    active_piece_row: isize,
+    active_piece_col: isize,
+    canvas: &BlockCanvas,
+    bounds_height: usize,
+    bounds_width: usize,
+) -> ([(f32, f32); MAX_IMPACT_CONTACTS], usize) {
+    let mut contacts = [(0.0, 0.0); MAX_IMPACT_CONTACTS];
+    let mut contact_count = 0;
+    let mut occupied_col_sum = 0.0;
+    let mut occupied_count = 0.0;
+    let mut lowest_occupied_row = active_piece_row;
+
+    for canvas_row in 0..bounds_height {
+        for canvas_col in 0..bounds_width {
+            if canvas[canvas_row][canvas_col].is_none() {
+                continue;
+            }
+
+            let grid_row = active_piece_row + canvas_row as isize;
+            let grid_col = active_piece_col + canvas_col as isize;
+            let below_row = grid_row + 1;
+            let column_center = grid_col as f32 + 0.5;
+
+            occupied_col_sum += column_center;
+            occupied_count += 1.0;
+            lowest_occupied_row = lowest_occupied_row.max(grid_row);
+
+            let touches_floor = below_row >= GRID_COUNT_ROWS as isize;
+            let touches_stack = below_row >= 0
+                && grid_col >= 0
+                && grid_col < GRID_COUNT_COLS as isize
+                && grid_locked.has_block_at_cell(below_row as usize, grid_col as usize);
+
+            if touches_floor || touches_stack {
+                contacts[contact_count] = (column_center, below_row as f32);
+                contact_count += 1;
+            }
+        }
+    }
+
+    if contact_count == 0 && occupied_count > 0.0 {
+        // Locking should always have at least one downward contact, but retain a
+        // geometrically sensible fallback for malformed or future piece rules.
+        contacts[0] = (
+            occupied_col_sum / occupied_count,
+            lowest_occupied_row as f32 + 1.0,
+        );
+        contact_count = 1;
+    }
+
+    (contacts, contact_count)
+}
 
 #[derive(Debug, Default)]
 pub struct GameInput {
@@ -65,6 +133,15 @@ pub struct GameState<'a> {
     piece_dirty: bool,
     // Cached ghost row
     cached_ghost_row: isize,
+    // Short-lived presentation cues consumed by the renderer. Keeping these in
+    // the game state makes effects deterministic and ensures pause freezes them.
+    impact_ticks_remaining: usize,
+    clear_effect_ticks_remaining: usize,
+    last_clear_count: usize,
+    impact_origins: [(f32, f32); MAX_IMPACT_CONTACTS],
+    impact_origin_count: usize,
+    impact_color: Color,
+    shrapnel_voxels: [ShrapnelVoxel; MAX_SHRAPNEL_VOXELS],
 }
 
 impl<'a> GameState<'a> {
@@ -117,6 +194,13 @@ impl<'a> GameState<'a> {
             cached_bounds_width,
             piece_dirty: true,
             cached_ghost_row: 0,
+            impact_ticks_remaining: 0,
+            clear_effect_ticks_remaining: 0,
+            last_clear_count: 0,
+            impact_origins: [(0.0, 0.0); MAX_IMPACT_CONTACTS],
+            impact_origin_count: 0,
+            impact_color: active_piece.color,
+            shrapnel_voxels: [ShrapnelVoxel::default(); MAX_SHRAPNEL_VOXELS],
         }
     }
 
@@ -232,6 +316,18 @@ impl<'a> GameState<'a> {
             return;
         }
 
+        let (contact_origins, contact_count) = impact_contact_origins(
+            &self.grid_locked,
+            self.active_piece_row,
+            self.active_piece_col,
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
+        );
+        self.impact_origins = contact_origins;
+        self.impact_origin_count = contact_count;
+        self.impact_color = self.active_piece.color;
+
         self.grid_locked.set_cells(
             self.active_piece_row,
             self.active_piece_col,
@@ -239,6 +335,8 @@ impl<'a> GameState<'a> {
             self.cached_bounds_height,
             self.cached_bounds_width,
         );
+
+        self.impact_ticks_remaining = self.impact_ticks_remaining.max(LOCK_IMPACT_TICKS);
 
         self.clear_filled_rows_and_update_score();
 
@@ -256,6 +354,11 @@ impl<'a> GameState<'a> {
 
         let lines_dropped = (landing_row - self.active_piece_row).max(0);
         self.active_piece_row = landing_row;
+
+        // Longer drops land with a little more visual weight, while the cap
+        // keeps the pulse brief enough not to distract from the next piece.
+        self.impact_ticks_remaining =
+            (LOCK_IMPACT_TICKS + lines_dropped as usize).min(LOCK_IMPACT_TICKS + 12);
 
         self.score += 2 * lines_dropped as usize;
 
@@ -452,6 +555,16 @@ impl<'a> GameState<'a> {
 
         self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
 
+        let tick_delta = self.get_tick_delta();
+        self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(tick_delta);
+        self.clear_effect_ticks_remaining =
+            self.clear_effect_ticks_remaining.saturating_sub(tick_delta);
+
+        if tick_delta > 0 {
+            let dt = (tick_delta as f32 / TICKS_PER_SECOND).min(0.1);
+            self.update_shrapnel(dt);
+        }
+
         let speed_modifier = if input.soft_drop {
             (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
         } else {
@@ -512,9 +625,208 @@ impl<'a> GameState<'a> {
         self.rows_cleared += new_rows_cleared;
     }
 
+    fn update_shrapnel(&mut self, dt: f32) {
+        const GRAVITY: f32 = 28.0;
+        const DRAG: f32 = 0.985;
+        const WALL_X: f32 = (GRID_COUNT_COLS as f32 / 2.0) - 0.2;
+        const FLOOR_Y: f32 = -(VISIBLE_GRID_COUNT_ROWS as f32 / 2.0);
+        const BACK_WALL_Z: f32 = -0.35;
+
+        for voxel in self.shrapnel_voxels.iter_mut() {
+            if !voxel.active {
+                continue;
+            }
+
+            voxel.age += dt;
+            if voxel.age >= voxel.max_life {
+                voxel.active = false;
+                continue;
+            }
+
+            voxel.velocity.y -= GRAVITY * dt;
+            voxel.velocity.x *= DRAG;
+            voxel.velocity.z *= DRAG;
+
+            voxel.position += voxel.velocity * dt;
+            voxel.rotation += voxel.angular_velocity * dt;
+
+            // Bounce off left/right well walls
+            if voxel.position.x < -WALL_X && voxel.velocity.x < 0.0 {
+                voxel.position.x = -WALL_X;
+                voxel.velocity.x = -voxel.velocity.x * 0.45;
+                voxel.angular_velocity *= 0.7;
+            } else if voxel.position.x > WALL_X && voxel.velocity.x > 0.0 {
+                voxel.position.x = WALL_X;
+                voxel.velocity.x = -voxel.velocity.x * 0.45;
+                voxel.angular_velocity *= 0.7;
+            }
+
+            // Bounce off recessed back wall
+            if voxel.position.z < BACK_WALL_Z && voxel.velocity.z < 0.0 {
+                voxel.position.z = BACK_WALL_Z;
+                voxel.velocity.z = -voxel.velocity.z * 0.45;
+            }
+
+            // Bounce off well floor
+            if voxel.position.y < FLOOR_Y && voxel.velocity.y < 0.0 && voxel.bounce_count < 2 {
+                voxel.position.y = FLOOR_Y;
+                voxel.velocity.y = -voxel.velocity.y * 0.35;
+                voxel.bounce_count += 1;
+            }
+        }
+    }
+
+    fn spawn_shrapnel_for_cleared_blocks(
+        &mut self,
+        cleared_blocks: &[Option<ClearedBlock>; MAX_CLEARED_CELLS],
+        cleared_count: usize,
+        clear_count: usize,
+    ) {
+        let is_carnage = clear_count >= 4;
+
+        let voxels_per_block = match clear_count {
+            1 => 4,
+            2 => 6,
+            3 => 7,
+            _ => 8,
+        };
+
+        let (min_life, max_life) = match clear_count {
+            1 => (0.80, 1.20),
+            2 => (1.00, 1.45),
+            3 => (1.20, 1.75),
+            _ => (1.40, 2.20),
+        };
+
+        let (min_size, max_size) = match clear_count {
+            1 => (0.32, 0.38),
+            2 => (0.34, 0.40),
+            3 => (0.36, 0.44),
+            _ => (0.38, 0.46),
+        };
+
+        let (min_vel_y, max_vel_y) = match clear_count {
+            1 => (2.2, 5.2),
+            2 => (2.8, 6.2),
+            3 => (3.4, 7.2),
+            _ => (4.0, 8.5),
+        };
+
+        let (min_vel_z, max_vel_z) = match clear_count {
+            1 => (1.2, 3.0),
+            2 => (1.8, 4.5),
+            3 => (2.6, 6.0),
+            _ => (3.5, 8.0),
+        };
+
+        let spin_speed = match clear_count {
+            1 => 7.0,
+            2 => 9.5,
+            3 => 12.0,
+            _ => 14.5,
+        };
+
+        const SUB_VOXEL_OFFSETS: [(f32, f32, f32); 8] = [
+            (-0.22, -0.22, -0.22),
+            (0.22, -0.22, -0.22),
+            (-0.22, 0.22, -0.22),
+            (0.22, 0.22, -0.22),
+            (-0.22, -0.22, 0.22),
+            (0.22, -0.22, 0.22),
+            (-0.22, 0.22, 0.22),
+            (0.22, 0.22, 0.22),
+        ];
+
+        let mut pool_index = 0;
+        let mut rng = rand::thread_rng();
+
+        for i in 0..cleared_count {
+            let Some(cleared) = cleared_blocks[i] else {
+                continue;
+            };
+
+            let block_center = cell_center(cleared.visible_row, cleared.col);
+
+            let mut corner_indices = [0usize, 1, 2, 3, 4, 5, 6, 7];
+            for k in 0..voxels_per_block {
+                let swap_idx = rng.gen_range(k..8);
+                corner_indices.swap(k, swap_idx);
+            }
+
+            for &corner_idx in &corner_indices[..voxels_per_block] {
+                let start_index = pool_index;
+                while pool_index < MAX_SHRAPNEL_VOXELS && self.shrapnel_voxels[pool_index].active {
+                    pool_index += 1;
+                }
+
+                if pool_index >= MAX_SHRAPNEL_VOXELS {
+                    pool_index = 0;
+                    while pool_index < start_index && self.shrapnel_voxels[pool_index].active {
+                        pool_index += 1;
+                    }
+                }
+
+                let target_index = pool_index % MAX_SHRAPNEL_VOXELS;
+                pool_index = (target_index + 1) % MAX_SHRAPNEL_VOXELS;
+
+                let (ox, oy, oz) = SUB_VOXEL_OFFSETS[corner_idx];
+                let jitter = Vec3::new(
+                    rng.gen_range(-0.04..0.04),
+                    rng.gen_range(-0.04..0.04),
+                    rng.gen_range(-0.04..0.04),
+                );
+                let pos = block_center + Vec3::new(ox, oy, oz) + jitter;
+
+                let local_dir = Vec3::new(ox, oy, oz).normalize_or_zero();
+                let norm_x = (cleared.col as f32 - 4.5) / 4.5;
+                let vel_x = norm_x * rng.gen_range(2.0..4.5)
+                    + local_dir.x * rng.gen_range(1.0..2.5)
+                    + rng.gen_range(-1.2..1.2);
+                let vel_y =
+                    rng.gen_range(min_vel_y..max_vel_y) + local_dir.y * rng.gen_range(0.5..1.8);
+                let vel_z =
+                    (rng.gen_range(min_vel_z..max_vel_z) + (local_dir.z.max(0.0) * 1.5)).max(0.2);
+
+                let rot_vel = Vec3::new(
+                    rng.gen_range(-spin_speed..spin_speed),
+                    rng.gen_range(-spin_speed..spin_speed),
+                    rng.gen_range(-spin_speed..spin_speed),
+                );
+
+                let life = rng.gen_range(min_life..max_life);
+                let size = rng.gen_range(min_size..max_size);
+
+                self.shrapnel_voxels[target_index] = ShrapnelVoxel {
+                    position: pos,
+                    velocity: Vec3::new(vel_x, vel_y, vel_z),
+                    rotation: Vec3::new(
+                        rng.gen_range(0.0..std::f32::consts::TAU),
+                        rng.gen_range(0.0..std::f32::consts::TAU),
+                        rng.gen_range(0.0..std::f32::consts::TAU),
+                    ),
+                    angular_velocity: rot_vel,
+                    color: cleared.color,
+                    size,
+                    age: 0.0,
+                    max_life: life,
+                    bounce_count: 0,
+                    is_carnage,
+                    active: true,
+                };
+            }
+        }
+    }
+
     fn clear_filled_rows_and_update_score(&mut self) {
-        let rows_cleared = self.grid_locked.clear_all_filled_rows();
+        let (rows_cleared, cleared_blocks, cleared_count) =
+            self.grid_locked.clear_all_filled_rows_detailed();
         let level = self.get_level();
+
+        if rows_cleared > 0 {
+            self.last_clear_count = rows_cleared;
+            self.clear_effect_ticks_remaining = LINE_CLEAR_EFFECT_TICKS;
+            self.spawn_shrapnel_for_cleared_blocks(&cleared_blocks, cleared_count, rows_cleared);
+        }
 
         match rows_cleared {
             1 => self.score += 100 * level,
@@ -529,6 +841,14 @@ impl<'a> GameState<'a> {
 
     pub fn get_grid_locked(&self) -> &Grid {
         &self.grid_locked
+    }
+
+    pub fn get_grid_locked_mut(&mut self) -> &mut Grid {
+        &mut self.grid_locked
+    }
+
+    pub fn trigger_line_clear(&mut self) {
+        self.clear_filled_rows_and_update_score();
     }
 
     pub fn get_grid_active(&self) -> &Grid {
@@ -580,5 +900,124 @@ impl<'a> GameState<'a> {
 
     pub fn get_is_paused(&self) -> bool {
         self.is_paused
+    }
+
+    pub fn get_impact_effect(&self) -> f32 {
+        self.impact_ticks_remaining as f32 / (LOCK_IMPACT_TICKS + 12) as f32
+    }
+
+    pub fn get_clear_effect(&self) -> (usize, f32) {
+        (
+            self.last_clear_count,
+            self.clear_effect_ticks_remaining as f32 / LINE_CLEAR_EFFECT_TICKS as f32,
+        )
+    }
+
+    pub fn get_impact_origins(&self) -> (&[(f32, f32)], Color) {
+        (
+            &self.impact_origins[..self.impact_origin_count],
+            self.impact_color,
+        )
+    }
+
+    pub fn get_shrapnel(&self) -> &[ShrapnelVoxel] {
+        &self.shrapnel_voxels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::impact_contact_origins;
+    use crate::{block::Block, grid::Grid, piece::BlockCanvas};
+    use macroquad::prelude::WHITE;
+
+    #[test]
+    fn rotated_l_reports_each_contact_on_a_stepped_stack() {
+        let mut locked = Grid::new();
+        let block = Some(Block::new(WHITE));
+        // Supporting bed:
+        //    [e][f]
+        // [g][h][i]
+        locked
+            .set_cell(11, 4, block)
+            .set_cell(11, 5, block)
+            .set_cell(12, 3, block)
+            .set_cell(12, 4, block)
+            .set_cell(12, 5, block);
+
+        // Clockwise-rotated L:
+        // [a][b][c]
+        // [d]
+        let mut canvas: BlockCanvas = [[None; 5]; 5];
+        canvas[0][0] = block;
+        canvas[0][1] = block;
+        canvas[0][2] = block;
+        canvas[1][0] = block;
+
+        let (contacts, contact_count) = impact_contact_origins(&locked, 10, 3, &canvas, 2, 3);
+
+        assert_eq!(contact_count, 3);
+        assert_eq!(
+            &contacts[..contact_count],
+            &[(4.5, 11.0), (5.5, 11.0), (3.5, 12.0)]
+        );
+    }
+
+    #[test]
+    fn line_clears_spawn_active_shrapnel_voxels() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        // Fill bottom-most visible row (1-line clear)
+        for col in 0..crate::grid::GRID_COUNT_COLS {
+            game_state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+        }
+
+        game_state.clear_filled_rows_and_update_score();
+
+        let active_count = game_state
+            .get_shrapnel()
+            .iter()
+            .filter(|v| v.active)
+            .count();
+        // 10 blocks * 4 voxels per block = 40 voxels
+        assert_eq!(active_count, 40);
+
+        // Advance physics by several ticks
+        game_state.update_shrapnel(0.05);
+
+        for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
+            assert!(voxel.age > 0.0);
+        }
+    }
+
+    #[test]
+    fn carnage_line_clears_spawn_maximum_shrapnel_voxels() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        // Fill bottom 4 visible rows (4-line clear / Carnage)
+        for row in 18..=21 {
+            for col in 0..crate::grid::GRID_COUNT_COLS {
+                game_state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
+            }
+        }
+
+        game_state.clear_filled_rows_and_update_score();
+
+        let active_count = game_state
+            .get_shrapnel()
+            .iter()
+            .filter(|v| v.active)
+            .count();
+        // 40 blocks * 8 sub-voxels = 320 voxels (100% spawn rate)
+        assert_eq!(active_count, 320);
+
+        let carnage_count = game_state
+            .get_shrapnel()
+            .iter()
+            .filter(|v| v.active && v.is_carnage)
+            .count();
+        assert_eq!(carnage_count, 320);
     }
 }

@@ -1,10 +1,19 @@
 use crate::block::Block;
 use crate::piece::BlockCanvas;
+use macroquad::prelude::Color;
 
 pub const VISIBLE_GRID_COUNT_ROWS: usize = 20;
 pub const GRID_COUNT_ROWS: usize = 22;
 pub const FIRST_VISIBLE_ROW_ID: usize = GRID_COUNT_ROWS - VISIBLE_GRID_COUNT_ROWS;
 pub const GRID_COUNT_COLS: usize = 10;
+pub const MAX_CLEARED_CELLS: usize = 40;
+
+#[derive(Copy, Clone, Debug)]
+pub struct ClearedBlock {
+    pub visible_row: usize,
+    pub col: usize,
+    pub color: Color,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Grid {
@@ -188,12 +197,34 @@ impl Grid {
         true
     }
 
-    // Clears all filled rows (if any), returning the number of rows cleared.
-    pub fn clear_all_filled_rows(&mut self) -> usize {
+    /// Clears all filled rows (if any), returning the number of rows cleared along
+    /// with an array of cleared visible block details for particle and audio effects.
+    pub fn clear_all_filled_rows_detailed(
+        &mut self,
+    ) -> (usize, [Option<ClearedBlock>; MAX_CLEARED_CELLS], usize) {
         let mut cleared_row_ids: Vec<usize> = Vec::new();
+        let mut cleared_blocks = [None; MAX_CLEARED_CELLS];
+        let mut cleared_count = 0;
 
         for row_id in 0..GRID_COUNT_ROWS {
             if self.is_row_filled(row_id) {
+                if row_id >= FIRST_VISIBLE_ROW_ID {
+                    let visible_row = row_id - FIRST_VISIBLE_ROW_ID;
+
+                    for col_id in 0..GRID_COUNT_COLS {
+                        if let Some(block) = self.get_cell(row_id, col_id) {
+                            if cleared_count < MAX_CLEARED_CELLS {
+                                cleared_blocks[cleared_count] = Some(ClearedBlock {
+                                    visible_row,
+                                    col: col_id,
+                                    color: block.color,
+                                });
+                                cleared_count += 1;
+                            }
+                        }
+                    }
+                }
+
                 self.clear_row(row_id);
                 cleared_row_ids.push(row_id);
             }
@@ -213,6 +244,43 @@ impl Grid {
             }
         }
 
-        cleared_row_count
+        (cleared_row_count, cleared_blocks, cleared_count)
+    }
+
+    /// Clears all filled rows (if any), returning the number of rows cleared.
+    #[allow(dead_code)]
+    pub fn clear_all_filled_rows(&mut self) -> usize {
+        let (count, _, _) = self.clear_all_filled_rows_detailed();
+        count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use macroquad::prelude::RED;
+
+    #[test]
+    fn clear_all_filled_rows_detailed_reports_cleared_cells() {
+        let mut grid = Grid::new();
+        let block = Some(Block::new(RED));
+
+        // Fill row 21 (bottom-most visible row)
+        for col in 0..GRID_COUNT_COLS {
+            grid.set_cell(21, col, block);
+        }
+
+        let (cleared_rows, cleared_blocks, cleared_count) = grid.clear_all_filled_rows_detailed();
+        assert_eq!(cleared_rows, 1);
+        assert_eq!(cleared_count, GRID_COUNT_COLS);
+
+        for col in 0..GRID_COUNT_COLS {
+            let cleared = cleared_blocks[col].expect("Expected cleared block");
+            assert_eq!(cleared.visible_row, 19);
+            assert_eq!(cleared.col, col);
+            assert_eq!(cleared.color, RED);
+        }
+
+        assert_eq!(grid.clear_all_filled_rows(), 0);
     }
 }
