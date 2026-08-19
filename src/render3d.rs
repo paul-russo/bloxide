@@ -244,6 +244,15 @@ pub fn cell_center(visible_row: usize, col: usize) -> Vec3 {
     )
 }
 
+fn mix_color(a: Color, b: Color, t: f32) -> Color {
+    Color::new(
+        a.r + ((b.r - a.r) * t),
+        a.g + ((b.g - a.g) * t),
+        a.b + ((b.b - a.b) * t),
+        a.a + ((b.a - a.a) * t),
+    )
+}
+
 /// Scale a colour's RGB by `shade` and override its alpha, clamping to the valid
 /// range so that highlight multipliers above 1.0 saturate instead of wrapping.
 fn shaded(color: Color, shade: f32, alpha: f32) -> Color {
@@ -486,18 +495,57 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &BlockTextures) {
         return;
     }
 
-    // Four-line clears briefly superheat the shrapnel to molten amber/red before cooling.
-    let color = if voxel.is_carnage && progress < 0.45 {
-        let heat = (1.0 - (progress / 0.45)).powi(2);
-        Color::new(
-            (voxel.color.r * (1.0 - heat) + 1.0 * heat).clamp(0.0, 1.0),
-            (voxel.color.g * (1.0 - heat) + 0.72 * heat).clamp(0.0, 1.0),
-            (voxel.color.b * (1.0 - heat) + 0.22 * heat).clamp(0.0, 1.0),
-            1.0,
-        )
+    // Four-line clears superheat shrapnel into molten incandescence before
+    // slowly cooling back to the block's base material.
+    let (is_hot, heat) = if voxel.is_carnage && progress < 0.72 {
+        let t = (progress / 0.72).clamp(0.0, 1.0);
+        let heat_curve = (1.0 - t).powf(1.35);
+        (true, heat_curve)
+    } else {
+        (false, 0.0)
+    };
+
+    let color = if is_hot {
+        if heat > 0.60 {
+            let t = (heat - 0.60) / 0.40;
+            mix_color(
+                Color::new(1.0, 0.70, 0.12, 1.0),
+                Color::new(1.0, 0.98, 0.90, 1.0),
+                t,
+            )
+        } else if heat > 0.22 {
+            let t = (heat - 0.22) / 0.38;
+            mix_color(
+                Color::new(0.98, 0.18, 0.02, 1.0),
+                Color::new(1.0, 0.70, 0.12, 1.0),
+                t,
+            )
+        } else {
+            let t = heat / 0.22;
+            mix_color(
+                voxel.color,
+                Color::new(0.98, 0.18, 0.02, 1.0),
+                t,
+            )
+        }
     } else {
         voxel.color
     };
+
+    if is_hot && heat > 0.15 {
+        let halo_size = scale * (2.2 + 1.4 * heat);
+        let halo_alpha = (heat * 0.26 * fade).clamp(0.0, 0.35);
+        let halo_color = Color::new(1.0, 0.58, 0.12, halo_alpha);
+        let halo_origin = voxel.position - Vec3::new(halo_size * 0.5, halo_size * 0.5, 0.0);
+
+        draw_affine_parallelogram(
+            halo_origin,
+            Vec3::new(halo_size, 0.0, 0.0),
+            Vec3::new(0.0, halo_size, 0.0),
+            None,
+            halo_color,
+        );
+    }
 
     let rot = Quat::from_euler(
         EulerRot::XYZ,
@@ -560,12 +608,19 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &BlockTextures) {
         if normal.dot(cam_dir) > 0.0 {
             visible_faces[index] = true;
             let ndotl = normal.dot(light_dir).max(0.0);
-            let shade = 0.42 + 0.88 * ndotl;
+            let shade = (0.42 + 0.88 * ndotl) * (1.0 - heat * 0.85)
+                + (1.08 + 0.22 * ndotl) * (heat * 0.85);
+            let texture_opt = if is_hot && heat > 0.42 {
+                None
+            } else {
+                Some(texture)
+            };
+
             draw_affine_parallelogram(
                 face_origins[index],
                 face_e1_e2[index].0,
                 face_e1_e2[index].1,
-                Some(texture),
+                texture_opt,
                 shaded(color, shade, 1.0),
             );
         }
@@ -575,8 +630,19 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &BlockTextures) {
     for (index, &(start, end, adjacent_a, adjacent_b)) in BLOCK_EDGES.iter().enumerate() {
         let visible_count = visible_faces[adjacent_a] as u8 + visible_faces[adjacent_b] as u8;
         if visible_edges[index] {
-            let shade = if visible_count == 2 { 0.45 } else { 0.28 };
-            draw_line_3d(corners[start], corners[end], shaded(color, shade, 1.0));
+            let base_shade = if visible_count == 2 { 0.45 } else { 0.28 };
+            let edge_color = if is_hot && heat > 0.08 {
+                let hot_color = mix_color(
+                    Color::new(1.0, 0.65, 0.15, 1.0),
+                    Color::new(1.0, 1.0, 0.92, 1.0),
+                    heat,
+                );
+                mix_color(shaded(color, base_shade, 1.0), hot_color, heat)
+            } else {
+                shaded(color, base_shade, 1.0)
+            };
+
+            draw_line_3d(corners[start], corners[end], edge_color);
         }
     }
 }
@@ -909,5 +975,32 @@ mod tests {
         let voxel = ShrapnelVoxel::default();
         assert!(!voxel.active);
         assert_eq!(voxel.age, 0.0);
+    }
+
+    #[test]
+    fn carnage_voxel_heat_curve_spans_majority_of_lifetime() {
+        let mut voxel = ShrapnelVoxel {
+            active: true,
+            is_carnage: true,
+            size: 0.4,
+            age: 0.1,
+            max_life: 2.0,
+            color: Color::new(0.0, 0.5, 1.0, 1.0),
+            ..Default::default()
+        };
+
+        // At 5% progress, voxel should be in white-hot / incandescent phase
+        let progress_early = voxel.age / voxel.max_life;
+        assert!(progress_early < 0.1);
+
+        // Advance to 50% progress (1.0s in): should still be actively hot
+        voxel.age = 1.0;
+        let progress_mid = voxel.age / voxel.max_life;
+        assert!(progress_mid < 0.72);
+
+        // Advance past 75% progress (1.5s in): should be fully cooled to base color
+        voxel.age = 1.6;
+        let progress_late = voxel.age / voxel.max_life;
+        assert!(progress_late >= 0.72);
     }
 }

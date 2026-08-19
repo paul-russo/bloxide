@@ -1041,27 +1041,6 @@ fn draw_held_piece(held_piece: Option<Piece>, textures: &BlockTextures) {
     }
 }
 
-fn line_clear_banner_layout(
-    well: Rect,
-    center: Vec2,
-    text: &str,
-    text_size: f32,
-    lift: f32,
-) -> (Rect, f32) {
-    let (_, text_height, _) = pixel_text_metrics(text, text_size);
-    let vertical_padding = (6.0 * hud_scale()).round().max(3.0);
-    let banner_height = text_height + vertical_padding * 2.0;
-    let banner = Rect::new(
-        well.x + 12.0,
-        (center.y - lift - banner_height * 0.5).round(),
-        well.w - 24.0,
-        banner_height,
-    );
-    let text_baseline = banner.y + vertical_padding + text_height;
-
-    (banner, text_baseline)
-}
-
 fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
     let scale = hud_scale();
     let well = well_screen_rect();
@@ -1141,86 +1120,6 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
                 );
             }
         }
-    }
-
-    let (clear_count, clear_remaining) = game_state.get_clear_effect();
-    if clear_remaining > 0.0 && clear_count > 0 {
-        let elapsed = 1.0 - clear_remaining;
-        let fade = (clear_remaining * 2.2).min(1.0);
-        let sweep_y = (well.y + (well.h * elapsed)).floor();
-        let center = vec2(well.x + well.w * 0.5, well.y + well.h * 0.52);
-
-        draw_rectangle(
-            well.x,
-            well.y,
-            well.w,
-            well.h,
-            Color::new(0.72, 0.39, 0.10, clear_remaining * 0.11),
-        );
-        draw_rectangle(
-            well.x,
-            sweep_y,
-            well.w,
-            3.0,
-            Color::new(COLOR_AMBER.r, COLOR_AMBER.g, COLOR_AMBER.b, fade),
-        );
-
-        for index in 0..42 {
-            let seed = index as f32 + clear_count as f32 * 31.0;
-            let direction = vec2(hash01(seed) - 0.5, hash01(seed + 4.0) - 0.62);
-            let speed = 55.0 + hash01(seed + 11.0) * 115.0;
-            let point = center + direction * speed * elapsed + vec2(0.0, elapsed * elapsed * 64.0);
-            let size = if index % 5 == 0 {
-                3.0
-            } else {
-                1.0 + (index % 2) as f32
-            };
-            let color = if index % 3 == 0 {
-                COLOR_TEXT
-            } else {
-                COLOR_AMBER
-            };
-            draw_rectangle(
-                point.x.floor(),
-                point.y.floor(),
-                size,
-                size,
-                Color::new(color.r, color.g, color.b, fade),
-            );
-        }
-
-        let callout = match clear_count {
-            1 => "LINE CLEAR",
-            2 => "DOUBLE CLEAR",
-            3 => "TRIPLE CLEAR",
-            _ => "BLOXIDE!",
-        };
-        let lift = (elapsed * 18.0 * scale).floor();
-        let callout_size = 24.0 + (clear_count as f32 * 2.0);
-        let (banner, callout_baseline) =
-            line_clear_banner_layout(well, center, callout, callout_size, lift);
-        draw_rectangle(
-            banner.x,
-            banner.y,
-            banner.w,
-            banner.h,
-            Color::new(0.04, 0.035, 0.025, fade * 0.92),
-        );
-        draw_rectangle_lines(
-            banner.x,
-            banner.y,
-            banner.w,
-            banner.h,
-            1.0,
-            Color::new(COLOR_AMBER.r, COLOR_AMBER.g, COLOR_AMBER.b, fade),
-        );
-        draw_text_centered_at(
-            callout,
-            center.x,
-            callout_baseline,
-            callout_size,
-            Color::new(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, fade),
-        );
     }
 
     let pause_text = "ESC  PAUSE";
@@ -1628,28 +1527,6 @@ mod tests {
                     piece.name
                 );
             }
-        }
-    }
-
-    #[test]
-    fn line_clear_banner_contains_the_full_bitmap_text_height() {
-        let well = well_screen_rect();
-        let center = vec2(well.x + well.w * 0.5, well.y + well.h * 0.52);
-
-        for (text, size) in [
-            ("LINE CLEAR", 26.0),
-            ("DOUBLE CLEAR", 28.0),
-            ("TRIPLE CLEAR", 30.0),
-            ("BLOXIDE!", 32.0),
-        ] {
-            let (_, text_height, _) = pixel_text_metrics(text, size);
-            let (banner, baseline) = line_clear_banner_layout(well, center, text, size, 0.0);
-            let text_top = baseline - text_height;
-            let top_padding = text_top - banner.y;
-            let bottom_padding = banner.y + banner.h - baseline;
-
-            assert!(top_padding >= 3.0);
-            assert!(bottom_padding >= 3.0);
         }
     }
 }
