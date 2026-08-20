@@ -1,8 +1,8 @@
 use crate::{
     bag_manager::BagManager,
     grid::{
-        ClearedBlock, Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS, MAX_CLEARED_CELLS,
-        VISIBLE_GRID_COUNT_ROWS,
+        ClearedBlock, Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS,
+        MAX_CLEARED_CELLS, VISIBLE_GRID_COUNT_ROWS,
     },
     high_score_manager::HighScoreManager,
     piece::{BlockCanvas, Piece},
@@ -22,6 +22,22 @@ const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before l
 const LOCK_IMPACT_TICKS: usize = 10;
 const LINE_CLEAR_EFFECT_TICKS: usize = 40;
 const MAX_IMPACT_CONTACTS: usize = 4;
+const HARD_DROP_TRAIL_TICKS: usize = 9;
+const LEVEL_FLARE_TICKS: usize = 45;
+
+/// The path a hard-dropped piece just travelled, so the renderer can streak
+/// it. Rows are grid rows of the piece's canvas origin, before and after the
+/// drop.
+#[derive(Copy, Clone, Debug)]
+pub struct HardDropTrail {
+    pub start_row: isize,
+    pub landing_row: isize,
+    pub col: isize,
+    pub canvas: BlockCanvas,
+    pub bounds_height: usize,
+    pub bounds_width: usize,
+    pub color: Color,
+}
 
 /// Find every downward contact made by the active piece. Coordinates are in
 /// grid space: columns use cell centres and rows identify the supporting block
@@ -138,10 +154,15 @@ pub struct GameState<'a> {
     impact_ticks_remaining: usize,
     clear_effect_ticks_remaining: usize,
     last_clear_count: usize,
+    /// Bit `n` is set when visible row `n` was part of the last line clear.
+    last_clear_row_mask: u32,
     impact_origins: [(f32, f32); MAX_IMPACT_CONTACTS],
     impact_origin_count: usize,
     impact_color: Color,
     shrapnel_voxels: [ShrapnelVoxel; MAX_SHRAPNEL_VOXELS],
+    hard_drop_trail: Option<HardDropTrail>,
+    hard_drop_trail_ticks_remaining: usize,
+    level_flare_ticks_remaining: usize,
 }
 
 impl<'a> GameState<'a> {
@@ -197,10 +218,14 @@ impl<'a> GameState<'a> {
             impact_ticks_remaining: 0,
             clear_effect_ticks_remaining: 0,
             last_clear_count: 0,
+            last_clear_row_mask: 0,
             impact_origins: [(0.0, 0.0); MAX_IMPACT_CONTACTS],
             impact_origin_count: 0,
             impact_color: active_piece.color,
             shrapnel_voxels: [ShrapnelVoxel::default(); MAX_SHRAPNEL_VOXELS],
+            hard_drop_trail: None,
+            hard_drop_trail_ticks_remaining: 0,
+            level_flare_ticks_remaining: 0,
         }
     }
 
@@ -353,6 +378,20 @@ impl<'a> GameState<'a> {
         );
 
         let lines_dropped = (landing_row - self.active_piece_row).max(0);
+
+        if lines_dropped > 0 {
+            self.hard_drop_trail = Some(HardDropTrail {
+                start_row: self.active_piece_row,
+                landing_row,
+                col: self.active_piece_col,
+                canvas: self.cached_blocks,
+                bounds_height: self.cached_bounds_height,
+                bounds_width: self.cached_bounds_width,
+                color: self.active_piece.color,
+            });
+            self.hard_drop_trail_ticks_remaining = HARD_DROP_TRAIL_TICKS;
+        }
+
         self.active_piece_row = landing_row;
 
         // Longer drops land with a little more visual weight, while the cap
@@ -559,6 +598,10 @@ impl<'a> GameState<'a> {
         self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(tick_delta);
         self.clear_effect_ticks_remaining =
             self.clear_effect_ticks_remaining.saturating_sub(tick_delta);
+        self.hard_drop_trail_ticks_remaining =
+            self.hard_drop_trail_ticks_remaining.saturating_sub(tick_delta);
+        self.level_flare_ticks_remaining =
+            self.level_flare_ticks_remaining.saturating_sub(tick_delta);
 
         if tick_delta > 0 {
             let dt = (tick_delta as f32 / TICKS_PER_SECOND).min(0.1);
@@ -622,7 +665,12 @@ impl<'a> GameState<'a> {
     }
 
     fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
+        let level_before = self.get_level();
         self.rows_cleared += new_rows_cleared;
+
+        if self.get_level() > level_before {
+            self.level_flare_ticks_remaining = LEVEL_FLARE_TICKS;
+        }
     }
 
     fn update_shrapnel(&mut self, dt: f32) {
@@ -824,6 +872,10 @@ impl<'a> GameState<'a> {
 
         if rows_cleared > 0 {
             self.last_clear_count = rows_cleared;
+            self.last_clear_row_mask = cleared_blocks[..cleared_count]
+                .iter()
+                .flatten()
+                .fold(0, |mask, block| mask | (1 << block.visible_row));
             self.clear_effect_ticks_remaining = LINE_CLEAR_EFFECT_TICKS;
             self.spawn_shrapnel_for_cleared_blocks(&cleared_blocks, cleared_count, rows_cleared);
         }
@@ -849,6 +901,11 @@ impl<'a> GameState<'a> {
 
     pub fn trigger_line_clear(&mut self) {
         self.clear_filled_rows_and_update_score();
+    }
+
+    /// End the run immediately, for the screenshot harness.
+    pub fn trigger_game_over(&mut self) {
+        self.end_game();
     }
 
     pub fn get_grid_active(&self) -> &Grid {
@@ -911,6 +968,54 @@ impl<'a> GameState<'a> {
             self.last_clear_count,
             self.clear_effect_ticks_remaining as f32 / LINE_CLEAR_EFFECT_TICKS as f32,
         )
+    }
+
+    /// Visible rows involved in the most recent line clear, as a bitmask, for
+    /// as long as the clear effect is running.
+    pub fn get_clear_row_mask(&self) -> u32 {
+        if self.clear_effect_ticks_remaining == 0 {
+            0
+        } else {
+            self.last_clear_row_mask
+        }
+    }
+
+    /// The most recent hard drop and how much of its streak remains (1.0 just
+    /// after landing, fading to 0.0).
+    pub fn get_hard_drop_trail(&self) -> Option<(HardDropTrail, f32)> {
+        if self.hard_drop_trail_ticks_remaining == 0 {
+            return None;
+        }
+
+        self.hard_drop_trail.map(|trail| {
+            (
+                trail,
+                self.hard_drop_trail_ticks_remaining as f32 / HARD_DROP_TRAIL_TICKS as f32,
+            )
+        })
+    }
+
+    /// How strongly the lamps are flaring for a level-up (1.0 at the moment of
+    /// the level change, fading to 0.0).
+    pub fn get_level_flare(&self) -> f32 {
+        self.level_flare_ticks_remaining as f32 / LEVEL_FLARE_TICKS as f32
+    }
+
+    /// How close the stack is to topping out, from 0.0 (comfortably low) to
+    /// 1.0 (touching the ceiling), for the alert lighting.
+    pub fn get_danger(&self) -> f32 {
+        const DANGER_ROWS: f32 = 6.0;
+        let highest_visible_row = (FIRST_VISIBLE_ROW_ID..GRID_COUNT_ROWS).find(|&row| {
+            (0..GRID_COUNT_COLS).any(|col| self.grid_locked.has_block_at_cell(row, col))
+        });
+
+        match highest_visible_row {
+            Some(row) => {
+                let free_rows = (row - FIRST_VISIBLE_ROW_ID) as f32;
+                (1.0 - free_rows / DANGER_ROWS).clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        }
     }
 
     pub fn get_impact_origins(&self) -> (&[(f32, f32)], Color) {
@@ -1019,5 +1124,57 @@ mod tests {
             .filter(|v| v.active && v.is_carnage)
             .count();
         assert_eq!(carnage_count, 320);
+    }
+
+    #[test]
+    fn line_clears_report_which_visible_rows_went() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        for row in [19, 21] {
+            for col in 0..crate::grid::GRID_COUNT_COLS {
+                game_state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
+            }
+        }
+
+        assert_eq!(game_state.get_clear_row_mask(), 0);
+        game_state.clear_filled_rows_and_update_score();
+
+        // Grid rows 19 and 21 are visible rows 17 and 19.
+        assert_eq!(game_state.get_clear_row_mask(), (1 << 17) | (1 << 19));
+    }
+
+    #[test]
+    fn hard_drop_leaves_a_trail_from_where_the_piece_started() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+        let start_row = game_state.active_piece_row;
+        let color = game_state.active_piece.color;
+
+        assert!(game_state.get_hard_drop_trail().is_none());
+        game_state.hard_drop();
+
+        let (trail, strength) = game_state.get_hard_drop_trail().expect("trail");
+        assert_eq!(trail.start_row, start_row);
+        assert!(trail.landing_row > start_row);
+        assert_eq!(trail.color, color);
+        assert!((strength - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn danger_rises_as_the_stack_nears_the_ceiling() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+        assert_eq!(game_state.get_danger(), 0.0);
+
+        game_state.grid_locked.set_cell(21, 0, Some(Block::new(WHITE)));
+        assert_eq!(game_state.get_danger(), 0.0);
+
+        game_state.grid_locked.set_cell(5, 0, Some(Block::new(WHITE)));
+        let high = game_state.get_danger();
+        assert!(high > 0.0 && high < 1.0);
+
+        game_state.grid_locked.set_cell(2, 0, Some(Block::new(WHITE)));
+        assert_eq!(game_state.get_danger(), 1.0);
     }
 }

@@ -70,14 +70,16 @@ pub mod pieces {
 
     // Restricted, earthy arena-shooter palette. The hues remain instantly
     // distinguishable, but every colour feels like it came from the same 1997
-    // software renderer instead of a modern emissive display.
+    // software renderer instead of a modern emissive display. The three
+    // darkest hues (J, T, Z) are lifted a little so they do not sink into the
+    // well's shadowed back wall.
     pub const PIECE_COLOR_I: Color = color_u8!(65, 151, 153, 255);
-    pub const PIECE_COLOR_J: Color = color_u8!(73, 91, 132, 255);
+    pub const PIECE_COLOR_J: Color = color_u8!(80, 102, 150, 255);
     pub const PIECE_COLOR_L: Color = color_u8!(196, 99, 38, 255);
     pub const PIECE_COLOR_O: Color = color_u8!(202, 160, 48, 255);
     pub const PIECE_COLOR_S: Color = color_u8!(89, 132, 62, 255);
-    pub const PIECE_COLOR_T: Color = color_u8!(125, 69, 127, 255);
-    pub const PIECE_COLOR_Z: Color = color_u8!(164, 48, 37, 255);
+    pub const PIECE_COLOR_T: Color = color_u8!(140, 76, 142, 255);
+    pub const PIECE_COLOR_Z: Color = color_u8!(176, 52, 40, 255);
 
     pub const I: Piece = Piece {
         name: "I",

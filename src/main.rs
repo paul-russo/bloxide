@@ -1,14 +1,19 @@
 mod bag_manager;
 mod block;
 mod draw;
+mod effects;
 mod game_state;
 mod grid;
 mod high_score_manager;
+mod lighting;
 mod menu;
 mod piece;
+mod pixel_font;
+mod postfx;
 mod render3d;
+mod textures;
 
-use draw::{draw_backdrop, draw_background, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
+use draw::{draw_backdrop, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
 use game_state::{GameInput, GameState};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
@@ -31,6 +36,104 @@ enum CurrentScreen {
     MainMenu,
 }
 
+/// Which frame `--screenshot` captures before quitting. Each scene exercises a
+/// different slice of the renderer so visual changes can be checked headlessly.
+#[derive(Copy, Clone, PartialEq)]
+enum ScreenshotScene {
+    /// A seeded stack mid line-clear, with shrapnel and shake in flight.
+    Carnage,
+    /// The same seeded stack at rest, with nothing clearing.
+    Still,
+    /// A topped-out stack with the game over menu up.
+    GameOver,
+    /// The main menu over the empty well.
+    Menu,
+}
+
+fn screenshot_scene_from_args() -> Option<ScreenshotScene> {
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|arg| arg == "--screenshot") {
+        return None;
+    }
+
+    if args.iter().any(|arg| arg == "--menu") {
+        Some(ScreenshotScene::Menu)
+    } else if args.iter().any(|arg| arg == "--still") {
+        Some(ScreenshotScene::Still)
+    } else if args.iter().any(|arg| arg == "--gameover") {
+        Some(ScreenshotScene::GameOver)
+    } else {
+        Some(ScreenshotScene::Carnage)
+    }
+}
+
+/// How many frames to run before capturing, from `--frame=N`. Effects such as
+/// the clear flash and shrapnel burst evolve over the first second, so this
+/// picks which moment of them to inspect.
+fn screenshot_frame_from_args() -> usize {
+    const DEFAULT_FRAME: usize = 16;
+    std::env::args()
+        .find_map(|arg| arg.strip_prefix("--frame=").and_then(|n| n.parse().ok()))
+        .unwrap_or(DEFAULT_FRAME)
+}
+
+/// Seed a partially filled stack for screenshots. `Carnage` leaves the bottom
+/// rows complete so a line clear can be triggered; `Still` punches a column out
+/// so nothing is clearable and the stack simply sits there; `GameOver` piles
+/// the stack to the ceiling and ends the run.
+fn seed_screenshot_state<'a>(
+    scene: ScreenshotScene,
+    high_score_manager: &'a HighScoreManager,
+) -> GameState<'a> {
+    let mut game_state = GameState::new(high_score_manager);
+    let colors = [
+        piece::pieces::PIECE_COLOR_I,
+        piece::pieces::PIECE_COLOR_J,
+        piece::pieces::PIECE_COLOR_L,
+        piece::pieces::PIECE_COLOR_O,
+        piece::pieces::PIECE_COLOR_S,
+        piece::pieces::PIECE_COLOR_T,
+        piece::pieces::PIECE_COLOR_Z,
+    ];
+    let first_row = if scene == ScreenshotScene::GameOver { 4 } else { 17 };
+
+    for row in first_row..22 {
+        for col in 0..10 {
+            let gap = (row == 17 && (col == 2 || col == 3 || col == 7))
+                || (row == 18 && (col == 4 || col == 5))
+                || (scene == ScreenshotScene::Still && col == 4)
+                || (scene == ScreenshotScene::GameOver && (row * 7 + col * 3) % 5 == 0);
+            if gap {
+                continue;
+            }
+
+            game_state.get_grid_locked_mut().set_cell(
+                row,
+                col,
+                Some(block::Block::new(colors[(row * 3 + col) % colors.len()])),
+            );
+        }
+    }
+
+    match scene {
+        ScreenshotScene::Carnage => game_state.trigger_line_clear(),
+        ScreenshotScene::GameOver => game_state.trigger_game_over(),
+        ScreenshotScene::Still | ScreenshotScene::Menu => {}
+    }
+
+    game_state
+}
+
+/// Alpha-blended overlays leave partial alpha in the framebuffer, which image
+/// viewers then composite against their own backdrop. Force the export opaque
+/// so the PNG shows exactly what was on screen.
+fn export_opaque_png(mut image: Image, path: &str) {
+    for pixel in image.get_image_data_mut() {
+        pixel[3] = 255;
+    }
+    image.export_png(path);
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let high_score_manager = HighScoreManager::new();
@@ -39,40 +142,16 @@ async fn main() {
 
     // Game state
     let mut maybe_game_state: Option<GameState> = None;
-    let screenshot_mode = std::env::args().any(|arg| arg == "--screenshot");
+    let screenshot_scene = screenshot_scene_from_args();
+    let screenshot_capture_frame = screenshot_frame_from_args();
     let mut screenshot_frame: usize = 0;
 
-    if screenshot_mode {
-        current_screen = CurrentScreen::Game;
-        let mut gs = GameState::new(&high_score_manager);
-        let colors = [
-            piece::pieces::PIECE_COLOR_I,
-            piece::pieces::PIECE_COLOR_J,
-            piece::pieces::PIECE_COLOR_L,
-            piece::pieces::PIECE_COLOR_O,
-            piece::pieces::PIECE_COLOR_S,
-            piece::pieces::PIECE_COLOR_T,
-            piece::pieces::PIECE_COLOR_Z,
-        ];
-
-        // Seed several rows with stacked blocks
-        for row in 17..22 {
-            for col in 0..10 {
-                if !(row == 17 && (col == 2 || col == 3 || col == 7))
-                    && !(row == 18 && (col == 4 || col == 5))
-                {
-                    gs.get_grid_locked_mut().set_cell(
-                        row,
-                        col,
-                        Some(block::Block::new(colors[(row * 3 + col) % colors.len()])),
-                    );
-                }
-            }
+    match screenshot_scene {
+        Some(ScreenshotScene::Menu) | None => {}
+        Some(scene) => {
+            current_screen = CurrentScreen::Game;
+            maybe_game_state = Some(seed_screenshot_state(scene, &high_score_manager));
         }
-
-        // Trigger line clear on the filled rows to burst voxels into the 3D well
-        gs.trigger_line_clear();
-        maybe_game_state = Some(gs);
     }
 
     let mut menu_main = Menu::new(
@@ -129,7 +208,6 @@ async fn main() {
 
     loop {
         render_surface.begin_frame();
-        draw_background();
 
         let menu_input = MenuInput {
             up: is_key_pressed(KeyCode::Up),
@@ -167,8 +245,8 @@ async fn main() {
             }
 
             game_state.draw(render_surface.clone());
-            menu_game_over.draw(());
-            menu_paused.draw(());
+            menu_game_over.draw(render_surface.clone());
+            menu_paused.draw(render_surface.clone());
 
             game_state.clean_up();
         } else {
@@ -185,25 +263,24 @@ async fn main() {
             // frames the menu screen too, rather than it floating on a void.
             draw_backdrop(&render_surface);
 
-            menu_main.draw(());
-            high_score_manager.draw(());
+            menu_main.draw(render_surface.clone());
+            high_score_manager.draw(render_surface.clone());
         }
 
         render_surface.present();
 
         if is_key_pressed(KeyCode::F12) {
-            get_screen_data().export_png("screenshot.png");
+            export_opaque_png(get_screen_data(), "screenshot.png");
         }
 
-        if screenshot_mode {
+        if screenshot_scene.is_some() {
             screenshot_frame += 1;
-            if screenshot_frame >= 16 {
-                get_screen_data().export_png("screenshot.png");
-                render_surface
-                    .target
-                    .texture
-                    .get_texture_data()
-                    .export_png("screenshot-render-target.png");
+            if screenshot_frame >= screenshot_capture_frame {
+                export_opaque_png(get_screen_data(), "screenshot.png");
+                export_opaque_png(
+                    render_surface.target.texture.get_texture_data(),
+                    "screenshot-render-target.png",
+                );
                 quit();
             }
         }
