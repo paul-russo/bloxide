@@ -1,12 +1,15 @@
 use crate::{
     bag_manager::BagManager,
     grid::{
-        ClearedBlock, Grid, GRID_COUNT_COLS, GRID_COUNT_ROWS, MAX_CLEARED_CELLS,
-        VISIBLE_GRID_COUNT_ROWS,
+        ClearedBlock, Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS,
+        MAX_CLEARED_CELLS,
     },
     high_score_manager::HighScoreManager,
     piece::{BlockCanvas, Piece},
-    render3d::{cell_center, ShrapnelVoxel, MAX_SHRAPNEL_VOXELS},
+    render3d::{
+        cell_center, floor_gap_contains, LavaSplash, ShrapnelVoxel, FLOOR_Y, LAVA_Y,
+        MAX_LAVA_SPLASHES, MAX_SHRAPNEL_VOXELS, SPLASH_SECONDS,
+    },
 };
 use macroquad::prelude::{Color, Vec3};
 use rand::Rng;
@@ -22,6 +25,22 @@ const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before l
 const LOCK_IMPACT_TICKS: usize = 10;
 const LINE_CLEAR_EFFECT_TICKS: usize = 40;
 const MAX_IMPACT_CONTACTS: usize = 4;
+const HARD_DROP_TRAIL_TICKS: usize = 9;
+const LEVEL_FLARE_TICKS: usize = 45;
+
+/// The path a hard-dropped piece just travelled, so the renderer can streak
+/// it. Rows are grid rows of the piece's canvas origin, before and after the
+/// drop.
+#[derive(Copy, Clone, Debug)]
+pub struct HardDropTrail {
+    pub start_row: isize,
+    pub landing_row: isize,
+    pub col: isize,
+    pub canvas: BlockCanvas,
+    pub bounds_height: usize,
+    pub bounds_width: usize,
+    pub color: Color,
+}
 
 /// Find every downward contact made by the active piece. Coordinates are in
 /// grid space: columns use cell centres and rows identify the supporting block
@@ -138,10 +157,17 @@ pub struct GameState<'a> {
     impact_ticks_remaining: usize,
     clear_effect_ticks_remaining: usize,
     last_clear_count: usize,
+    /// Bit `n` is set when visible row `n` was part of the last line clear.
+    last_clear_row_mask: u32,
     impact_origins: [(f32, f32); MAX_IMPACT_CONTACTS],
     impact_origin_count: usize,
     impact_color: Color,
     shrapnel_voxels: [ShrapnelVoxel; MAX_SHRAPNEL_VOXELS],
+    lava_splashes: [LavaSplash; MAX_LAVA_SPLASHES],
+    next_splash_index: usize,
+    hard_drop_trail: Option<HardDropTrail>,
+    hard_drop_trail_ticks_remaining: usize,
+    level_flare_ticks_remaining: usize,
 }
 
 impl<'a> GameState<'a> {
@@ -197,10 +223,16 @@ impl<'a> GameState<'a> {
             impact_ticks_remaining: 0,
             clear_effect_ticks_remaining: 0,
             last_clear_count: 0,
+            last_clear_row_mask: 0,
             impact_origins: [(0.0, 0.0); MAX_IMPACT_CONTACTS],
             impact_origin_count: 0,
             impact_color: active_piece.color,
             shrapnel_voxels: [ShrapnelVoxel::default(); MAX_SHRAPNEL_VOXELS],
+            lava_splashes: [LavaSplash::default(); MAX_LAVA_SPLASHES],
+            next_splash_index: 0,
+            hard_drop_trail: None,
+            hard_drop_trail_ticks_remaining: 0,
+            level_flare_ticks_remaining: 0,
         }
     }
 
@@ -353,6 +385,20 @@ impl<'a> GameState<'a> {
         );
 
         let lines_dropped = (landing_row - self.active_piece_row).max(0);
+
+        if lines_dropped > 0 {
+            self.hard_drop_trail = Some(HardDropTrail {
+                start_row: self.active_piece_row,
+                landing_row,
+                col: self.active_piece_col,
+                canvas: self.cached_blocks,
+                bounds_height: self.cached_bounds_height,
+                bounds_width: self.cached_bounds_width,
+                color: self.active_piece.color,
+            });
+            self.hard_drop_trail_ticks_remaining = HARD_DROP_TRAIL_TICKS;
+        }
+
         self.active_piece_row = landing_row;
 
         // Longer drops land with a little more visual weight, while the cap
@@ -559,6 +605,10 @@ impl<'a> GameState<'a> {
         self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(tick_delta);
         self.clear_effect_ticks_remaining =
             self.clear_effect_ticks_remaining.saturating_sub(tick_delta);
+        self.hard_drop_trail_ticks_remaining =
+            self.hard_drop_trail_ticks_remaining.saturating_sub(tick_delta);
+        self.level_flare_ticks_remaining =
+            self.level_flare_ticks_remaining.saturating_sub(tick_delta);
 
         if tick_delta > 0 {
             let dt = (tick_delta as f32 / TICKS_PER_SECOND).min(0.1);
@@ -622,15 +672,35 @@ impl<'a> GameState<'a> {
     }
 
     fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
+        let level_before = self.get_level();
         self.rows_cleared += new_rows_cleared;
+
+        if self.get_level() > level_before {
+            self.level_flare_ticks_remaining = LEVEL_FLARE_TICKS;
+        }
     }
 
     fn update_shrapnel(&mut self, dt: f32) {
         const GRAVITY: f32 = 28.0;
         const DRAG: f32 = 0.985;
         const WALL_X: f32 = (GRID_COUNT_COLS as f32 / 2.0) - 0.2;
-        const FLOOR_Y: f32 = -(VISIBLE_GRID_COUNT_ROWS as f32 / 2.0);
         const BACK_WALL_Z: f32 = -0.35;
+        const FRONT_Z: f32 = 0.35;
+
+        // Debris sits on the melt heating up and then sinks, over roughly this
+        // long once it lands.
+        const SINK_SECONDS: f32 = 1.4;
+
+        for splash in self.lava_splashes.iter_mut().filter(|splash| splash.active) {
+            splash.age += dt;
+            if splash.age >= SPLASH_SECONDS {
+                splash.active = false;
+            }
+        }
+
+        let mut landings: [(Vec3, f32); MAX_SHRAPNEL_VOXELS] =
+            [(Vec3::ZERO, 0.0); MAX_SHRAPNEL_VOXELS];
+        let mut landing_count = 0;
 
         for voxel in self.shrapnel_voxels.iter_mut() {
             if !voxel.active {
@@ -638,8 +708,16 @@ impl<'a> GameState<'a> {
             }
 
             voxel.age += dt;
-            if voxel.age >= voxel.max_life {
-                voxel.active = false;
+
+            if voxel.is_sinking() {
+                // Settle on the surface and slow the tumble as the metal
+                // takes hold; retire once fully under.
+                voxel.submersion += dt / SINK_SECONDS;
+                voxel.rotation += voxel.angular_velocity * dt;
+                voxel.angular_velocity *= 0.9;
+                if voxel.submersion >= 1.0 {
+                    voxel.active = false;
+                }
                 continue;
             }
 
@@ -667,13 +745,51 @@ impl<'a> GameState<'a> {
                 voxel.velocity.z = -voxel.velocity.z * 0.45;
             }
 
-            // Bounce off well floor
-            if voxel.position.y < FLOOR_Y && voxel.velocity.y < 0.0 && voxel.bounce_count < 2 {
-                voxel.position.y = FLOOR_Y;
-                voxel.velocity.y = -voxel.velocity.y * 0.35;
-                voxel.bounce_count += 1;
+            // The well has no solid floor, only a grate. Debris that comes
+            // down on a bar takes one bounce off it; debris over a gap, or
+            // anything coming down a second time, drops through into the pit.
+            // Below the grate the shaft is closed at the front by the grille.
+            if voxel.position.y < FLOOR_Y && voxel.velocity.y < 0.0 {
+                let over_bar = !floor_gap_contains(voxel.position.x);
+                let above_grate = voxel.position.y > FLOOR_Y - 0.3;
+                if over_bar && above_grate && voxel.bounce_count == 0 {
+                    voxel.position.y = FLOOR_Y;
+                    voxel.velocity.y = -voxel.velocity.y * 0.35;
+                    voxel.velocity.x += if voxel.position.x >= 0.0 { 0.6 } else { -0.6 };
+                    voxel.bounce_count += 1;
+                }
+            }
+            if voxel.position.y < FLOOR_Y && voxel.position.z > FRONT_Z && voxel.velocity.z > 0.0 {
+                voxel.position.z = FRONT_Z;
+                voxel.velocity.z = -voxel.velocity.z * 0.45;
+            }
+
+            // Touching the melt starts the sink.
+            if voxel.position.y - voxel.size * 0.5 <= LAVA_Y {
+                voxel.position.y = LAVA_Y + voxel.size * 0.5;
+                voxel.velocity = Vec3::ZERO;
+                voxel.submersion = f32::EPSILON;
+                landings[landing_count] = (voxel.position, voxel.size);
+                landing_count += 1;
             }
         }
+
+        for &(position, size) in &landings[..landing_count] {
+            self.spawn_lava_splash(position, size);
+        }
+    }
+
+    /// Start a splash ring where a piece of debris went into the melt. The
+    /// pool is a ring buffer; with many landings at once the oldest splash is
+    /// simply replaced, which is invisible amid the rest.
+    fn spawn_lava_splash(&mut self, position: Vec3, size: f32) {
+        self.lava_splashes[self.next_splash_index] = LavaSplash {
+            position,
+            age: 0.0,
+            size,
+            active: true,
+        };
+        self.next_splash_index = (self.next_splash_index + 1) % MAX_LAVA_SPLASHES;
     }
 
     fn spawn_shrapnel_for_cleared_blocks(
@@ -689,13 +805,6 @@ impl<'a> GameState<'a> {
             2 => 6,
             3 => 7,
             _ => 8,
-        };
-
-        let (min_life, max_life) = match clear_count {
-            1 => (0.80, 1.20),
-            2 => (1.00, 1.45),
-            3 => (1.20, 1.75),
-            _ => (1.40, 2.20),
         };
 
         let (min_size, max_size) = match clear_count {
@@ -793,7 +902,6 @@ impl<'a> GameState<'a> {
                     rng.gen_range(-spin_speed..spin_speed),
                 );
 
-                let life = rng.gen_range(min_life..max_life);
                 let size = rng.gen_range(min_size..max_size);
 
                 self.shrapnel_voxels[target_index] = ShrapnelVoxel {
@@ -808,7 +916,7 @@ impl<'a> GameState<'a> {
                     color: cleared.color,
                     size,
                     age: 0.0,
-                    max_life: life,
+                    submersion: 0.0,
                     bounce_count: 0,
                     is_carnage,
                     active: true,
@@ -824,6 +932,10 @@ impl<'a> GameState<'a> {
 
         if rows_cleared > 0 {
             self.last_clear_count = rows_cleared;
+            self.last_clear_row_mask = cleared_blocks[..cleared_count]
+                .iter()
+                .flatten()
+                .fold(0, |mask, block| mask | (1 << block.visible_row));
             self.clear_effect_ticks_remaining = LINE_CLEAR_EFFECT_TICKS;
             self.spawn_shrapnel_for_cleared_blocks(&cleared_blocks, cleared_count, rows_cleared);
         }
@@ -849,6 +961,11 @@ impl<'a> GameState<'a> {
 
     pub fn trigger_line_clear(&mut self) {
         self.clear_filled_rows_and_update_score();
+    }
+
+    /// End the run immediately, for the screenshot harness.
+    pub fn trigger_game_over(&mut self) {
+        self.end_game();
     }
 
     pub fn get_grid_active(&self) -> &Grid {
@@ -913,6 +1030,54 @@ impl<'a> GameState<'a> {
         )
     }
 
+    /// Visible rows involved in the most recent line clear, as a bitmask, for
+    /// as long as the clear effect is running.
+    pub fn get_clear_row_mask(&self) -> u32 {
+        if self.clear_effect_ticks_remaining == 0 {
+            0
+        } else {
+            self.last_clear_row_mask
+        }
+    }
+
+    /// The most recent hard drop and how much of its streak remains (1.0 just
+    /// after landing, fading to 0.0).
+    pub fn get_hard_drop_trail(&self) -> Option<(HardDropTrail, f32)> {
+        if self.hard_drop_trail_ticks_remaining == 0 {
+            return None;
+        }
+
+        self.hard_drop_trail.map(|trail| {
+            (
+                trail,
+                self.hard_drop_trail_ticks_remaining as f32 / HARD_DROP_TRAIL_TICKS as f32,
+            )
+        })
+    }
+
+    /// How strongly the lamps are flaring for a level-up (1.0 at the moment of
+    /// the level change, fading to 0.0).
+    pub fn get_level_flare(&self) -> f32 {
+        self.level_flare_ticks_remaining as f32 / LEVEL_FLARE_TICKS as f32
+    }
+
+    /// How close the stack is to topping out, from 0.0 (comfortably low) to
+    /// 1.0 (touching the ceiling), for the alert lighting.
+    pub fn get_danger(&self) -> f32 {
+        const DANGER_ROWS: f32 = 6.0;
+        let highest_visible_row = (FIRST_VISIBLE_ROW_ID..GRID_COUNT_ROWS).find(|&row| {
+            (0..GRID_COUNT_COLS).any(|col| self.grid_locked.has_block_at_cell(row, col))
+        });
+
+        match highest_visible_row {
+            Some(row) => {
+                let free_rows = (row - FIRST_VISIBLE_ROW_ID) as f32;
+                (1.0 - free_rows / DANGER_ROWS).clamp(0.0, 1.0)
+            }
+            None => 0.0,
+        }
+    }
+
     pub fn get_impact_origins(&self) -> (&[(f32, f32)], Color) {
         (
             &self.impact_origins[..self.impact_origin_count],
@@ -922,6 +1087,10 @@ impl<'a> GameState<'a> {
 
     pub fn get_shrapnel(&self) -> &[ShrapnelVoxel] {
         &self.shrapnel_voxels
+    }
+
+    pub fn get_lava_splashes(&self) -> &[LavaSplash] {
+        &self.lava_splashes
     }
 }
 
@@ -992,6 +1161,44 @@ mod tests {
     }
 
     #[test]
+    fn debris_falls_through_the_grate_splashes_and_sinks_into_the_melt() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        for col in 0..crate::grid::GRID_COUNT_COLS {
+            game_state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+        }
+        game_state.clear_filled_rows_and_update_score();
+        assert!(game_state.get_lava_splashes().iter().all(|splash| !splash.active));
+
+        // Run the burst for a second at 60 Hz: by then everything has fallen
+        // through the grate, and some of it has reached the melt.
+        let mut saw_below_floor = false;
+        let mut saw_sinking = false;
+        for _ in 0..60 {
+            game_state.update_shrapnel(1.0 / 60.0);
+            for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
+                saw_below_floor |= voxel.position.y < super::FLOOR_Y - 0.5;
+                saw_sinking |= voxel.is_sinking();
+                assert!(voxel.position.y >= super::LAVA_Y - 0.001, "nothing goes under");
+                if voxel.is_sinking() {
+                    assert!((voxel.position.y - voxel.size * 0.5 - super::LAVA_Y).abs() < 0.01);
+                }
+            }
+        }
+        assert!(saw_below_floor, "debris should drop through the open floor");
+        assert!(saw_sinking, "debris should land in the melt");
+        assert!(game_state.get_lava_splashes().iter().any(|splash| splash.active));
+
+        // Given a few more seconds, every piece has sunk and been retired.
+        for _ in 0..300 {
+            game_state.update_shrapnel(1.0 / 60.0);
+        }
+        assert!(game_state.get_shrapnel().iter().all(|v| !v.active));
+    }
+
+
+    #[test]
     fn carnage_line_clears_spawn_maximum_shrapnel_voxels() {
         let high_score_manager = crate::high_score_manager::HighScoreManager::new();
         let mut game_state = super::GameState::new(&high_score_manager);
@@ -1019,5 +1226,57 @@ mod tests {
             .filter(|v| v.active && v.is_carnage)
             .count();
         assert_eq!(carnage_count, 320);
+    }
+
+    #[test]
+    fn line_clears_report_which_visible_rows_went() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        for row in [19, 21] {
+            for col in 0..crate::grid::GRID_COUNT_COLS {
+                game_state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
+            }
+        }
+
+        assert_eq!(game_state.get_clear_row_mask(), 0);
+        game_state.clear_filled_rows_and_update_score();
+
+        // Grid rows 19 and 21 are visible rows 17 and 19.
+        assert_eq!(game_state.get_clear_row_mask(), (1 << 17) | (1 << 19));
+    }
+
+    #[test]
+    fn hard_drop_leaves_a_trail_from_where_the_piece_started() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+        let start_row = game_state.active_piece_row;
+        let color = game_state.active_piece.color;
+
+        assert!(game_state.get_hard_drop_trail().is_none());
+        game_state.hard_drop();
+
+        let (trail, strength) = game_state.get_hard_drop_trail().expect("trail");
+        assert_eq!(trail.start_row, start_row);
+        assert!(trail.landing_row > start_row);
+        assert_eq!(trail.color, color);
+        assert!((strength - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn danger_rises_as_the_stack_nears_the_ceiling() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+        assert_eq!(game_state.get_danger(), 0.0);
+
+        game_state.grid_locked.set_cell(21, 0, Some(Block::new(WHITE)));
+        assert_eq!(game_state.get_danger(), 0.0);
+
+        game_state.grid_locked.set_cell(5, 0, Some(Block::new(WHITE)));
+        let high = game_state.get_danger();
+        assert!(high > 0.0 && high < 1.0);
+
+        game_state.grid_locked.set_cell(2, 0, Some(Block::new(WHITE)));
+        assert_eq!(game_state.get_danger(), 1.0);
     }
 }

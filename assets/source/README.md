@@ -1,8 +1,14 @@
-# Block texture sources
+# Texture sources
 
-These source textures were generated with the built-in ImageGen tool, then
-converted into neutral grayscale 64x64 runtime textures. The game embeds the
-runtime copies and samples them with nearest-neighbor filtering.
+The game no longer ships texture files. Every material (riveted armour plate,
+vented panel, gunmetal, the stone wall) is generated at startup by
+`src/textures.rs`, authored at the exact texel density it is displayed at:
+one texel per framebuffer pixel on a 16-pixel block face, so bevels, rivets and
+vent slots land on whole pixels instead of shimmering through a point sampler.
+
+The images in this directory are the original ImageGen concept art that the
+procedural materials were designed from. They are kept for reference and are
+not loaded by the game.
 
 ## Riveted armor plate prompt
 
@@ -75,19 +81,3 @@ runtime copies and samples them with nearest-neighbor filtering.
 > bolts, vents, seams, grid, focal mark, text, symbols, logos or watermark  
 > Avoid: obvious square composition, high-frequency static noise, glossy
 > reflections, colorful paint, large structural shapes, dramatic lighting
-
-## Runtime conversion
-
-Both runtime assets were made with this point-sampled pipeline:
-
-```sh
-magick SOURCE.png -colorspace Gray -contrast-stretch 1%x1% \
-  +level 42%,100% -filter point -resize 64x64! -colorspace sRGB OUTPUT.png
-```
-
-The bezel material uses the same grayscale and point-sampling treatment and is
-reduced to one seamless 64x64 tile. The fascia repeats it at exactly one tile
-per world unit, preserving square texels at the playfield's 17-pixel cell pitch
-instead of stretching one image over the full height. The underlying fascia
-and throat remain continuous geometry, and every runtime texture uses nearest
-filtering.
