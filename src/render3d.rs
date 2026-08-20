@@ -53,15 +53,15 @@ const BLOCK_FACE_Z_BIAS: f32 = 0.008;
 /// There is deliberately no yaw. Keeping the view left/right symmetric means a
 /// column looks the same wherever it sits on the board, so the player can still
 /// judge horizontal alignment of a falling piece at a glance.
-const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 5.08, 33.0);
+const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 4.83, 33.0);
 
-/// Look slightly below the well's centre so the downward tilt is shared across
+/// Look a little below the well's centre so the downward tilt is shared across
 /// the board rather than concentrated at the bottom.
 ///
 /// The position and target are offset from the well's centre by the same amount,
 /// which slides the well down the frame without steepening the tilt. That is
-/// what balances the margin above the well against the one below it.
-const CAMERA_TARGET: Vec3 = Vec3::new(0.0, -0.15, 0.0);
+/// what balances the lintel above the well against the pit below it.
+const CAMERA_TARGET: Vec3 = Vec3::new(0.0, -0.40, 0.0);
 
 /// Cosine of the camera's downward pitch. The orthographic view height is
 /// scaled by this so that one vertical world unit still covers exactly
@@ -109,7 +109,6 @@ const WELL_BACK_COLOR: Color = color_u8!(40, 41, 40, 255);
 const BEZEL_FRAME_COLOR: Color = color_u8!(52, 53, 52, 255);
 const BEZEL_TEXTURE_COLOR: Color = color_u8!(88, 90, 90, 255);
 const BEZEL_SIDE_COLOR: Color = color_u8!(44, 45, 46, 255);
-const BEZEL_BOTTOM_COLOR: Color = color_u8!(60, 60, 58, 255);
 const BEZEL_EDGE_COLOR: Color = color_u8!(137, 126, 99, 185);
 const BEZEL_SEAM_COLOR: Color = color_u8!(13, 12, 10, 230);
 
@@ -168,9 +167,52 @@ const LAMP_HOUSING_SIZE: Vec3 = Vec3::new(0.62, 0.52, 0.26);
 const LAMP_HOUSING_COLOR: Color = color_u8!(70, 72, 72, 255);
 const LAMP_CAGE_COLOR: Color = color_u8!(20, 20, 18, 255);
 
-/// The furnace grille spans the throat's width along the bottom of the fascia,
-/// leaving one plain tile of steel at either end.
+/// Steel of the furnace grille on the fascia and the floor grate in the well.
 const GRATE_COLOR: Color = color_u8!(74, 76, 76, 255);
+
+/// The well has no solid floor. Its bottom is an open grate at the block
+/// plane, and below it the shaft continues down into a pit: the back and side
+/// walls extend to a pool of molten metal this far under the grate, seen
+/// through the floor bars from above and through the fascia's grille from
+/// the front. Debris from cleared rows falls through the grate into it.
+pub const PIT_DEPTH: f32 = 1.7;
+
+/// `y` of the well's floor grate and of the lava surface beneath it.
+pub const FLOOR_Y: f32 = -WELL_HEIGHT * 0.5;
+pub const LAVA_Y: f32 = FLOOR_Y - PIT_DEPTH;
+
+/// Floor grate bars run front to back on a four-pixel pitch, like the grille.
+const FLOOR_BAR_PITCH_PIXELS: f32 = 4.0;
+const FLOOR_BAR_WIDTH_PIXELS: f32 = 2.0;
+const FLOOR_BAR_HEIGHT: f32 = 0.12;
+
+/// Floor bar positions, as the `x` of each bar's left edge, measured out from
+/// the well's centre line so they land on whole framebuffer pixels.
+fn floor_bar_left_edges() -> impl Iterator<Item = f32> {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let bar_pitch = FLOOR_BAR_PITCH_PIXELS * pixel;
+    let bar_count = (WELL_WIDTH / bar_pitch).floor() as usize;
+    let bars_left = -bar_pitch * bar_count as f32 * 0.5 + pixel;
+
+    (0..bar_count).map(move |bar| bars_left + bar as f32 * bar_pitch)
+}
+
+/// Whether `x` lies in a gap between floor bars rather than over a bar, so
+/// the debris physics and the drawn grate agree on what falls through.
+pub fn floor_gap_contains(x: f32) -> bool {
+    let bar_width = FLOOR_BAR_WIDTH_PIXELS / CELL_PIXEL_PITCH;
+    !floor_bar_left_edges().any(|left| x >= left && x < left + bar_width)
+}
+
+/// Molten metal palette: the cooler crust between the bright channels, and
+/// the hottest glow.
+const LAVA_CRUST_COLOR: Color = color_u8!(170, 50, 10, 255);
+const LAVA_GLOW_COLOR: Color = color_u8!(255, 160, 45, 255);
+const LAVA_HOT_COLOR: Color = color_u8!(255, 240, 180, 255);
+
+/// The pit walls are close enough to the melt to be lit by it directly: this
+/// is the light on the wall at the lava line, fading up to the floor grate.
+const PIT_WALL_GLOW: Vec3 = Vec3::new(3.2, 1.3, 0.3);
 
 /// Indices into [`bezel_fascia_boxes`].
 const FASCIA_BOTTOM: usize = 0;
@@ -351,13 +393,6 @@ fn draw_quad_corners(corners: [Vec3; 4], colors: [Color; 4]) {
         indices: vec![0, 1, 2, 0, 2, 3],
         texture: None,
     });
-}
-
-/// [`draw_quad_corners`] with each corner tinted by the scene light falling on
-/// it, then scaled by `shade`.
-fn draw_lit_quad_corners(corners: [Vec3; 4], base: Color, shade: f32, lights: &SceneLights) {
-    let colors = corners.map(|corner| lit(shaded(base, shade, 1.0), lights.at(corner)));
-    draw_quad_corners(corners, colors);
 }
 
 /// Draw a quad whose corners are each tinted by the scene light falling on
@@ -716,7 +751,12 @@ pub fn draw_block_cube_scaled(
 /// Maximum simultaneous active shrapnel voxels across all clearing rows.
 pub const MAX_SHRAPNEL_VOXELS: usize = 320;
 
-/// A 3D tumbling sub-voxel spawned when rows are cleared.
+/// How long a carnage voxel's in-flight incandescence lasts before it cools
+/// back to its base material.
+pub const CARNAGE_GLOW_SECONDS: f32 = 1.4;
+
+/// A 3D tumbling sub-voxel spawned when rows are cleared. It flies, drops
+/// through the floor grate, and ends its life sinking into the melt.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ShrapnelVoxel {
     pub position: Vec3,
@@ -725,36 +765,99 @@ pub struct ShrapnelVoxel {
     pub angular_velocity: Vec3,
     pub color: Color,
     pub size: f32,
+    /// Seconds since the voxel was spawned.
     pub age: f32,
-    pub max_life: f32,
+    /// How far the voxel has sunk below the lava surface, as a fraction of
+    /// its own size: 0.0 while airborne, 1.0 when it has gone under and is
+    /// retired.
+    pub submersion: f32,
     pub bounce_count: u8,
     pub is_carnage: bool,
     pub active: bool,
 }
 
+impl ShrapnelVoxel {
+    /// Whether the voxel has reached the melt and is sinking.
+    pub fn is_sinking(&self) -> bool {
+        self.submersion > 0.0
+    }
+}
+
+/// Maximum simultaneous lava splashes.
+pub const MAX_LAVA_SPLASHES: usize = 48;
+
+/// How long a splash ring takes to spread and fade.
+pub const SPLASH_SECONDS: f32 = 0.6;
+
+/// A ring of light spreading across the melt where debris went in.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LavaSplash {
+    pub position: Vec3,
+    pub age: f32,
+    /// Size of the debris that made it, which sets the ring's reach.
+    pub size: f32,
+    pub active: bool,
+}
+
+/// Draw the active splash rings: each is a bright disc that spreads out and
+/// thins, drawn flat on the lava surface. Must be drawn after the lava and
+/// before the floor grate, so the bars still occlude it.
+pub fn draw_lava_splashes(splashes: &[LavaSplash]) {
+    for splash in splashes.iter().filter(|splash| splash.active) {
+        let t = (splash.age / SPLASH_SECONDS).clamp(0.0, 1.0);
+        let radius = splash.size * (1.0 + 3.4 * t);
+        let alpha = (1.0 - t).powi(2);
+        let color = mix_color(LAVA_HOT_COLOR, LAVA_GLOW_COLOR, t);
+        let center = Vec3::new(splash.position.x, LAVA_Y + 0.01, splash.position.z);
+
+        // The ring on the surface is nearly edge-on to the camera, so a short
+        // vertical flare of the same light stands up from the point of entry
+        // to make the splash legible.
+        draw_glow_disc_on_plane(center, radius, color, alpha);
+        draw_glow_disc(
+            center + Vec3::Y * splash.size * 0.6,
+            splash.size * (1.2 + 1.6 * t),
+            color,
+            alpha * 0.8,
+        );
+    }
+}
+
 /// Draw a single tumbling shrapnel voxel with dynamic directional shading,
-/// point-sampled texture, and optional hot-metal carnages.
+/// point-sampled texture, and hot-metal incandescence: briefly in flight for
+/// four-line clears, and always once it hits the melt.
 pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
     if !voxel.active {
         return;
     }
 
-    let progress = (voxel.age / voxel.max_life).clamp(0.0, 1.0);
-    let fade = ((1.0 - progress) / 0.15).clamp(0.0, 1.0);
-    let scale = voxel.size * (0.25 + 0.75 * fade);
+    // A voxel that has reached the melt floats on the surface while the heat
+    // takes it, then is clipped by the surface: the cube shrinks toward its
+    // top and the visible remainder rides the lava, which at this pixel scale
+    // reads as the debris going under.
+    const HEAT_SOAK: f32 = 0.55;
+    let remaining = if voxel.submersion <= HEAT_SOAK {
+        1.0
+    } else {
+        1.0 - (voxel.submersion - HEAT_SOAK) / (1.0 - HEAT_SOAK)
+    };
+    let scale = voxel.size * remaining;
     if scale <= 0.001 {
         return;
     }
 
-    // Four-line clears superheat shrapnel into molten incandescence before
-    // slowly cooling back to the block's base material.
-    let (is_hot, heat) = if voxel.is_carnage && progress < 0.72 {
-        let t = (progress / 0.72).clamp(0.0, 1.0);
-        let heat_curve = (1.0 - t).powf(1.35);
-        (true, heat_curve)
+    // Four-line clears superheat shrapnel into molten incandescence in flight,
+    // slowly cooling back to the block's base material; anything that reaches
+    // the melt heats up again as it soaks and goes under white-hot.
+    let flight_heat = if voxel.is_carnage {
+        (1.0 - voxel.age / CARNAGE_GLOW_SECONDS).clamp(0.0, 1.0).powf(1.35)
     } else {
-        (false, 0.0)
+        0.0
     };
+    let sink_heat = (voxel.submersion / HEAT_SOAK).clamp(0.0, 1.0);
+    let heat = flight_heat.max(sink_heat);
+    let is_hot = heat > 0.0;
+    let fade = remaining;
 
     let color = if is_hot {
         if heat > 0.60 {
@@ -783,14 +886,29 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
         voxel.color
     };
 
+    // A sinking voxel's visible remainder rides on the surface, lifted a
+    // touch so it never z-fights with the melt.
+    let position = if voxel.is_sinking() {
+        Vec3::new(voxel.position.x, LAVA_Y + scale * 0.5 + 0.02, voxel.position.z)
+    } else {
+        voxel.position
+    };
+
     if is_hot && heat > 0.15 {
-        let halo_radius = scale * (1.3 + 0.9 * heat);
-        let halo_alpha = (heat * 0.4 * fade).clamp(0.0, 0.5);
+        // Debris on the melt throws a bigger, brighter halo than debris
+        // glowing in flight: it is the thing that is burning up.
+        let (reach, strength) = if voxel.is_sinking() {
+            (2.2, 0.65)
+        } else {
+            (1.3, 0.4)
+        };
+        let halo_radius = voxel.size * (reach + 0.9 * heat);
+        let halo_alpha = (heat * strength * fade.max(0.3)).clamp(0.0, 0.7);
 
         draw_glow_disc(
-            voxel.position,
+            position,
             halo_radius,
-            Color::new(1.0, 0.58, 0.12, 1.0),
+            Color::new(1.0, 0.62, 0.14, 1.0),
             halo_alpha,
         );
     }
@@ -804,7 +922,7 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
     let edge_x = rot * Vec3::new(scale, 0.0, 0.0);
     let edge_y = rot * Vec3::new(0.0, scale, 0.0);
     let edge_z = rot * Vec3::new(0.0, 0.0, scale);
-    let min = voxel.position - 0.5 * (edge_x + edge_y + edge_z);
+    let min = position - 0.5 * (edge_x + edge_y + edge_z);
 
     let light_dir = Vec3::new(-0.35, 0.75, 0.55).normalize();
     let view = view_direction();
@@ -878,8 +996,6 @@ pub fn draw_tumbling_cube(
         rotation,
         color,
         size,
-        age: 0.0,
-        max_life: f32::MAX,
         active: true,
         ..Default::default()
     };
@@ -959,12 +1075,20 @@ pub fn draw_ghost_cell(center: Vec3, color: Color, exterior: GhostEdges) {
 /// Must be drawn before the blocks. The shaft is opaque and would otherwise
 /// need to sort behind them, and drawing it first also gives the depth buffer a
 /// sane floor for everything that follows.
-pub fn draw_well(textures: &SceneTextures, lights: &SceneLights) {
+pub fn draw_well(
+    textures: &SceneTextures,
+    lights: &SceneLights,
+    time: f64,
+    splashes: &[LavaSplash],
+) {
     let half_w = WELL_WIDTH / 2.0;
     let half_h = WELL_HEIGHT / 2.0;
 
     draw_back_wall(half_w, half_h, textures, lights);
     draw_shaft_walls(half_w, half_h, lights);
+    draw_lava(half_w, lights, time);
+    draw_lava_splashes(splashes);
+    draw_floor_grate(half_w, lights);
     draw_well_guides(half_w, half_h);
     draw_well_bezel(half_w, half_h, textures, lights);
 }
@@ -979,33 +1103,90 @@ fn shaft_top_y(half_h: f32) -> f32 {
     half_h + BACK_WALL_ROWS_ABOVE as f32
 }
 
+/// Bottom of the shaft walls: the lava surface at the foot of the pit.
+fn shaft_bottom_y() -> f32 {
+    LAVA_Y
+}
+
+/// Light falling on a shaft surface at `point`: the scene lights, plus the
+/// melt's own glow on anything down in the pit with it, strongest at the lava
+/// line and gone by the floor grate. The steel down there is heated as much
+/// as lit, so the glow is not bounded by the surface's dark base tint.
+fn shaft_light_at(point: Vec3, lights: &SceneLights) -> Vec3 {
+    let scene = lights.at(point);
+    if point.y >= FLOOR_Y {
+        return scene;
+    }
+
+    let depth = ((FLOOR_Y - point.y) / PIT_DEPTH).clamp(0.0, 1.0);
+    scene + PIT_WALL_GLOW * depth.powf(1.3) * lights.furnace_level()
+}
+
+/// Base tint of a shaft surface at `point`: its usual steel above the floor,
+/// warming toward dull red heat down in the pit.
+fn shaft_base_color(point: Vec3, base: Color) -> Color {
+    if point.y >= FLOOR_Y {
+        return base;
+    }
+
+    let depth = ((FLOOR_Y - point.y) / PIT_DEPTH).clamp(0.0, 1.0);
+    mix_color(base, color_u8!(120, 44, 14, 255), depth * 0.7)
+}
+
+/// [`draw_quad`] with each corner tinted by [`shaft_base_color`] and lit by
+/// [`shaft_light_at`].
+fn draw_shaft_quad(
+    origin: Vec3,
+    e1: Vec3,
+    e2: Vec3,
+    texture: Option<&Texture2D>,
+    base: Color,
+    lights: &SceneLights,
+) {
+    let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
+    let colors = corners
+        .map(|corner| lit(shaft_base_color(corner, base), shaft_light_at(corner, lights)));
+    draw_quad(origin, e1, e2, texture, colors);
+}
+
+/// [`draw_quad_corners`] with each corner tinted by [`shaft_base_color`],
+/// scaled by `shade`, and lit by [`shaft_light_at`].
+fn draw_shaft_quad_corners(corners: [Vec3; 4], base: Color, shade: f32, lights: &SceneLights) {
+    let colors = corners.map(|corner| {
+        lit(
+            shaded(shaft_base_color(corner, base), shade, 1.0),
+            shaft_light_at(corner, lights),
+        )
+    });
+    draw_quad_corners(corners, colors);
+}
+
 /// The shaft's back wall: dark gunmetal plate, one lit tile per cell, so the
-/// furnace glow pools across the bottom rows and the lamps catch the top
-/// corners. Kept dark overall so the coloured blocks stay the brightest thing
-/// inside the well. Tiles are squeezed to the tapered width and continue up
-/// over the hidden spawn rows.
+/// lava glow climbs the bottom rows and the lamps catch the top corners. Kept
+/// dark overall so the coloured blocks stay the brightest thing inside the
+/// well. Tiles are squeezed to the tapered width, continue up over the hidden
+/// spawn rows, and run down past the floor grate to the melt.
 fn draw_back_wall(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &SceneLights) {
     let back_half_w = back_wall_half_width(half_w);
     let tile_width = back_half_w * 2.0 / GRID_COUNT_COLS as f32;
     let top = shaft_top_y(half_h);
-    let rows = VISIBLE_GRID_COUNT_ROWS + BACK_WALL_ROWS_ABOVE;
+    let bottom = shaft_bottom_y();
+    let rows = ((top - bottom) / 1.0).ceil() as usize;
 
     for row in 0..rows {
+        let y_top = top - row as f32;
+        let height = (y_top - bottom).min(1.0);
         for col in 0..GRID_COUNT_COLS {
-            let top_left = Vec3::new(
-                col as f32 * tile_width - back_half_w,
-                top - row as f32,
-                BACK_WALL_Z,
-            );
+            let top_left = Vec3::new(col as f32 * tile_width - back_half_w, y_top, BACK_WALL_Z);
             let (origin, e1, e2) = flipped_quad(
                 top_left,
                 Vec3::X * tile_width,
-                Vec3::NEG_Y,
+                Vec3::NEG_Y * height,
                 (row + col) % 2 == 1,
                 (row / 2 + col) % 2 == 1,
             );
 
-            draw_lit_quad(
+            draw_shaft_quad(
                 origin,
                 e1,
                 e2,
@@ -1017,24 +1198,25 @@ fn draw_back_wall(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &S
     }
 }
 
-/// The shaft's side walls and floor, running from the opening's edge at the
-/// block plane back to the narrower back wall. Each is lit one row or column
-/// at a time so the furnace glow pools at the foot of the walls. The right
-/// wall is shaded like the blocks' right faces, keeping the light's direction
-/// consistent across the scene.
+/// The shaft's side walls, running from the opening's edge at the block plane
+/// back to the narrower back wall, from above the lintel down to the melt.
+/// They are lit one row at a time so the lava glow climbs their feet. The
+/// right wall is shaded like the blocks' right faces, keeping the light's
+/// direction consistent across the scene.
 fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights) {
     let front_z = WELL_DEPTH * 0.5;
     let back_half_w = back_wall_half_width(half_w);
     let top = shaft_top_y(half_h);
-    let rows = VISIBLE_GRID_COUNT_ROWS + BACK_WALL_ROWS_ABOVE;
+    let bottom = shaft_bottom_y();
+    let rows = ((top - bottom) / 1.0).ceil() as usize;
 
     for row in 0..rows {
         let y_top = top - row as f32;
-        let y_bottom = y_top - 1.0;
+        let y_bottom = (y_top - 1.0).max(bottom);
         for (x_sign, shade) in [(-1.0, 1.0), (1.0, 0.78)] {
             let front_x = x_sign * half_w;
             let back_x = x_sign * back_half_w;
-            draw_lit_quad_corners(
+            draw_shaft_quad_corners(
                 [
                     Vec3::new(front_x, y_top, front_z),
                     Vec3::new(back_x, y_top, BACK_WALL_Z),
@@ -1047,21 +1229,115 @@ fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights) {
             );
         }
     }
+}
 
-    for col in 0..GRID_COUNT_COLS {
-        let front_left = col as f32 - half_w;
-        let front_right = front_left + 1.0;
-        let taper = back_half_w / half_w;
-        draw_lit_quad_corners(
+/// The pool of molten metal at the bottom of the pit, filling the tapered
+/// shaft's footprint. It is drawn as a grid of small patches so the glow can
+/// vary across it: a slowly crawling pattern of bright channels through a
+/// darker crust, breathing with the furnace lightstyle.
+fn draw_lava(half_w: f32, lights: &SceneLights, time: f64) {
+    const PATCHES_X: usize = 20;
+    const PATCHES_Z: usize = 3;
+    let front_z = WELL_DEPTH * 0.5;
+    let back_half_w = back_wall_half_width(half_w);
+    let taper = back_half_w / half_w;
+    let level = lights.furnace_level();
+    let t = time as f32;
+
+    for iz in 0..PATCHES_Z {
+        let z0 = front_z - (iz as f32 / PATCHES_Z as f32) * WELL_DEPTH;
+        let z1 = front_z - ((iz + 1) as f32 / PATCHES_Z as f32) * WELL_DEPTH;
+        let taper0 = 1.0 + (taper - 1.0) * (front_z - z0) / WELL_DEPTH;
+        let taper1 = 1.0 + (taper - 1.0) * (front_z - z1) / WELL_DEPTH;
+
+        for ix in 0..PATCHES_X {
+            let x0 = -half_w + ix as f32 * WELL_WIDTH / PATCHES_X as f32;
+            let x1 = x0 + WELL_WIDTH / PATCHES_X as f32;
+            let corners = [
+                Vec3::new(x0 * taper1, LAVA_Y, z1),
+                Vec3::new(x1 * taper1, LAVA_Y, z1),
+                Vec3::new(x1 * taper0, LAVA_Y, z0),
+                Vec3::new(x0 * taper0, LAVA_Y, z0),
+            ];
+            let colors = corners.map(|corner| lava_color_at(corner, t, level));
+
+            draw_quad_corners(corners, colors);
+        }
+    }
+
+    // Seen this near edge-on, the surface alone is a sliver; a haze of heat
+    // rising off it gives the melt a visible glowing band.
+    let haze_height = 0.55;
+    let hot = lava_color_at(Vec3::new(0.0, LAVA_Y, front_z), t, level);
+    let clear = Color::new(hot.r, hot.g, hot.b, 0.0);
+    let glow = Color::new(hot.r, hot.g, hot.b, 0.6);
+    draw_quad(
+        Vec3::new(-half_w, LAVA_Y + haze_height, front_z - 0.02),
+        Vec3::X * WELL_WIDTH,
+        Vec3::NEG_Y * haze_height,
+        None,
+        [clear, clear, glow, glow],
+    );
+}
+
+/// Colour of the lava surface at a point: two drifting sine ridges pick out
+/// bright channels, and the whole pool breathes with the furnace.
+fn lava_color_at(point: Vec3, time: f32, level: f32) -> Color {
+    let ridge_a = ((point.x * 1.7 + time * 0.6).sin() * 0.5 + 0.5).powi(3);
+    let ridge_b = ((point.x * 0.9 - point.z * 2.5 - time * 0.35).sin() * 0.5 + 0.5).powi(2);
+    let channel = (ridge_a * 0.7 + ridge_b * 0.5).clamp(0.0, 1.0);
+    let glow = mix_color(LAVA_CRUST_COLOR, LAVA_GLOW_COLOR, channel);
+    let hot = mix_color(glow, LAVA_HOT_COLOR, (channel - 0.75).max(0.0) * 2.0);
+
+    shaded(hot, 0.75 + 0.35 * level, 1.0)
+}
+
+/// The open grate that is the well's floor: steel bars running front to back
+/// across the shaft at the block plane, with the melt visible between them.
+/// Each bar is two framebuffer pixels wide on a four-pixel pitch, measured out
+/// from the well's centre line, so they land on whole pixels and line up with
+/// the fascia grille below. Drawn after the lava so the bars occlude it.
+fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
+    let front_z = WELL_DEPTH * 0.5;
+    let back_half_w = back_wall_half_width(half_w);
+    let bar_width = FLOOR_BAR_WIDTH_PIXELS / CELL_PIXEL_PITCH;
+    let grate = lit(GRATE_COLOR, lights.at(Vec3::new(0.0, FLOOR_Y, 0.0)));
+    let top_lit = shaded(grate, 1.25, 1.0);
+    let top_far = shaded(grate, 0.85, 1.0);
+    let front_face = shaded(grate, 0.6, 1.0);
+
+    for x in floor_bar_left_edges() {
+        let taper_x = |x: f32| x * back_half_w / half_w;
+
+        // Top face, lit along its front lip like the blocks' tops.
+        draw_quad_corners(
             [
-                Vec3::new(front_left * taper, -half_h, BACK_WALL_Z),
-                Vec3::new(front_right * taper, -half_h, BACK_WALL_Z),
-                Vec3::new(front_right, -half_h, front_z),
-                Vec3::new(front_left, -half_h, front_z),
+                Vec3::new(taper_x(x), FLOOR_Y, BACK_WALL_Z),
+                Vec3::new(taper_x(x + bar_width), FLOOR_Y, BACK_WALL_Z),
+                Vec3::new(x + bar_width, FLOOR_Y, front_z),
+                Vec3::new(x, FLOOR_Y, front_z),
             ],
-            BEZEL_BOTTOM_COLOR,
-            1.0,
-            lights,
+            [top_far, top_far, top_lit, top_lit],
+        );
+
+        // Front face, the bar's thickness seen from the camera.
+        draw_quad(
+            Vec3::new(x, FLOOR_Y, front_z),
+            Vec3::X * bar_width,
+            Vec3::NEG_Y * FLOOR_BAR_HEIGHT,
+            None,
+            [front_face; 4],
+        );
+    }
+
+    // Front and back rails the bars are welded to.
+    for (z, half) in [(front_z, half_w), (BACK_WALL_Z, back_half_w)] {
+        draw_quad(
+            Vec3::new(-half, FLOOR_Y + 0.002, z),
+            Vec3::X * half * 2.0,
+            Vec3::NEG_Y * FLOOR_BAR_HEIGHT,
+            None,
+            [shaded(grate, 0.9, 1.0); 4],
         );
     }
 }
@@ -1110,16 +1386,20 @@ fn bezel_fascia_boxes(half_w: f32, half_h: f32) -> [(Vec3, Vec3); 4] {
     let front_center_z = back_z + BEZEL_BOX_DEPTH * 0.5;
     let lintel_center_z = back_z + BEZEL_LINTEL_DEPTH * 0.5;
     let outer_width = WELL_WIDTH + 2.0 * (BEZEL_BEVEL_WIDTH + BEZEL_FASCIA_WIDTH);
-    let side_bottom = -(half_h + BEZEL_BEVEL_WIDTH);
+    let side_bottom = -half_h;
     let side_top = half_h + BEZEL_LINTEL_CLEARANCE;
     let side_x = half_w + BEZEL_BEVEL_WIDTH + BEZEL_FASCIA_WIDTH * 0.5;
-    let cap_y = half_h + BEZEL_BEVEL_WIDTH + BEZEL_FASCIA_WIDTH * 0.5;
     let lintel_y = side_top + BEZEL_LINTEL_HEIGHT * 0.5;
+
+    // The bottom bar fronts the whole pit, from the floor grate down to just
+    // below the lava surface, so its grille looks straight in at the melt.
+    let pit_front_height = PIT_DEPTH + BEZEL_FASCIA_WIDTH * 0.5;
+    let pit_front_y = FLOOR_Y - pit_front_height * 0.5;
 
     [
         (
-            Vec3::new(0.0, -cap_y, front_center_z),
-            Vec3::new(outer_width, BEZEL_FASCIA_WIDTH, BEZEL_BOX_DEPTH),
+            Vec3::new(0.0, pit_front_y, front_center_z),
+            Vec3::new(outer_width, pit_front_height, BEZEL_BOX_DEPTH),
         ),
         (
             Vec3::new(-side_x, (side_bottom + side_top) * 0.5, front_center_z),
@@ -1266,6 +1546,15 @@ fn draw_lamp(position: Vec3, lights: &SceneLights) {
 /// `alpha` at the centre to fully transparent at `radius`. Under the palette
 /// quantisation this dithers into the stepped halos of a software lightmap.
 pub fn draw_glow_disc(center: Vec3, radius: f32, color: Color, alpha: f32) {
+    draw_glow_fan(center, Vec3::X, Vec3::Y, radius, color, alpha);
+}
+
+/// [`draw_glow_disc`] laid flat on a horizontal surface such as the lava.
+pub fn draw_glow_disc_on_plane(center: Vec3, radius: f32, color: Color, alpha: f32) {
+    draw_glow_fan(center, Vec3::X, Vec3::Z, radius, color, alpha);
+}
+
+fn draw_glow_fan(center: Vec3, axis_a: Vec3, axis_b: Vec3, radius: f32, color: Color, alpha: f32) {
     const SEGMENTS: usize = 16;
     let mut vertices = Vec::with_capacity(SEGMENTS + 1);
     let mut indices = Vec::with_capacity(SEGMENTS * 3);
@@ -1277,7 +1566,7 @@ pub fn draw_glow_disc(center: Vec3, radius: f32, color: Color, alpha: f32) {
 
     for segment in 0..SEGMENTS {
         let angle = segment as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-        let rim = center + Vec3::new(angle.cos(), angle.sin(), 0.0) * radius;
+        let rim = center + (axis_a * angle.cos() + axis_b * angle.sin()) * radius;
         vertices.push(Vertex::new2(
             rim,
             Vec2::ZERO,
@@ -1309,12 +1598,11 @@ pub fn draw_lamp_glow(lights: &SceneLights) {
     }
 }
 
-/// The bottom bar is the furnace front: fire glows behind a steel grille that
-/// runs the width of the throat, with a plain tile of fascia at either end.
-///
-/// The grille is geometry rather than a texture so its bars land on exact
-/// framebuffer pixels: each bar is two pixels wide on a four-pixel pitch,
-/// measured out from the well's centre line.
+/// The bottom bar fronts the pit: a solid steel post at either end, and
+/// between them an open grille looking straight in at the melt. Bars are two
+/// pixels wide on a four-pixel pitch so they land on whole framebuffer pixels
+/// and line up with the floor grate above. Horizontal ribs brace the bars at
+/// the floor line and at every unit below it.
 fn draw_furnace_front(
     center: Vec3,
     size: Vec3,
@@ -1327,42 +1615,36 @@ fn draw_furnace_front(
     let min_x = center.x - size.x * 0.5;
     let max_x = center.x + size.x * 0.5;
     let front_z = center.z + size.z * 0.5;
+    let post_width = BEZEL_FASCIA_WIDTH + BEZEL_BEVEL_WIDTH;
 
-    for cap_x in [min_x, max_x - BEZEL_TILE_SIZE] {
-        let top_left = Vec3::new(cap_x, top, front_z);
-        draw_lit_quad(
-            top_left + Vec3::Z * 0.003,
-            Vec3::X * BEZEL_TILE_SIZE,
-            Vec3::NEG_Y * BEZEL_TILE_SIZE,
-            Some(textures.gunmetal()),
+    for post_x in [min_x, max_x - post_width] {
+        let post_center = Vec3::new(post_x + post_width * 0.5, center.y, center.z);
+        let post_size = Vec3::new(post_width, size.y, size.z);
+        draw_shaded_box(post_center, post_size, BEZEL_FRAME_COLOR, 1.0);
+        draw_cube_wires(post_center, post_size, BEZEL_SEAM_COLOR);
+        draw_tiled_front_face(
+            post_center,
+            post_size,
+            textures.gunmetal(),
             BEZEL_TEXTURE_COLOR,
+            0,
             lights,
         );
+        draw_front_face_outline(post_center, post_size, BEZEL_SEAM_COLOR);
     }
 
-    // Fire first, brightest along the floor line.
-    let span_half = ((size.x * 0.5 - BEZEL_TILE_SIZE) * CELL_PIXEL_PITCH).floor() * pixel;
-    let fire = lights.furnace_glow();
-    let fire_deep = shaded(fire, 0.5, 1.0);
-    draw_quad(
-        Vec3::new(center.x - span_half, top, front_z + 0.003),
-        Vec3::X * span_half * 2.0,
-        Vec3::NEG_Y * size.y,
-        None,
-        [fire_deep, fire_deep, fire, fire],
-    );
+    // The grille bars stand against the glow behind them, so they read dark:
+    // the camera sees their unlit fronts, edged by a thin rim of lava light.
+    let span_half = ((size.x * 0.5 - post_width) * CELL_PIXEL_PITCH).floor() * pixel;
+    let grate = lit(GRATE_COLOR, lights.at(Vec3::new(center.x, top, front_z)));
+    let bar_face = shaded(grate, 0.55, 1.0);
+    let bar_rim = shaded(grate, 1.1, 1.0);
+    let bar_z = front_z + 0.006;
 
-    // Then the grille: vertical bars lit down their left edge, and a rib
-    // across the middle lit along its top.
-    let bar_pitch = 4.0 * pixel;
+    let bar_pitch = 6.0 * pixel;
     let bar_width = 2.0 * pixel;
     let bar_count = (span_half * 2.0 / bar_pitch).floor() as usize;
-    let bars_left = center.x - bar_pitch * bar_count as f32 * 0.5 + pixel;
-    let bar_z = front_z + 0.006;
-    let grate = lit(GRATE_COLOR, lights.at(Vec3::new(center.x, center.y, front_z)));
-    let bar_lit = shaded(grate, 1.35, 1.0);
-    let bar_shadow = shaded(grate, 0.7, 1.0);
-
+    let bars_left = center.x - bar_pitch * bar_count as f32 * 0.5 + pixel * 2.0;
     for bar in 0..bar_count {
         let x = bars_left + bar as f32 * bar_pitch;
         draw_quad(
@@ -1370,34 +1652,37 @@ fn draw_furnace_front(
             Vec3::X * bar_width,
             Vec3::NEG_Y * size.y,
             None,
-            [bar_lit, bar_shadow, bar_shadow, bar_lit],
+            [bar_rim, bar_face, bar_face, bar_rim],
         );
     }
 
-    let rib_top = (center.y + pixel).max(bottom);
-    draw_quad(
-        Vec3::new(center.x - span_half, rib_top, bar_z + 0.002),
-        Vec3::X * span_half * 2.0,
-        Vec3::NEG_Y * (2.0 * pixel),
-        None,
-        [bar_lit, bar_lit, bar_shadow, bar_shadow],
-    );
+    // A rib braces the bars at the floor line and another at the melt.
+    for rib_top in [top, (LAVA_Y + 0.35).max(bottom + 0.2)] {
+        draw_quad(
+            Vec3::new(center.x - span_half, rib_top, bar_z + 0.002),
+            Vec3::X * span_half * 2.0,
+            Vec3::NEG_Y * (2.0 * pixel),
+            None,
+            [bar_rim, bar_rim, bar_face, bar_face],
+        );
+    }
 }
 
-/// Draw the sloped sides and floor between the cabinet face and the playfield
-/// opening. Leaving the top open is a gameplay cue: pieces visibly enter a
-/// chute instead of appearing on a display enclosed behind glass.
+/// Draw the chamfered sides between the cabinet face and the playfield
+/// opening. The opening is left open at the top, so pieces visibly enter a
+/// chute, and open at the bottom, where the floor grate hands over to the pit.
 fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
     let depth = BEZEL_FRONT_Z - BEZEL_THROAT_Z;
-    let slope_out = Vec3::new(0.0, -BEZEL_BEVEL_WIDTH, depth);
     let rim_top = half_h + BEZEL_LINTEL_CLEARANCE;
+    let rim_bottom = LAVA_Y;
 
     // The side chamfers run the full height of the pillars, up past the
-    // visible rows to the lintel, and are lit one row at a time so the furnace
-    // glow pools at their feet instead of fading linearly up the whole throat.
+    // visible rows to the lintel and down the pit to the melt, and are lit one
+    // row at a time so the glow pools at their feet instead of fading linearly
+    // up the whole throat.
     let mut y_top = rim_top;
-    while y_top > -half_h + 0.0001 {
-        let height = (y_top + half_h).min(1.0);
+    while y_top > rim_bottom + 0.0001 {
+        let height = (y_top - rim_bottom).min(1.0);
         for (x_sign, side_shade) in [(-1.0, 1.0), (1.0, 0.78)] {
             let inner_top = Vec3::new(x_sign * half_w, y_top, BEZEL_THROAT_Z);
             draw_lit_quad(
@@ -1412,73 +1697,16 @@ fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
         y_top -= height;
     }
 
-    for col in 0..GRID_COUNT_COLS {
-        let inner_left = Vec3::new(col as f32 - half_w, -half_h, BEZEL_THROAT_Z);
-        draw_lit_quad(inner_left, Vec3::X, slope_out, None, BEZEL_BOTTOM_COLOR, lights);
-    }
-
-    let mut corner_vertices = Vec::with_capacity(12);
-    let mut corner_indices = Vec::with_capacity(12);
-    let mut push_triangle = |a: Vec3, b: Vec3, c: Vec3, color: Color| {
-        let first = corner_vertices.len() as u16;
-        corner_vertices.push(Vertex::new2(a, Vec2::ZERO, color));
-        corner_vertices.push(Vertex::new2(b, Vec2::ZERO, color));
-        corner_vertices.push(Vertex::new2(c, Vec2::ZERO, color));
-        corner_indices.extend_from_slice(&[first, first + 1, first + 2]);
-    };
-
-    for x_sign in [-1.0, 1.0] {
-        let y_sign = -1.0;
-        let inner = Vec3::new(x_sign * half_w, y_sign * half_h, BEZEL_THROAT_Z);
-        let outer_side = Vec3::new(
-            x_sign * (half_w + BEZEL_BEVEL_WIDTH),
-            y_sign * half_h,
-            BEZEL_FRONT_Z,
-        );
-        let outer_cap = Vec3::new(
-            x_sign * half_w,
-            y_sign * (half_h + BEZEL_BEVEL_WIDTH),
-            BEZEL_FRONT_Z,
-        );
-        let outer_corner = Vec3::new(
-            x_sign * (half_w + BEZEL_BEVEL_WIDTH),
-            y_sign * (half_h + BEZEL_BEVEL_WIDTH),
-            BEZEL_FRONT_Z,
-        );
-        let side_color = if x_sign < 0.0 {
-            BEZEL_SIDE_COLOR
-        } else {
-            shaded(BEZEL_SIDE_COLOR, 0.78, 1.0)
-        };
-        let corner_light = lights.at(inner);
-
-        push_triangle(
-            inner,
-            outer_cap,
-            outer_corner,
-            lit(BEZEL_BOTTOM_COLOR, corner_light),
-        );
-        push_triangle(inner, outer_corner, outer_side, lit(side_color, corner_light));
-    }
-
-    draw_mesh(&Mesh {
-        vertices: corner_vertices,
-        indices: corner_indices,
-        texture: None,
-    });
-
-    // A lit rim along the opening's inner edge, where the chamfer meets the
+    // A lit rim down each side of the opening, where the chamfer meets the
     // block plane.
     let edge_z = BEZEL_THROAT_Z + 0.004;
-    let corners = [
-        Vec3::new(-half_w, -half_h, edge_z),
-        Vec3::new(half_w, -half_h, edge_z),
-        Vec3::new(half_w, rim_top, edge_z),
-        Vec3::new(-half_w, rim_top, edge_z),
-    ];
-    draw_line_3d(corners[0], corners[1], BEZEL_EDGE_COLOR);
-    draw_line_3d(corners[0], corners[3], BEZEL_EDGE_COLOR);
-    draw_line_3d(corners[1], corners[2], BEZEL_EDGE_COLOR);
+    for x_sign in [-1.0, 1.0] {
+        draw_line_3d(
+            Vec3::new(x_sign * half_w, rim_bottom, edge_z),
+            Vec3::new(x_sign * half_w, rim_top, edge_z),
+            BEZEL_EDGE_COLOR,
+        );
+    }
 }
 
 /// Draw the cabinet: a sloped throat into the well, riveted steel pillars
@@ -1489,22 +1717,23 @@ fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &
     draw_bezel_throat(half_w, half_h, lights);
 
     for (index, (center, size)) in bezel_fascia_boxes(half_w, half_h).into_iter().enumerate() {
-        draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0);
-        draw_cube_wires(center, size, BEZEL_SEAM_COLOR);
-
+        // The bottom bar is open grille between its end posts, so it draws
+        // its own solids rather than one box that would wall off the pit.
         if index == FASCIA_BOTTOM {
             draw_furnace_front(center, size, textures, lights);
-        } else {
-            draw_tiled_front_face(
-                center,
-                size,
-                textures.gunmetal(),
-                BEZEL_TEXTURE_COLOR,
-                index,
-                lights,
-            );
+            continue;
         }
 
+        draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0);
+        draw_cube_wires(center, size, BEZEL_SEAM_COLOR);
+        draw_tiled_front_face(
+            center,
+            size,
+            textures.gunmetal(),
+            BEZEL_TEXTURE_COLOR,
+            index,
+            lights,
+        );
         draw_front_face_outline(center, size, BEZEL_SEAM_COLOR);
     }
 
@@ -1722,36 +1951,49 @@ mod tests {
     }
 
     #[test]
-    fn shrapnel_voxel_defaults_to_inactive() {
+    fn shrapnel_voxel_defaults_to_inactive_and_airborne() {
         let voxel = ShrapnelVoxel::default();
         assert!(!voxel.active);
         assert_eq!(voxel.age, 0.0);
+        assert!(!voxel.is_sinking());
     }
 
     #[test]
-    fn carnage_voxel_heat_curve_spans_majority_of_lifetime() {
-        let mut voxel = ShrapnelVoxel {
-            active: true,
-            is_carnage: true,
-            size: 0.4,
-            age: 0.1,
-            max_life: 2.0,
-            color: Color::new(0.0, 0.5, 1.0, 1.0),
-            ..Default::default()
-        };
+    fn floor_grate_bars_are_pixel_aligned_and_leave_gaps_to_fall_through() {
+        let pixel = 1.0 / CELL_PIXEL_PITCH;
+        let bar_width = FLOOR_BAR_WIDTH_PIXELS * pixel;
+        let edges: Vec<f32> = floor_bar_left_edges().collect();
 
-        // At 5% progress, voxel should be in white-hot / incandescent phase
-        let progress_early = voxel.age / voxel.max_life;
-        assert!(progress_early < 0.1);
+        assert!(edges.len() > 30, "{} bars", edges.len());
+        for pair in edges.windows(2) {
+            let gap = pair[1] - (pair[0] + bar_width);
+            assert!((gap - (FLOOR_BAR_PITCH_PIXELS - FLOOR_BAR_WIDTH_PIXELS) * pixel).abs() < 1e-5);
+        }
 
-        // Advance to 50% progress (1.0s in): should still be actively hot
-        voxel.age = 1.0;
-        let progress_mid = voxel.age / voxel.max_life;
-        assert!(progress_mid < 0.72);
+        // Every bar starts on a whole framebuffer pixel relative to the
+        // well's centre line, and is symmetric about it.
+        for &left in &edges {
+            let offset_pixels = left * CELL_PIXEL_PITCH;
+            assert!((offset_pixels - offset_pixels.round()).abs() < 1e-3, "{left}");
+        }
+        assert!((edges[0] + bar_width + edges[edges.len() - 1]).abs() < 1e-4);
 
-        // Advance past 75% progress (1.5s in): should be fully cooled to base color
-        voxel.age = 1.6;
-        let progress_late = voxel.age / voxel.max_life;
-        assert!(progress_late >= 0.72);
+        // A point over a bar is caught; the midpoint of the next gap is not.
+        let first = edges[0];
+        assert!(!floor_gap_contains(first + bar_width * 0.5));
+        assert!(floor_gap_contains(first + bar_width + pixel));
+    }
+
+    #[test]
+    fn the_pit_is_fronted_by_the_grille_and_floored_by_lava() {
+        let [bottom, left, _, _] = bezel_fascia_boxes(WELL_WIDTH / 2.0, WELL_HEIGHT / 2.0);
+        let bottom_top = bottom.0.y + bottom.1.y * 0.5;
+        let bottom_bottom = bottom.0.y - bottom.1.y * 0.5;
+        let left_bottom = left.0.y - left.1.y * 0.5;
+
+        assert!((bottom_top - FLOOR_Y).abs() < 1e-5, "grille starts at the floor grate");
+        assert!(bottom_bottom < LAVA_Y, "grille reaches below the melt");
+        assert!((left_bottom - bottom_top).abs() < 1e-5, "pillars stand on the grille");
+        assert!(LAVA_Y < FLOOR_Y - 1.0, "there is a real drop into the pit");
     }
 }

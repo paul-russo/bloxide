@@ -3,13 +3,16 @@
 //! macroquad's fixed pipeline has no lights, so the renderer fakes lightmaps:
 //! every large surface is split into tiles and each tile's corners are tinted
 //! by [`SceneLights::at`]. Two sources light the cabinet: a pair of caged lamps
-//! mounted high on the pillars, and the furnace burning under the well floor.
-//! Both flicker on id Software's original lightstyle strings, sampled at the
-//! same ten steps per second Quake used, so the whole scene breathes together.
+//! mounted high on the pillars, and the pool of molten metal at the bottom of
+//! the pit under the well. Both flicker on id Software's original lightstyle
+//! strings, sampled at the same ten steps per second Quake used, so the whole
+//! scene breathes together.
 
 use macroquad::prelude::*;
 
-use crate::render3d::{BEZEL_FRONT_Z, BEZEL_PILLAR_CENTER_X, WELL_HEIGHT, WELL_WIDTH};
+use crate::render3d::{
+    BEZEL_FRONT_Z, BEZEL_PILLAR_CENTER_X, LAVA_Y, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
+};
 
 /// Lightstyle 1 ("FLICKER, first variety"). `a` is dark, `m` is normal, `z`
 /// is double brightness.
@@ -28,9 +31,10 @@ pub const LAMP_HEIGHT: f32 = WELL_HEIGHT * 0.5 - 1.4;
 pub const LAMP_OFFSET_X: f32 = BEZEL_PILLAR_CENTER_X;
 pub const LAMP_Z: f32 = BEZEL_FRONT_Z + 0.38;
 
-/// The furnace is a line of fire just under the well floor, spanning its width.
-const FURNACE_Y: f32 = -WELL_HEIGHT * 0.5 - 0.6;
-const FURNACE_Z: f32 = 0.0;
+/// The furnace light is the lava surface itself: a glowing slab spanning the
+/// pit at [`LAVA_Y`]. It is treated as an area source, so the nearest point
+/// of the slab is used for falloff.
+const FURNACE_Y: f32 = LAVA_Y;
 
 /// Slightly cool, so unlit steel reads as steel and the warm sources stand
 /// out against it instead of tinting everything the same brown.
@@ -42,8 +46,8 @@ const LAMP_INTENSITY: f32 = 1.3;
 const LAMP_RADIUS: f32 = 5.0;
 
 const FURNACE_COLOR: Vec3 = Vec3::new(1.0, 0.42, 0.10);
-const FURNACE_INTENSITY: f32 = 1.7;
-const FURNACE_RADIUS: f32 = 2.6;
+const FURNACE_INTENSITY: f32 = 2.2;
+const FURNACE_RADIUS: f32 = 3.2;
 
 /// Sample a Quake lightstyle string at `time`, returning a brightness
 /// multiplier where `m` is 1.0.
@@ -97,14 +101,8 @@ impl SceneLights {
         Color::new(glow.x.min(1.0), glow.y.min(1.0), glow.z.min(1.0), 1.0)
     }
 
-    /// Colour of the fire seen through the furnace grate right now.
-    pub fn furnace_glow(&self) -> Color {
-        let glow = FURNACE_COLOR * (self.furnace_intensity / FURNACE_INTENSITY);
-        Color::new(glow.x.min(1.0), glow.y.min(1.0), glow.z.min(1.0), 1.0)
-    }
-
-    /// Relative brightness of the fire (around 1.0), for effects that scale
-    /// with it rather than take its colour.
+    /// Relative brightness of the melt (around 1.0), for the lava surface and
+    /// the effects that scale with it.
     pub fn furnace_level(&self) -> f32 {
         self.furnace_intensity / FURNACE_INTENSITY
     }
@@ -121,9 +119,10 @@ impl SceneLights {
             light += self.lamp_color * (self.lamp_intensity * falloff);
         }
 
-        // Distance to the furnace line, clamped to the well's width.
+        // Distance to the nearest point of the lava slab.
         let nearest_x = point.x.clamp(-WELL_WIDTH * 0.5, WELL_WIDTH * 0.5);
-        let furnace_delta = point - Vec3::new(nearest_x, FURNACE_Y, FURNACE_Z);
+        let nearest_z = point.z.clamp(-WELL_DEPTH * 0.5, WELL_DEPTH * 0.5);
+        let furnace_delta = point - Vec3::new(nearest_x, FURNACE_Y, nearest_z);
         let furnace_falloff =
             1.0 / (1.0 + furnace_delta.length_squared() / (FURNACE_RADIUS * FURNACE_RADIUS));
         light += FURNACE_COLOR * (self.furnace_intensity * furnace_falloff);

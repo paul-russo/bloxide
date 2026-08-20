@@ -11,7 +11,7 @@ use macroquad::prelude::*;
 use crate::game_state::HardDropTrail;
 use crate::grid::{FIRST_VISIBLE_ROW_ID, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::SceneLights;
-use crate::render3d::{cell_center, draw_quad, BLOCK_INSET, WELL_HEIGHT, WELL_WIDTH};
+use crate::render3d::{cell_center, draw_quad, BLOCK_INSET, LAVA_Y, WELL_HEIGHT, WELL_WIDTH};
 
 const EMBER_COUNT: usize = 26;
 
@@ -35,20 +35,20 @@ fn hash01(index: usize, salt: u32) -> f32 {
     (h & 0x00FF_FFFF) as f32 / 16_777_216.0
 }
 
-/// Sparks rising from the furnace floor, swaying as they cool from yellow to
-/// red and fade. Brightness tracks the furnace so they surge when it flares.
+/// Sparks rising off the melt, up through the floor grate and into the well,
+/// swaying as they cool from yellow to red and fade. Brightness tracks the
+/// furnace so they surge when it flares.
 pub fn draw_embers(time: f64, lights: &SceneLights) {
     let half_w = WELL_WIDTH * 0.5;
-    let floor_y = -WELL_HEIGHT * 0.5;
     let furnace = lights.furnace_level();
 
     for index in 0..EMBER_COUNT {
         let period = 2.4 + hash01(index, 1) * 2.2;
         let phase = ((time / period as f64) + hash01(index, 2) as f64).fract() as f32;
-        let rise = 4.0 + hash01(index, 3) * 7.0;
+        let rise = 6.0 + hash01(index, 3) * 8.0;
         let sway = (time as f32 * (0.9 + hash01(index, 4)) + index as f32).sin() * 0.3;
         let x = (hash01(index, 5) * 2.0 - 1.0) * (half_w - 0.3) + sway * phase;
-        let y = floor_y + 0.2 + phase * rise;
+        let y = LAVA_Y + 0.1 + phase * rise;
         let size = if hash01(index, 6) > 0.7 { 0.12 } else { 0.07 };
         let fade = (1.0 - phase).powf(1.6);
         let flicker = 0.7 + 0.3 * ((time as f32 * 17.0 + index as f32 * 3.1).sin() * 0.5 + 0.5);

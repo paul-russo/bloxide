@@ -618,7 +618,7 @@ pub fn draw_backdrop(surface: &RenderSurface) {
     let lights = SceneLights::idle(time);
     draw_background(&surface.textures, &lights);
     set_camera(&surface.camera_3d(Vec2::ZERO));
-    draw_well(&surface.textures, &lights);
+    draw_well(&surface.textures, &lights, time, &[]);
     draw_embers(time, &lights);
     draw_lamp_glow(&lights);
     surface.restore_2d();
@@ -837,7 +837,6 @@ fn draw_held_piece(held_piece: Option<Piece>, textures: &SceneTextures, lights: 
 
 fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
     let scale = hud_scale();
-    let well = well_screen_rect();
     let impact = game_state.get_impact_effect();
 
     if impact > 0.0 {
@@ -916,11 +915,13 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
         }
     }
 
-    let pause_text = "ESC  PAUSE";
+    // The pause hint sits under the controls panel, clear of the pit below
+    // the well.
+    let controls = controls_card_rect();
     draw_text_centered_at(
-        pause_text,
-        well.x + well.w * 0.5,
-        frame_height() - (18.0 * scale),
+        "ESC  PAUSE",
+        controls.x + controls.w * 0.5,
+        controls.y + controls.h + (22.0 * scale),
         18.0,
         color_u8!(156, 136, 93, 210),
     );
@@ -964,7 +965,7 @@ impl<'a> Drawable for GameState<'a> {
 
         // Opaque scene first, effects that live behind the stack next, then
         // the stack, and finally everything translucent that sits in front.
-        draw_well(&args.textures, &lights);
+        draw_well(&args.textures, &lights, time, self.get_lava_splashes());
         draw_embers(time, &lights);
         if let Some((trail, strength)) = self.get_hard_drop_trail() {
             draw_hard_drop_trail(&trail, strength);

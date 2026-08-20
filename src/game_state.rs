@@ -2,11 +2,14 @@ use crate::{
     bag_manager::BagManager,
     grid::{
         ClearedBlock, Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS,
-        MAX_CLEARED_CELLS, VISIBLE_GRID_COUNT_ROWS,
+        MAX_CLEARED_CELLS,
     },
     high_score_manager::HighScoreManager,
     piece::{BlockCanvas, Piece},
-    render3d::{cell_center, ShrapnelVoxel, MAX_SHRAPNEL_VOXELS},
+    render3d::{
+        cell_center, floor_gap_contains, LavaSplash, ShrapnelVoxel, FLOOR_Y, LAVA_Y,
+        MAX_LAVA_SPLASHES, MAX_SHRAPNEL_VOXELS, SPLASH_SECONDS,
+    },
 };
 use macroquad::prelude::{Color, Vec3};
 use rand::Rng;
@@ -160,6 +163,8 @@ pub struct GameState<'a> {
     impact_origin_count: usize,
     impact_color: Color,
     shrapnel_voxels: [ShrapnelVoxel; MAX_SHRAPNEL_VOXELS],
+    lava_splashes: [LavaSplash; MAX_LAVA_SPLASHES],
+    next_splash_index: usize,
     hard_drop_trail: Option<HardDropTrail>,
     hard_drop_trail_ticks_remaining: usize,
     level_flare_ticks_remaining: usize,
@@ -223,6 +228,8 @@ impl<'a> GameState<'a> {
             impact_origin_count: 0,
             impact_color: active_piece.color,
             shrapnel_voxels: [ShrapnelVoxel::default(); MAX_SHRAPNEL_VOXELS],
+            lava_splashes: [LavaSplash::default(); MAX_LAVA_SPLASHES],
+            next_splash_index: 0,
             hard_drop_trail: None,
             hard_drop_trail_ticks_remaining: 0,
             level_flare_ticks_remaining: 0,
@@ -677,8 +684,23 @@ impl<'a> GameState<'a> {
         const GRAVITY: f32 = 28.0;
         const DRAG: f32 = 0.985;
         const WALL_X: f32 = (GRID_COUNT_COLS as f32 / 2.0) - 0.2;
-        const FLOOR_Y: f32 = -(VISIBLE_GRID_COUNT_ROWS as f32 / 2.0);
         const BACK_WALL_Z: f32 = -0.35;
+        const FRONT_Z: f32 = 0.35;
+
+        // Debris sits on the melt heating up and then sinks, over roughly this
+        // long once it lands.
+        const SINK_SECONDS: f32 = 1.4;
+
+        for splash in self.lava_splashes.iter_mut().filter(|splash| splash.active) {
+            splash.age += dt;
+            if splash.age >= SPLASH_SECONDS {
+                splash.active = false;
+            }
+        }
+
+        let mut landings: [(Vec3, f32); MAX_SHRAPNEL_VOXELS] =
+            [(Vec3::ZERO, 0.0); MAX_SHRAPNEL_VOXELS];
+        let mut landing_count = 0;
 
         for voxel in self.shrapnel_voxels.iter_mut() {
             if !voxel.active {
@@ -686,8 +708,16 @@ impl<'a> GameState<'a> {
             }
 
             voxel.age += dt;
-            if voxel.age >= voxel.max_life {
-                voxel.active = false;
+
+            if voxel.is_sinking() {
+                // Settle on the surface and slow the tumble as the metal
+                // takes hold; retire once fully under.
+                voxel.submersion += dt / SINK_SECONDS;
+                voxel.rotation += voxel.angular_velocity * dt;
+                voxel.angular_velocity *= 0.9;
+                if voxel.submersion >= 1.0 {
+                    voxel.active = false;
+                }
                 continue;
             }
 
@@ -715,13 +745,51 @@ impl<'a> GameState<'a> {
                 voxel.velocity.z = -voxel.velocity.z * 0.45;
             }
 
-            // Bounce off well floor
-            if voxel.position.y < FLOOR_Y && voxel.velocity.y < 0.0 && voxel.bounce_count < 2 {
-                voxel.position.y = FLOOR_Y;
-                voxel.velocity.y = -voxel.velocity.y * 0.35;
-                voxel.bounce_count += 1;
+            // The well has no solid floor, only a grate. Debris that comes
+            // down on a bar takes one bounce off it; debris over a gap, or
+            // anything coming down a second time, drops through into the pit.
+            // Below the grate the shaft is closed at the front by the grille.
+            if voxel.position.y < FLOOR_Y && voxel.velocity.y < 0.0 {
+                let over_bar = !floor_gap_contains(voxel.position.x);
+                let above_grate = voxel.position.y > FLOOR_Y - 0.3;
+                if over_bar && above_grate && voxel.bounce_count == 0 {
+                    voxel.position.y = FLOOR_Y;
+                    voxel.velocity.y = -voxel.velocity.y * 0.35;
+                    voxel.velocity.x += if voxel.position.x >= 0.0 { 0.6 } else { -0.6 };
+                    voxel.bounce_count += 1;
+                }
+            }
+            if voxel.position.y < FLOOR_Y && voxel.position.z > FRONT_Z && voxel.velocity.z > 0.0 {
+                voxel.position.z = FRONT_Z;
+                voxel.velocity.z = -voxel.velocity.z * 0.45;
+            }
+
+            // Touching the melt starts the sink.
+            if voxel.position.y - voxel.size * 0.5 <= LAVA_Y {
+                voxel.position.y = LAVA_Y + voxel.size * 0.5;
+                voxel.velocity = Vec3::ZERO;
+                voxel.submersion = f32::EPSILON;
+                landings[landing_count] = (voxel.position, voxel.size);
+                landing_count += 1;
             }
         }
+
+        for &(position, size) in &landings[..landing_count] {
+            self.spawn_lava_splash(position, size);
+        }
+    }
+
+    /// Start a splash ring where a piece of debris went into the melt. The
+    /// pool is a ring buffer; with many landings at once the oldest splash is
+    /// simply replaced, which is invisible amid the rest.
+    fn spawn_lava_splash(&mut self, position: Vec3, size: f32) {
+        self.lava_splashes[self.next_splash_index] = LavaSplash {
+            position,
+            age: 0.0,
+            size,
+            active: true,
+        };
+        self.next_splash_index = (self.next_splash_index + 1) % MAX_LAVA_SPLASHES;
     }
 
     fn spawn_shrapnel_for_cleared_blocks(
@@ -737,13 +805,6 @@ impl<'a> GameState<'a> {
             2 => 6,
             3 => 7,
             _ => 8,
-        };
-
-        let (min_life, max_life) = match clear_count {
-            1 => (0.80, 1.20),
-            2 => (1.00, 1.45),
-            3 => (1.20, 1.75),
-            _ => (1.40, 2.20),
         };
 
         let (min_size, max_size) = match clear_count {
@@ -841,7 +902,6 @@ impl<'a> GameState<'a> {
                     rng.gen_range(-spin_speed..spin_speed),
                 );
 
-                let life = rng.gen_range(min_life..max_life);
                 let size = rng.gen_range(min_size..max_size);
 
                 self.shrapnel_voxels[target_index] = ShrapnelVoxel {
@@ -856,7 +916,7 @@ impl<'a> GameState<'a> {
                     color: cleared.color,
                     size,
                     age: 0.0,
-                    max_life: life,
+                    submersion: 0.0,
                     bounce_count: 0,
                     is_carnage,
                     active: true,
@@ -1028,6 +1088,10 @@ impl<'a> GameState<'a> {
     pub fn get_shrapnel(&self) -> &[ShrapnelVoxel] {
         &self.shrapnel_voxels
     }
+
+    pub fn get_lava_splashes(&self) -> &[LavaSplash] {
+        &self.lava_splashes
+    }
 }
 
 #[cfg(test)]
@@ -1095,6 +1159,44 @@ mod tests {
             assert!(voxel.age > 0.0);
         }
     }
+
+    #[test]
+    fn debris_falls_through_the_grate_splashes_and_sinks_into_the_melt() {
+        let high_score_manager = crate::high_score_manager::HighScoreManager::new();
+        let mut game_state = super::GameState::new(&high_score_manager);
+
+        for col in 0..crate::grid::GRID_COUNT_COLS {
+            game_state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+        }
+        game_state.clear_filled_rows_and_update_score();
+        assert!(game_state.get_lava_splashes().iter().all(|splash| !splash.active));
+
+        // Run the burst for a second at 60 Hz: by then everything has fallen
+        // through the grate, and some of it has reached the melt.
+        let mut saw_below_floor = false;
+        let mut saw_sinking = false;
+        for _ in 0..60 {
+            game_state.update_shrapnel(1.0 / 60.0);
+            for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
+                saw_below_floor |= voxel.position.y < super::FLOOR_Y - 0.5;
+                saw_sinking |= voxel.is_sinking();
+                assert!(voxel.position.y >= super::LAVA_Y - 0.001, "nothing goes under");
+                if voxel.is_sinking() {
+                    assert!((voxel.position.y - voxel.size * 0.5 - super::LAVA_Y).abs() < 0.01);
+                }
+            }
+        }
+        assert!(saw_below_floor, "debris should drop through the open floor");
+        assert!(saw_sinking, "debris should land in the melt");
+        assert!(game_state.get_lava_splashes().iter().any(|splash| splash.active));
+
+        // Given a few more seconds, every piece has sunk and been retired.
+        for _ in 0..300 {
+            game_state.update_shrapnel(1.0 / 60.0);
+        }
+        assert!(game_state.get_shrapnel().iter().all(|v| !v.active));
+    }
+
 
     #[test]
     fn carnage_line_clears_spawn_maximum_shrapnel_voxels() {
