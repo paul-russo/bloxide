@@ -4,6 +4,7 @@ mod draw;
 mod effects;
 mod game_state;
 mod grid;
+mod headless;
 mod high_score_manager;
 mod lighting;
 mod menu;
@@ -20,6 +21,13 @@ use macroquad::{miniquad::window::quit, prelude::*};
 use menu::{Menu, MenuInput, MenuItem};
 
 fn window_conf() -> Conf {
+    // Screenshot runs are launched repeatedly from a shell; keep their window
+    // from appearing and stealing focus. This has to happen here, before the
+    // macroquad wrapper around `main` creates the window.
+    if screenshot_scene_from_args().is_some() {
+        headless::install();
+    }
+
     Conf {
         window_title: String::from("BLOXIDE // Software Carnage"),
         high_dpi: true,
