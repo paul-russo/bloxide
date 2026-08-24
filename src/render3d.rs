@@ -8,12 +8,28 @@
 //! the CPU-evaluated scene lights in [`crate::lighting`]. That is enough to make
 //! a stack of same-coloured blocks read as distinct solid volumes and the
 //! cabinet read as lit steel.
+//!
+//! Everything is drawn as triangles sampling the one material atlas, including
+//! untextured surfaces (the atlas has a white swatch) and lines (one-pixel
+//! quads, see [`draw_line_quad`]). macroquad starts a new GPU batch whenever
+//! the texture or primitive type changes, so keeping both constant lets an
+//! entire frame reach the GPU in a few batches.
 
 use macroquad::prelude::*;
+use macroquad::window::get_internal_gl;
 
 use crate::grid::{GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::{lit, SceneLights};
-use crate::textures::SceneTextures;
+use crate::textures::{Material, SceneTextures};
+
+/// Geometry one macroquad batch can hold. A frame with a full stack, a
+/// four-row carnage burst and the HUD comes to about 35k vertices, so a batch
+/// this size takes a whole frame without splitting. Each batch owns a GPU
+/// buffer of this capacity (about a megabyte here), which is why it is sized
+/// for the frame rather than left at macroquad's generous default count of
+/// small batches.
+pub const FRAME_VERTEX_CAPACITY: usize = 40_000;
+pub const FRAME_INDEX_CAPACITY: usize = 60_000;
 
 /// The entire game is rendered to this deliberately tiny framebuffer before
 /// nearest-neighbour integer upscaling. At the default 1200x900 window this is a
@@ -290,20 +306,76 @@ pub fn world_to_screen_with_shake(point: Vec3, shake: Vec2) -> Vec2 {
     )
 }
 
-/// Inverse of [`world_to_screen`] onto the plane `z == plane_z`: the world point
-/// under a framebuffer pixel on, say, the wall behind the cabinet. Lets 2D
-/// backdrop drawing sample the same scene lights as the 3D geometry.
-pub fn screen_to_world_on_plane(point: Vec2, plane_z: f32) -> Vec3 {
-    let inverse = well_view_projection_matrix(Vec2::ZERO).inverse();
-    let ndc = Vec2::new(
-        point.x / RENDER_WIDTH as f32 * 2.0 - 1.0,
-        1.0 - point.y / RENDER_HEIGHT as f32 * 2.0,
-    );
-    let near = inverse.project_point3(Vec3::new(ndc.x, ndc.y, -1.0));
-    let far = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
-    let t = (plane_z - near.z) / (far.z - near.z);
+/// A camera-facing plane at depth `z`, addressed in framebuffer pixels: the
+/// inverse of [`world_to_screen`] onto the plane `z == plane_z`.
+///
+/// Screen-space elements (the wall behind the cabinet, the HUD housings, the
+/// HUD itself) are drawn as quads on such a plane, so they go through the same
+/// camera and the same batch as the 3D scene. The mapping compensates for the
+/// camera shake the frame is drawn with: anything placed through it stays put
+/// on screen while the well shakes around it.
+pub struct ScreenPlane {
+    z: f32,
+    /// The frame's camera shake, as the world-space offset that cancels it.
+    shake: Vec3,
+    inverse_view_projection: Mat4,
+}
 
-    near + (far - near) * t
+impl ScreenPlane {
+    pub fn new(z: f32, shake: Vec2) -> Self {
+        Self {
+            z,
+            shake: Vec3::new(shake.x, shake.y, 0.0),
+            inverse_view_projection: well_view_projection_matrix(Vec2::ZERO).inverse(),
+        }
+    }
+
+    /// The point of the resting scene under `screen`: where the pixel looks
+    /// with an unshaken camera. Screen-fixed surfaces sample the scene lights
+    /// here, so their shading does not jitter along with the well.
+    pub fn resting_world(&self, screen: Vec2) -> Vec3 {
+        let ndc = Vec2::new(
+            screen.x / RENDER_WIDTH as f32 * 2.0 - 1.0,
+            1.0 - screen.y / RENDER_HEIGHT as f32 * 2.0,
+        );
+        let near = self
+            .inverse_view_projection
+            .project_point3(Vec3::new(ndc.x, ndc.y, -1.0));
+        let far = self
+            .inverse_view_projection
+            .project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
+        let t = (self.z - near.z) / (far.z - near.z);
+
+        near + (far - near) * t
+    }
+
+    /// Where to place geometry so that it appears at `screen` through the
+    /// frame's shaken camera.
+    pub fn world(&self, screen: Vec2) -> Vec3 {
+        self.resting_world(screen) + self.shake
+    }
+
+    /// World-space corners of a framebuffer rectangle, in [`draw_quad`]'s
+    /// order: top-left, top-right, bottom-right, bottom-left.
+    pub fn corners(&self, rect: Rect) -> [Vec3; 4] {
+        [
+            self.world(Vec2::new(rect.x, rect.y)),
+            self.world(Vec2::new(rect.x + rect.w, rect.y)),
+            self.world(Vec2::new(rect.x + rect.w, rect.y + rect.h)),
+            self.world(Vec2::new(rect.x, rect.y + rect.h)),
+        ]
+    }
+}
+
+/// Switch depth testing on or off for everything drawn afterwards in the
+/// frame, without flushing the batch. Switching off also stops depth writes.
+/// The screen-fixed layers behind and in front of the scene are painted in
+/// submission order with the test off; the scene between them relies on it.
+pub fn set_depth_test(enabled: bool) {
+    // The internal context is the one every macroquad draw_* call uses; it is
+    // held only for this call.
+    let gl = unsafe { get_internal_gl() };
+    gl.quad_gl.depth_test(enabled);
 }
 
 /// World-space centre of a visible grid cell.
@@ -339,19 +411,35 @@ fn shaded(color: Color, shade: f32, alpha: f32) -> Color {
     }
 }
 
+/// Queue triangles into macroquad's current batch.
+///
+/// This goes straight to the batcher rather than through `draw_mesh`, which
+/// wants its vertices and indices in freshly allocated `Vec`s: this renderer
+/// submits thousands of quads a frame, and stack arrays are enough for all of
+/// them.
+fn submit_triangles(vertices: &[Vertex], indices: &[u16], texture: &Texture2D) {
+    // The internal context is the one every macroquad draw_* call uses; it is
+    // held only for these three calls.
+    let gl = unsafe { get_internal_gl() };
+    gl.quad_gl.texture(Some(texture));
+    gl.quad_gl.draw_mode(DrawMode::Triangles);
+    gl.quad_gl.geometry(vertices, indices);
+}
+
+const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
+
 /// Draw one quad with explicit texture orientation and per-corner colours.
 ///
 /// `origin` carries the material's top-left texel; `e1` runs along the
 /// material's rows (u) and `e2` down its columns (v). Callers therefore decide
-/// which world edge a material's lit top edge lands on, instead of inheriting
-/// `draw_affine_parallelogram`'s transposed mapping. Colours follow the same
+/// which world edge a material's lit top edge lands on. Colours follow the same
 /// corner order and are interpolated across the face, which is how every
 /// gradient and light falloff in the scene is drawn without a lighting shader.
-pub fn draw_quad(origin: Vec3, e1: Vec3, e2: Vec3, texture: Option<&Texture2D>, colors: [Color; 4]) {
-    draw_quad_uv(origin, e1, e2, Vec2::ZERO, Vec2::ONE, texture, colors);
+pub fn draw_quad(origin: Vec3, e1: Vec3, e2: Vec3, material: Material, colors: [Color; 4]) {
+    draw_quad_uv(origin, e1, e2, Vec2::ZERO, Vec2::ONE, material, colors);
 }
 
-/// [`draw_quad`] over a sub-rectangle of the texture, from `uv_min` at
+/// [`draw_quad`] over a sub-rectangle of the material, from `uv_min` at
 /// `origin` to `uv_max` at the opposite corner. Used to clip the last partial
 /// tile when a small material is tiled across a surface of arbitrary size.
 pub fn draw_quad_uv(
@@ -360,39 +448,37 @@ pub fn draw_quad_uv(
     e2: Vec3,
     uv_min: Vec2,
     uv_max: Vec2,
-    texture: Option<&Texture2D>,
+    material: Material,
     colors: [Color; 4],
 ) {
-    let vertices = vec![
-        Vertex::new2(origin, vec2(uv_min.x, uv_min.y), colors[0]),
-        Vertex::new2(origin + e1, vec2(uv_max.x, uv_min.y), colors[1]),
-        Vertex::new2(origin + e1 + e2, vec2(uv_max.x, uv_max.y), colors[2]),
-        Vertex::new2(origin + e2, vec2(uv_min.x, uv_max.y), colors[3]),
-    ];
-
-    draw_mesh(&Mesh {
-        vertices,
-        indices: vec![0, 1, 2, 0, 2, 3],
-        texture: texture.cloned(),
-    });
+    let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
+    draw_quad_corners_uv(corners, uv_min, uv_max, material, colors);
 }
 
-/// Draw an untextured quad through four arbitrary corners, given in the same
-/// order as [`draw_quad`] (material top-left, then around). Used for surfaces
-/// that are not parallelograms, such as the tapered walls of the shaft.
-fn draw_quad_corners(corners: [Vec3; 4], colors: [Color; 4]) {
-    let vertices = vec![
-        Vertex::new2(corners[0], vec2(0.0, 0.0), colors[0]),
-        Vertex::new2(corners[1], vec2(1.0, 0.0), colors[1]),
-        Vertex::new2(corners[2], vec2(1.0, 1.0), colors[2]),
-        Vertex::new2(corners[3], vec2(0.0, 1.0), colors[3]),
+/// Draw a quad through four arbitrary corners, given in the same order as
+/// [`draw_quad`] (material top-left, then around). Used for surfaces that are
+/// not parallelograms, such as the tapered walls of the shaft, and for
+/// rectangles mapped onto a [`ScreenPlane`].
+pub fn draw_quad_corners(corners: [Vec3; 4], material: Material, colors: [Color; 4]) {
+    draw_quad_corners_uv(corners, Vec2::ZERO, Vec2::ONE, material, colors);
+}
+
+/// [`draw_quad_corners`] over a sub-rectangle of the material.
+pub fn draw_quad_corners_uv(
+    corners: [Vec3; 4],
+    uv_min: Vec2,
+    uv_max: Vec2,
+    material: Material,
+    colors: [Color; 4],
+) {
+    let vertices = [
+        Vertex::new2(corners[0], material.uv(vec2(uv_min.x, uv_min.y)), colors[0]),
+        Vertex::new2(corners[1], material.uv(vec2(uv_max.x, uv_min.y)), colors[1]),
+        Vertex::new2(corners[2], material.uv(vec2(uv_max.x, uv_max.y)), colors[2]),
+        Vertex::new2(corners[3], material.uv(vec2(uv_min.x, uv_max.y)), colors[3]),
     ];
 
-    draw_mesh(&Mesh {
-        vertices,
-        indices: vec![0, 1, 2, 0, 2, 3],
-        texture: None,
-    });
+    submit_triangles(&vertices, &QUAD_INDICES, material.texture());
 }
 
 /// Draw a quad whose corners are each tinted by the scene light falling on
@@ -402,13 +488,75 @@ pub fn draw_lit_quad(
     origin: Vec3,
     e1: Vec3,
     e2: Vec3,
-    texture: Option<&Texture2D>,
+    material: Material,
     base: Color,
     lights: &SceneLights,
 ) {
     let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
     let colors = corners.map(|corner| lit(base, lights.at(corner)));
-    draw_quad(origin, e1, e2, texture, colors);
+    draw_quad(origin, e1, e2, material, colors);
+}
+
+/// Depth bias toward the camera for line quads: about three steps of the
+/// 16-bit depth buffer over the camera's clip range. A line lying on the face
+/// it outlines then wins the depth test against that face deterministically,
+/// instead of depending on how the two happen to rasterise.
+const LINE_DEPTH_BIAS: f32 = 0.005;
+
+/// Unit vector pointing up the screen, in world space.
+fn screen_up() -> Vec3 {
+    view_direction().cross(Vec3::X)
+}
+
+/// Length in framebuffer pixels of a world-space vector's projection. The
+/// orthographic camera has no yaw, so world x maps to [`CELL_PIXEL_PITCH`]
+/// pixels per unit; its tilted vertical axis maps to slightly more, which is
+/// what keeps a world-vertical unit on the same pitch (see
+/// [`camera_view_height`]).
+fn screen_pixel_length(v: Vec3) -> f32 {
+    let up = v.dot(screen_up()) / camera_pitch_cosine();
+    CELL_PIXEL_PITCH * (v.x * v.x + up * up).sqrt()
+}
+
+/// Draw a one-pixel line as a quad, so it joins the triangle batch instead of
+/// forcing a separate line batch.
+///
+/// The quad is one framebuffer pixel wide and faces the camera. GL lines
+/// cover the pixel they start in and stop short of the one they end in;
+/// sliding the quad back half a pixel reproduces that, and puts its ends on
+/// pixel boundaries whenever the line runs through pixel centres, as the
+/// block edges do, so the pixels it covers are never left to a fill rule.
+pub fn draw_line_quad(start: Vec3, end: Vec3, color: Color, textures: &SceneTextures) {
+    let along = end - start;
+    let along_pixels = screen_pixel_length(along);
+    let view = view_direction();
+    let across_direction = along.cross(view).normalize_or_zero();
+    let across_pixels = screen_pixel_length(across_direction);
+    if along_pixels <= f32::EPSILON || across_pixels <= f32::EPSILON {
+        return;
+    }
+
+    let shift = along * (0.5 / along_pixels);
+    let across = across_direction / across_pixels;
+    let origin = start - shift - across * 0.5 + view * LINE_DEPTH_BIAS;
+
+    draw_quad(origin, along, across, textures.white(), [color; 4]);
+}
+
+/// The twelve edges of an axis-aligned box, as line quads.
+fn draw_box_wires(center: Vec3, size: Vec3, color: Color, textures: &SceneTextures) {
+    let min = center - size * 0.5;
+    let max = center + size * 0.5;
+
+    for (y, z) in [(min.y, min.z), (max.y, min.z), (min.y, max.z), (max.y, max.z)] {
+        draw_line_quad(Vec3::new(min.x, y, z), Vec3::new(max.x, y, z), color, textures);
+    }
+    for (x, z) in [(min.x, min.z), (max.x, min.z), (min.x, max.z), (max.x, max.z)] {
+        draw_line_quad(Vec3::new(x, min.y, z), Vec3::new(x, max.y, z), color, textures);
+    }
+    for (x, y) in [(min.x, min.y), (max.x, min.y), (min.x, max.y), (max.x, max.y)] {
+        draw_line_quad(Vec3::new(x, y, min.z), Vec3::new(x, y, max.z), color, textures);
+    }
 }
 
 /// Mirror a quad's texture along either axis without moving its geometry, by
@@ -497,7 +645,13 @@ fn cube_face_geometry(
 /// decides which are visible. That keeps this correct from any camera angle at
 /// the cost of a few hidden quads per block, which is irrelevant at the couple
 /// of hundred blocks a playfield can hold.
-pub fn draw_shaded_box(center: Vec3, size: Vec3, color: Color, alpha: f32) {
+pub fn draw_shaded_box(
+    center: Vec3,
+    size: Vec3,
+    color: Color,
+    alpha: f32,
+    textures: &SceneTextures,
+) {
     // Each face is defined by its lowest corner plus two edge vectors.
     let min = center - (size * 0.5);
     let edge_x = Vec3::new(size.x, 0.0, 0.0);
@@ -505,7 +659,7 @@ pub fn draw_shaded_box(center: Vec3, size: Vec3, color: Color, alpha: f32) {
     let edge_z = Vec3::new(0.0, 0.0, size.z);
 
     let face = |offset: Vec3, e1: Vec3, e2: Vec3, shade: f32| {
-        draw_affine_parallelogram(offset, e1, e2, None, shaded(color, shade, alpha));
+        draw_quad(offset, e1, e2, textures.white(), [shaded(color, shade, alpha); 4]);
     };
 
     face(min + edge_z, edge_x, edge_y, SHADE_FRONT);
@@ -523,7 +677,7 @@ pub fn draw_shaded_box(center: Vec3, size: Vec3, color: Color, alpha: f32) {
 fn draw_tiled_front_face(
     center: Vec3,
     size: Vec3,
-    texture: &Texture2D,
+    material: Material,
     tint: Color,
     phase: usize,
     lights: &SceneLights,
@@ -549,7 +703,7 @@ fn draw_tiled_front_face(
             let uv_max = Vec2::new(width / BEZEL_TILE_SIZE, height / BEZEL_TILE_SIZE);
             let (uv_min, uv_max) = flipped_uvs(uv_max, index % 2 == 1, (index / 2) % 2 == 1);
 
-            draw_quad_uv(origin, e1, e2, uv_min, uv_max, Some(texture), colors);
+            draw_quad_uv(origin, e1, e2, uv_min, uv_max, material, colors);
         }
     }
 }
@@ -572,7 +726,7 @@ fn flipped_uvs(uv_max: Vec2, flip_x: bool, flip_y: bool) -> (Vec2, Vec2) {
     (Vec2::new(u0, v0), Vec2::new(u1, v1))
 }
 
-fn draw_front_face_outline(center: Vec3, size: Vec3, color: Color) {
+fn draw_front_face_outline(center: Vec3, size: Vec3, color: Color, textures: &SceneTextures) {
     let half = size * 0.5;
     let z = center.z + half.z + 0.006;
     let corners = [
@@ -583,7 +737,7 @@ fn draw_front_face_outline(center: Vec3, size: Vec3, color: Color) {
     ];
 
     for index in 0..4 {
-        draw_line_3d(corners[index], corners[(index + 1) % 4], color);
+        draw_line_quad(corners[index], corners[(index + 1) % 4], color, textures);
     }
 }
 
@@ -707,10 +861,10 @@ pub fn draw_block_cube_scaled(
         // screen, so it is flat-shaded rather than textured, darkest at the
         // back and brightest along its front lip: a lit surface receding into
         // the shaft.
-        let (texture, origin_shade, far_shade) = match index {
-            FACE_FRONT => (Some(texture), shade * 1.04, shade * 0.94),
-            FACE_TOP => (None, shade * 0.72, shade * 1.0),
-            _ => (Some(texture), shade, shade),
+        let (material, origin_shade, far_shade) = match index {
+            FACE_FRONT => (texture, shade * 1.04, shade * 0.94),
+            FACE_TOP => (textures.white(), shade * 0.72, shade * 1.0),
+            _ => (texture, shade, shade),
         };
         let origin_color = shaded(color, origin_shade, 1.0);
         let far_color = shaded(color, far_shade, 1.0);
@@ -719,7 +873,7 @@ pub fn draw_block_cube_scaled(
             origin,
             e1,
             e2,
-            texture,
+            material,
             [origin_color, origin_color, far_color, far_color],
         );
     }
@@ -743,7 +897,12 @@ pub fn draw_block_cube_scaled(
         // cut a groove between them. Lines remain on their true geometry so the
         // depth buffer can occlude them behind neighbouring blocks.
         if visible_edges[index] && visible_count == 1 {
-            draw_line_3d(corners[start], corners[end], shaded(color, 0.27, 1.0));
+            draw_line_quad(
+                corners[start],
+                corners[end],
+                shaded(color, 0.27, 1.0),
+                textures,
+            );
         }
     }
 }
@@ -802,7 +961,7 @@ pub struct LavaSplash {
 /// Draw the active splash rings: each is a bright disc that spreads out and
 /// thins, drawn flat on the lava surface. Must be drawn after the lava and
 /// before the floor grate, so the bars still occlude it.
-pub fn draw_lava_splashes(splashes: &[LavaSplash]) {
+pub fn draw_lava_splashes(splashes: &[LavaSplash], textures: &SceneTextures) {
     for splash in splashes.iter().filter(|splash| splash.active) {
         let t = (splash.age / SPLASH_SECONDS).clamp(0.0, 1.0);
         let radius = splash.size * (1.0 + 3.4 * t);
@@ -813,12 +972,13 @@ pub fn draw_lava_splashes(splashes: &[LavaSplash]) {
         // The ring on the surface is nearly edge-on to the camera, so a short
         // vertical flare of the same light stands up from the point of entry
         // to make the splash legible.
-        draw_glow_disc_on_plane(center, radius, color, alpha);
+        draw_glow_disc_on_plane(center, radius, color, alpha, textures);
         draw_glow_disc(
             center + Vec3::Y * splash.size * 0.6,
             splash.size * (1.2 + 1.6 * t),
             color,
             alpha * 0.8,
+            textures,
         );
     }
 }
@@ -910,6 +1070,7 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
             halo_radius,
             Color::new(1.0, 0.62, 0.14, 1.0),
             halo_alpha,
+            textures,
         );
     }
 
@@ -950,13 +1111,13 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
             let ndotl = normal.dot(light_dir).max(0.0);
             let shade = (0.42 + 0.88 * ndotl) * (1.0 - heat * 0.85)
                 + (1.08 + 0.22 * ndotl) * (heat * 0.85);
-            let texture_opt = if is_hot && heat > 0.42 {
-                None
+            let material = if is_hot && heat > 0.42 {
+                textures.white()
             } else {
-                Some(texture)
+                texture
             };
 
-            draw_quad(origin, e1, e2, texture_opt, [shaded(color, shade, 1.0); 4]);
+            draw_quad(origin, e1, e2, material, [shaded(color, shade, 1.0); 4]);
         }
     }
 
@@ -976,7 +1137,7 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
                 shaded(color, base_shade, 1.0)
             };
 
-            draw_line_3d(corners[start], corners[end], edge_color);
+            draw_line_quad(corners[start], corners[end], edge_color, textures);
         }
     }
 }
@@ -1032,8 +1193,14 @@ const GHOST_BRACKET_LEG: f32 = 0.32;
 /// cubes need to be sorted back-to-front against the stack to composite
 /// correctly, whereas lines read cleanly at any depth and never hide the blocks
 /// the player is aiming at.
-pub fn draw_ghost_cell(center: Vec3, color: Color, exterior: GhostEdges) {
-    let pulse = 0.82 + (((get_time() as f32 * 4.0).sin() + 1.0) * 0.09);
+pub fn draw_ghost_cell(
+    center: Vec3,
+    color: Color,
+    exterior: GhostEdges,
+    time: f64,
+    textures: &SceneTextures,
+) {
+    let pulse = 0.82 + (((time as f32 * 4.0).sin() + 1.0) * 0.09);
     let half = BLOCK_INSET * 0.5;
     let z = center.z + half + BLOCK_FACE_Z_BIAS;
     let silhouette = shaded(color, GHOST_OUTLINE_SHADE, pulse * 0.45);
@@ -1050,7 +1217,7 @@ pub fn draw_ghost_cell(center: Vec3, color: Color, exterior: GhostEdges) {
 
     for edge in 0..4 {
         if exterior[edge] {
-            draw_line_3d(corners[edge], corners[(edge + 1) % 4], silhouette);
+            draw_line_quad(corners[edge], corners[(edge + 1) % 4], silhouette, textures);
         }
     }
 
@@ -1064,8 +1231,18 @@ pub fn draw_ghost_cell(center: Vec3, color: Color, exterior: GhostEdges) {
         let point = corners[corner];
         let toward_next = (corners[(corner + 1) % 4] - point).normalize();
         let toward_previous = (corners[(corner + 3) % 4] - point).normalize();
-        draw_line_3d(point, point + toward_next * GHOST_BRACKET_LEG, bracket);
-        draw_line_3d(point, point + toward_previous * GHOST_BRACKET_LEG, bracket);
+        draw_line_quad(
+            point,
+            point + toward_next * GHOST_BRACKET_LEG,
+            bracket,
+            textures,
+        );
+        draw_line_quad(
+            point,
+            point + toward_previous * GHOST_BRACKET_LEG,
+            bracket,
+            textures,
+        );
     }
 }
 
@@ -1085,11 +1262,11 @@ pub fn draw_well(
     let half_h = WELL_HEIGHT / 2.0;
 
     draw_back_wall(half_w, half_h, textures, lights);
-    draw_shaft_walls(half_w, half_h, lights);
-    draw_lava(half_w, lights, time);
-    draw_lava_splashes(splashes);
-    draw_floor_grate(half_w, lights);
-    draw_well_guides(half_w, half_h);
+    draw_shaft_walls(half_w, half_h, lights, textures);
+    draw_lava(half_w, lights, time, textures);
+    draw_lava_splashes(splashes, textures);
+    draw_floor_grate(half_w, lights, textures);
+    draw_well_guides(half_w, half_h, textures);
     draw_well_bezel(half_w, half_h, textures, lights);
 }
 
@@ -1139,26 +1316,32 @@ fn draw_shaft_quad(
     origin: Vec3,
     e1: Vec3,
     e2: Vec3,
-    texture: Option<&Texture2D>,
+    material: Material,
     base: Color,
     lights: &SceneLights,
 ) {
     let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
     let colors = corners
         .map(|corner| lit(shaft_base_color(corner, base), shaft_light_at(corner, lights)));
-    draw_quad(origin, e1, e2, texture, colors);
+    draw_quad(origin, e1, e2, material, colors);
 }
 
 /// [`draw_quad_corners`] with each corner tinted by [`shaft_base_color`],
 /// scaled by `shade`, and lit by [`shaft_light_at`].
-fn draw_shaft_quad_corners(corners: [Vec3; 4], base: Color, shade: f32, lights: &SceneLights) {
+fn draw_shaft_quad_corners(
+    corners: [Vec3; 4],
+    base: Color,
+    shade: f32,
+    lights: &SceneLights,
+    textures: &SceneTextures,
+) {
     let colors = corners.map(|corner| {
         lit(
             shaded(shaft_base_color(corner, base), shade, 1.0),
             shaft_light_at(corner, lights),
         )
     });
-    draw_quad_corners(corners, colors);
+    draw_quad_corners(corners, textures.white(), colors);
 }
 
 /// The shaft's back wall: dark gunmetal plate, one lit tile per cell, so the
@@ -1186,14 +1369,7 @@ fn draw_back_wall(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &S
                 (row / 2 + col) % 2 == 1,
             );
 
-            draw_shaft_quad(
-                origin,
-                e1,
-                e2,
-                Some(textures.gunmetal()),
-                WELL_BACK_COLOR,
-                lights,
-            );
+            draw_shaft_quad(origin, e1, e2, textures.gunmetal(), WELL_BACK_COLOR, lights);
         }
     }
 }
@@ -1203,7 +1379,7 @@ fn draw_back_wall(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &S
 /// They are lit one row at a time so the lava glow climbs their feet. The
 /// right wall is shaded like the blocks' right faces, keeping the light's
 /// direction consistent across the scene.
-fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights) {
+fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights, textures: &SceneTextures) {
     let front_z = WELL_DEPTH * 0.5;
     let back_half_w = back_wall_half_width(half_w);
     let top = shaft_top_y(half_h);
@@ -1226,6 +1402,7 @@ fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights) {
                 BEZEL_SIDE_COLOR,
                 shade,
                 lights,
+                textures,
             );
         }
     }
@@ -1235,7 +1412,7 @@ fn draw_shaft_walls(half_w: f32, half_h: f32, lights: &SceneLights) {
 /// shaft's footprint. It is drawn as a grid of small patches so the glow can
 /// vary across it: a slowly crawling pattern of bright channels through a
 /// darker crust, breathing with the furnace lightstyle.
-fn draw_lava(half_w: f32, lights: &SceneLights, time: f64) {
+fn draw_lava(half_w: f32, lights: &SceneLights, time: f64, textures: &SceneTextures) {
     const PATCHES_X: usize = 20;
     const PATCHES_Z: usize = 3;
     let front_z = WELL_DEPTH * 0.5;
@@ -1261,7 +1438,7 @@ fn draw_lava(half_w: f32, lights: &SceneLights, time: f64) {
             ];
             let colors = corners.map(|corner| lava_color_at(corner, t, level));
 
-            draw_quad_corners(corners, colors);
+            draw_quad_corners(corners, textures.white(), colors);
         }
     }
 
@@ -1275,7 +1452,7 @@ fn draw_lava(half_w: f32, lights: &SceneLights, time: f64) {
         Vec3::new(-half_w, LAVA_Y + haze_height, front_z - 0.02),
         Vec3::X * WELL_WIDTH,
         Vec3::NEG_Y * haze_height,
-        None,
+        textures.white(),
         [clear, clear, glow, glow],
     );
 }
@@ -1297,7 +1474,7 @@ fn lava_color_at(point: Vec3, time: f32, level: f32) -> Color {
 /// Each bar is two framebuffer pixels wide on a four-pixel pitch, measured out
 /// from the well's centre line, so they land on whole pixels and line up with
 /// the fascia grille below. Drawn after the lava so the bars occlude it.
-fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
+fn draw_floor_grate(half_w: f32, lights: &SceneLights, textures: &SceneTextures) {
     let front_z = WELL_DEPTH * 0.5;
     let back_half_w = back_wall_half_width(half_w);
     let bar_width = FLOOR_BAR_WIDTH_PIXELS / CELL_PIXEL_PITCH;
@@ -1305,6 +1482,7 @@ fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
     let top_lit = shaded(grate, 1.25, 1.0);
     let top_far = shaded(grate, 0.85, 1.0);
     let front_face = shaded(grate, 0.6, 1.0);
+    let white = textures.white();
 
     for x in floor_bar_left_edges() {
         let taper_x = |x: f32| x * back_half_w / half_w;
@@ -1317,6 +1495,7 @@ fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
                 Vec3::new(x + bar_width, FLOOR_Y, front_z),
                 Vec3::new(x, FLOOR_Y, front_z),
             ],
+            white,
             [top_far, top_far, top_lit, top_lit],
         );
 
@@ -1325,7 +1504,7 @@ fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
             Vec3::new(x, FLOOR_Y, front_z),
             Vec3::X * bar_width,
             Vec3::NEG_Y * FLOOR_BAR_HEIGHT,
-            None,
+            white,
             [front_face; 4],
         );
     }
@@ -1336,7 +1515,7 @@ fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
             Vec3::new(-half, FLOOR_Y + 0.002, z),
             Vec3::X * half * 2.0,
             Vec3::NEG_Y * FLOOR_BAR_HEIGHT,
-            None,
+            white,
             [shaded(grate, 0.9, 1.0); 4],
         );
     }
@@ -1345,14 +1524,14 @@ fn draw_floor_grate(half_w: f32, lights: &SceneLights) {
 /// Draw the faint per-cell grid on the well's back wall. Columns follow the
 /// wall's tapered width so the lines stay painted on the wall rather than
 /// floating in front of its edges.
-fn draw_well_guides(half_w: f32, half_h: f32) {
+fn draw_well_guides(half_w: f32, half_h: f32, textures: &SceneTextures) {
     let z = BACK_WALL_Z + GUIDE_Z_BIAS;
     let back_half_w = back_wall_half_width(half_w);
     let column_width = back_half_w * 2.0 / GRID_COUNT_COLS as f32;
 
     for col in 1..GRID_COUNT_COLS {
         let x = col as f32 * column_width - back_half_w;
-        draw_line_3d(
+        draw_line_quad(
             Vec3::new(x, -half_h, z),
             Vec3::new(x, half_h, z),
             if col == GRID_COUNT_COLS / 2 {
@@ -1360,12 +1539,13 @@ fn draw_well_guides(half_w: f32, half_h: f32) {
             } else {
                 WELL_GUIDE_COLOR
             },
+            textures,
         );
     }
 
     for row in 1..VISIBLE_GRID_COUNT_ROWS {
         let y = half_h - row as f32;
-        draw_line_3d(
+        draw_line_quad(
             Vec3::new(-back_half_w, y, z),
             Vec3::new(back_half_w, y, z),
             if row % 5 == 0 {
@@ -1373,6 +1553,7 @@ fn draw_well_guides(half_w: f32, half_h: f32) {
             } else {
                 WELL_GUIDE_COLOR
             },
+            textures,
         );
     }
 }
@@ -1432,46 +1613,44 @@ pub fn lintel_front_bounds() -> (Vec3, Vec3) {
 
 /// Bolt-head positions on the fascia front: a column up each pillar plus one
 /// in each corner of the lintel.
-fn bolt_positions(half_w: f32, half_h: f32) -> Vec<Vec3> {
+fn bolt_positions(half_w: f32, half_h: f32) -> impl Iterator<Item = Vec3> {
     let boxes = bezel_fascia_boxes(half_w, half_h);
     let pillar_x = boxes[1].0.x.abs();
     let pillar_front_z = boxes[1].0.z + boxes[1].1.z * 0.5;
     let (lintel_center, lintel_size) = boxes[FASCIA_LINTEL];
     let lintel_front_z = lintel_center.z + lintel_size.z * 0.5;
-    let mut positions = Vec::new();
 
     // The lamps take the place of whichever bolt would sit under them.
     let lamp_clearance = LAMP_HOUSING_SIZE.y * 0.5 + BOLT_SIZE;
-    let mut y = -half_h + 0.5;
-    while y < half_h {
-        let under_lamp = SceneLights::lamp_positions()
-            .iter()
-            .any(|lamp| (lamp.y - y).abs() < lamp_clearance);
-        if !under_lamp {
-            for x_sign in [-1.0, 1.0] {
-                positions.push(Vec3::new(x_sign * pillar_x, y, pillar_front_z));
-            }
-        }
-        y += BOLT_SPACING;
-    }
+    let pillar_bolts = (0..)
+        .map(move |index| -half_h + 0.5 + index as f32 * BOLT_SPACING)
+        .take_while(move |&y| y < half_h)
+        .filter(move |&y| {
+            !SceneLights::lamp_positions()
+                .iter()
+                .any(|lamp| (lamp.y - y).abs() < lamp_clearance)
+        })
+        .flat_map(move |y| {
+            [-1.0, 1.0].map(|x_sign| Vec3::new(x_sign * pillar_x, y, pillar_front_z))
+        });
 
     let inset = 0.5;
-    for x_sign in [-1.0, 1.0] {
-        for y_sign in [-1.0, 1.0] {
-            positions.push(Vec3::new(
+    let lintel_bolts = [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
+        .into_iter()
+        .map(move |(x_sign, y_sign)| {
+            Vec3::new(
                 x_sign * (lintel_size.x * 0.5 - inset),
                 lintel_center.y + y_sign * (lintel_size.y * 0.5 - inset),
                 lintel_front_z,
-            ));
-        }
-    }
+            )
+        });
 
-    positions
+    pillar_bolts.chain(lintel_bolts)
 }
 
 /// A domed bolt head standing just off a fascia face: a soft drop shadow under
 /// a small face that is lit across its crown and shadowed at its skirt.
-fn draw_bolt(center: Vec3, lights: &SceneLights) {
+fn draw_bolt(center: Vec3, lights: &SceneLights, textures: &SceneTextures) {
     let half = BOLT_SIZE * 0.5;
     let shadow_offset = Vec3::new(0.06, -0.06, 0.0);
     let top_left = Vec3::new(center.x - half, center.y + half, center.z + BOLT_DEPTH);
@@ -1481,14 +1660,14 @@ fn draw_bolt(center: Vec3, lights: &SceneLights) {
         top_left + shadow_offset + Vec3::Z * 0.002,
         Vec3::X * BOLT_SIZE,
         Vec3::NEG_Y * BOLT_SIZE,
-        None,
+        textures.white(),
         [color_u8!(8, 8, 7, 200); 4],
     );
     draw_quad(
         top_left + Vec3::Z * 0.004,
         Vec3::X * BOLT_SIZE,
         Vec3::NEG_Y * BOLT_SIZE,
-        None,
+        textures.white(),
         [
             shaded(base, 1.5, 1.0),
             shaded(base, 1.3, 1.0),
@@ -1501,15 +1680,15 @@ fn draw_bolt(center: Vec3, lights: &SceneLights) {
 /// Draw a caged bulkhead lamp housing with its emissive face. The translucent
 /// glow around it is drawn separately by [`draw_lamp_glow`], after everything
 /// opaque, so its depth writes cannot clip blocks in the well's top corners.
-fn draw_lamp(position: Vec3, lights: &SceneLights) {
+fn draw_lamp(position: Vec3, lights: &SceneLights, textures: &SceneTextures) {
     let housing_center = Vec3::new(
         position.x,
         position.y,
         BEZEL_FRONT_Z + LAMP_HOUSING_SIZE.z * 0.5,
     );
     let housing = lit(LAMP_HOUSING_COLOR, lights.at(position));
-    draw_shaded_box(housing_center, LAMP_HOUSING_SIZE, housing, 1.0);
-    draw_cube_wires(housing_center, LAMP_HOUSING_SIZE, BEZEL_SEAM_COLOR);
+    draw_shaded_box(housing_center, LAMP_HOUSING_SIZE, housing, 1.0, textures);
+    draw_box_wires(housing_center, LAMP_HOUSING_SIZE, BEZEL_SEAM_COLOR, textures);
 
     let face_size = Vec2::new(LAMP_HOUSING_SIZE.x - 0.18, LAMP_HOUSING_SIZE.y - 0.18);
     let face_z = housing_center.z + LAMP_HOUSING_SIZE.z * 0.5 + 0.004;
@@ -1527,17 +1706,18 @@ fn draw_lamp(position: Vec3, lights: &SceneLights) {
         face_top_left,
         Vec3::X * face_size.x,
         Vec3::NEG_Y * face_size.y,
-        None,
+        textures.white(),
         [hot, hot, deep, deep],
     );
 
     // Two cage bars across the lens.
     for bar in 1..3 {
         let x = face_top_left.x + face_size.x * (bar as f32 / 3.0);
-        draw_line_3d(
+        draw_line_quad(
             Vec3::new(x, face_top_left.y, face_z + 0.004),
             Vec3::new(x, face_top_left.y - face_size.y, face_z + 0.004),
             LAMP_CAGE_COLOR,
+            textures,
         );
     }
 }
@@ -1545,56 +1725,63 @@ fn draw_lamp(position: Vec3, lights: &SceneLights) {
 /// A soft radial light pool facing the camera: a fan of triangles fading from
 /// `alpha` at the centre to fully transparent at `radius`. Under the palette
 /// quantisation this dithers into the stepped halos of a software lightmap.
-pub fn draw_glow_disc(center: Vec3, radius: f32, color: Color, alpha: f32) {
-    draw_glow_fan(center, Vec3::X, Vec3::Y, radius, color, alpha);
+pub fn draw_glow_disc(
+    center: Vec3,
+    radius: f32,
+    color: Color,
+    alpha: f32,
+    textures: &SceneTextures,
+) {
+    draw_glow_fan(center, Vec3::X, Vec3::Y, radius, color, alpha, textures.white());
 }
 
 /// [`draw_glow_disc`] laid flat on a horizontal surface such as the lava.
-pub fn draw_glow_disc_on_plane(center: Vec3, radius: f32, color: Color, alpha: f32) {
-    draw_glow_fan(center, Vec3::X, Vec3::Z, radius, color, alpha);
+pub fn draw_glow_disc_on_plane(
+    center: Vec3,
+    radius: f32,
+    color: Color,
+    alpha: f32,
+    textures: &SceneTextures,
+) {
+    draw_glow_fan(center, Vec3::X, Vec3::Z, radius, color, alpha, textures.white());
 }
 
-fn draw_glow_fan(center: Vec3, axis_a: Vec3, axis_b: Vec3, radius: f32, color: Color, alpha: f32) {
+fn draw_glow_fan(
+    center: Vec3,
+    axis_a: Vec3,
+    axis_b: Vec3,
+    radius: f32,
+    color: Color,
+    alpha: f32,
+    material: Material,
+) {
     const SEGMENTS: usize = 16;
-    let mut vertices = Vec::with_capacity(SEGMENTS + 1);
-    let mut indices = Vec::with_capacity(SEGMENTS * 3);
-    vertices.push(Vertex::new2(
-        center,
-        Vec2::ZERO,
-        Color::new(color.r, color.g, color.b, alpha),
-    ));
+    let uv = material.uv(Vec2::splat(0.5));
+    let rim_color = Color::new(color.r, color.g, color.b, 0.0);
+    let mut vertices =
+        [Vertex::new2(center, uv, Color::new(color.r, color.g, color.b, alpha)); SEGMENTS + 1];
+    let mut indices = [0u16; SEGMENTS * 3];
 
     for segment in 0..SEGMENTS {
         let angle = segment as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
         let rim = center + (axis_a * angle.cos() + axis_b * angle.sin()) * radius;
-        vertices.push(Vertex::new2(
-            rim,
-            Vec2::ZERO,
-            Color::new(color.r, color.g, color.b, 0.0),
-        ));
-        indices.extend_from_slice(&[
-            0,
-            1 + segment as u16,
-            1 + ((segment + 1) % SEGMENTS) as u16,
-        ]);
+        vertices[segment + 1] = Vertex::new2(rim, uv, rim_color);
+        indices[segment * 3 + 1] = 1 + segment as u16;
+        indices[segment * 3 + 2] = 1 + ((segment + 1) % SEGMENTS) as u16;
     }
 
-    draw_mesh(&Mesh {
-        vertices,
-        indices,
-        texture: None,
-    });
+    submit_triangles(&vertices, &indices, material.texture());
 }
 
 /// Translucent light pools around the lamps. Must be drawn after every opaque
 /// element of the 3D pass.
-pub fn draw_lamp_glow(lights: &SceneLights) {
+pub fn draw_lamp_glow(lights: &SceneLights, textures: &SceneTextures) {
     let glow = lights.lamp_glow();
 
     for position in SceneLights::lamp_positions() {
         let center = position + Vec3::Z * 0.02;
-        draw_glow_disc(center, 2.6, glow, 0.22);
-        draw_glow_disc(center, 1.2, glow, 0.20);
+        draw_glow_disc(center, 2.6, glow, 0.22, textures);
+        draw_glow_disc(center, 1.2, glow, 0.20, textures);
     }
 }
 
@@ -1620,8 +1807,8 @@ fn draw_furnace_front(
     for post_x in [min_x, max_x - post_width] {
         let post_center = Vec3::new(post_x + post_width * 0.5, center.y, center.z);
         let post_size = Vec3::new(post_width, size.y, size.z);
-        draw_shaded_box(post_center, post_size, BEZEL_FRAME_COLOR, 1.0);
-        draw_cube_wires(post_center, post_size, BEZEL_SEAM_COLOR);
+        draw_shaded_box(post_center, post_size, BEZEL_FRAME_COLOR, 1.0, textures);
+        draw_box_wires(post_center, post_size, BEZEL_SEAM_COLOR, textures);
         draw_tiled_front_face(
             post_center,
             post_size,
@@ -1630,7 +1817,7 @@ fn draw_furnace_front(
             0,
             lights,
         );
-        draw_front_face_outline(post_center, post_size, BEZEL_SEAM_COLOR);
+        draw_front_face_outline(post_center, post_size, BEZEL_SEAM_COLOR, textures);
     }
 
     // The grille bars stand against the glow behind them, so they read dark:
@@ -1651,7 +1838,7 @@ fn draw_furnace_front(
             Vec3::new(x, top, bar_z),
             Vec3::X * bar_width,
             Vec3::NEG_Y * size.y,
-            None,
+            textures.white(),
             [bar_rim, bar_face, bar_face, bar_rim],
         );
     }
@@ -1662,7 +1849,7 @@ fn draw_furnace_front(
             Vec3::new(center.x - span_half, rib_top, bar_z + 0.002),
             Vec3::X * span_half * 2.0,
             Vec3::NEG_Y * (2.0 * pixel),
-            None,
+            textures.white(),
             [bar_rim, bar_rim, bar_face, bar_face],
         );
     }
@@ -1671,7 +1858,7 @@ fn draw_furnace_front(
 /// Draw the chamfered sides between the cabinet face and the playfield
 /// opening. The opening is left open at the top, so pieces visibly enter a
 /// chute, and open at the bottom, where the floor grate hands over to the pit.
-fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
+fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights, textures: &SceneTextures) {
     let depth = BEZEL_FRONT_Z - BEZEL_THROAT_Z;
     let rim_top = half_h + BEZEL_LINTEL_CLEARANCE;
     let rim_bottom = LAVA_Y;
@@ -1689,7 +1876,7 @@ fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
                 inner_top,
                 Vec3::new(x_sign * BEZEL_BEVEL_WIDTH, 0.0, depth),
                 Vec3::NEG_Y * height,
-                None,
+                textures.white(),
                 shaded(BEZEL_SIDE_COLOR, side_shade, 1.0),
                 lights,
             );
@@ -1698,13 +1885,19 @@ fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
     }
 
     // A lit rim down each side of the opening, where the chamfer meets the
-    // block plane.
+    // block plane: a one-pixel strip just inside the opening. The opening's
+    // edge lies on a pixel boundary, so the strip is placed explicitly rather
+    // than centred on the edge, where half of it would fall under the chamfer.
     let edge_z = BEZEL_THROAT_Z + 0.004;
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
     for x_sign in [-1.0, 1.0] {
-        draw_line_3d(
-            Vec3::new(x_sign * half_w, rim_bottom, edge_z),
-            Vec3::new(x_sign * half_w, rim_top, edge_z),
-            BEZEL_EDGE_COLOR,
+        let inner_x = x_sign * (half_w - pixel);
+        draw_quad(
+            Vec3::new(inner_x.min(x_sign * half_w), rim_top, edge_z),
+            Vec3::X * pixel,
+            Vec3::NEG_Y * (rim_top - rim_bottom),
+            textures.white(),
+            [BEZEL_EDGE_COLOR; 4],
         );
     }
 }
@@ -1714,7 +1907,7 @@ fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights) {
 /// lamp on each pillar. The throat stays open between lintel and well so
 /// pieces visibly drop out of the machine rather than appear behind glass.
 fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &SceneLights) {
-    draw_bezel_throat(half_w, half_h, lights);
+    draw_bezel_throat(half_w, half_h, lights, textures);
 
     for (index, (center, size)) in bezel_fascia_boxes(half_w, half_h).into_iter().enumerate() {
         // The bottom bar is open grille between its end posts, so it draws
@@ -1724,8 +1917,8 @@ fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &
             continue;
         }
 
-        draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0);
-        draw_cube_wires(center, size, BEZEL_SEAM_COLOR);
+        draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0, textures);
+        draw_box_wires(center, size, BEZEL_SEAM_COLOR, textures);
         draw_tiled_front_face(
             center,
             size,
@@ -1734,15 +1927,15 @@ fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &
             index,
             lights,
         );
-        draw_front_face_outline(center, size, BEZEL_SEAM_COLOR);
+        draw_front_face_outline(center, size, BEZEL_SEAM_COLOR, textures);
     }
 
     for bolt in bolt_positions(half_w, half_h) {
-        draw_bolt(bolt, lights);
+        draw_bolt(bolt, lights, textures);
     }
 
     for lamp in SceneLights::lamp_positions() {
-        draw_lamp(lamp, lights);
+        draw_lamp(lamp, lights, textures);
     }
 }
 
@@ -1834,10 +2027,51 @@ mod tests {
             Vec3::new(9.0, -12.5, 0.5),
         ] {
             let screen = world_to_screen(point);
-            let back = screen_to_world_on_plane(screen, point.z);
+            let back = ScreenPlane::new(point.z, Vec2::ZERO).resting_world(screen);
 
             assert!((back - point).length() < 0.001, "{point} -> {screen} -> {back}");
         }
+    }
+
+    #[test]
+    fn screen_plane_geometry_stays_put_under_camera_shake() {
+        let shake = Vec2::new(0.17, -0.23);
+        let plane = ScreenPlane::new(1.5, shake);
+        let screen = Vec2::new(123.0, 45.0);
+
+        // Placed through the shaken camera, the point lands on the same pixel.
+        let placed = plane.world(screen);
+        let seen = world_to_screen_with_shake(placed, shake);
+        assert!((seen - screen).length() < 0.01, "{seen}");
+        assert!((placed.z - 1.5).abs() < 0.001);
+
+        // While the resting point is where the unshaken camera looks.
+        let resting = plane.resting_world(screen);
+        assert!((world_to_screen(resting) - screen).length() < 0.01);
+        assert!((placed - resting - Vec3::new(shake.x, shake.y, 0.0)).length() < 0.001);
+    }
+
+    #[test]
+    fn screen_plane_rect_corners_follow_draw_quad_order() {
+        let plane = ScreenPlane::new(-1.0, Vec2::ZERO);
+        let corners = plane.corners(Rect::new(10.0, 20.0, 30.0, 40.0));
+        let projected = corners.map(world_to_screen);
+
+        assert!((projected[0] - Vec2::new(10.0, 20.0)).length() < 0.01);
+        assert!((projected[1] - Vec2::new(40.0, 20.0)).length() < 0.01);
+        assert!((projected[2] - Vec2::new(40.0, 60.0)).length() < 0.01);
+        assert!((projected[3] - Vec2::new(10.0, 60.0)).length() < 0.01);
+    }
+
+    #[test]
+    fn screen_pixel_length_matches_the_cell_pitch_on_both_axes() {
+        assert!((screen_pixel_length(Vec3::X) - CELL_PIXEL_PITCH).abs() < 0.001);
+        assert!((screen_pixel_length(Vec3::Y) - CELL_PIXEL_PITCH).abs() < 0.001);
+
+        // Depth only shows through the camera's tilt.
+        let depth = screen_pixel_length(Vec3::Z);
+        assert!(depth > 1.0 && depth < 4.0, "{depth}");
+        assert!(screen_pixel_length(view_direction()).abs() < 0.001);
     }
 
     #[test]
@@ -1922,7 +2156,7 @@ mod tests {
 
     #[test]
     fn bolts_sit_on_the_fascia_front_and_never_overlap_the_lamps() {
-        let bolts = bolt_positions(WELL_WIDTH / 2.0, WELL_HEIGHT / 2.0);
+        let bolts: Vec<Vec3> = bolt_positions(WELL_WIDTH / 2.0, WELL_HEIGHT / 2.0).collect();
         let [_, left, _, lintel] = bezel_fascia_boxes(WELL_WIDTH / 2.0, WELL_HEIGHT / 2.0);
         let pillar_front_z = left.0.z + left.1.z * 0.5;
         let lintel_front_z = lintel.0.z + lintel.1.z * 0.5;

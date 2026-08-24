@@ -12,6 +12,7 @@ use crate::game_state::HardDropTrail;
 use crate::grid::{FIRST_VISIBLE_ROW_ID, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::SceneLights;
 use crate::render3d::{cell_center, draw_quad, BLOCK_INSET, LAVA_Y, WELL_HEIGHT, WELL_WIDTH};
+use crate::textures::SceneTextures;
 
 const EMBER_COUNT: usize = 26;
 
@@ -38,7 +39,7 @@ fn hash01(index: usize, salt: u32) -> f32 {
 /// Sparks rising off the melt, up through the floor grate and into the well,
 /// swaying as they cool from yellow to red and fade. Brightness tracks the
 /// furnace so they surge when it flares.
-pub fn draw_embers(time: f64, lights: &SceneLights) {
+pub fn draw_embers(time: f64, lights: &SceneLights, textures: &SceneTextures) {
     let half_w = WELL_WIDTH * 0.5;
     let furnace = lights.furnace_level();
 
@@ -64,7 +65,7 @@ pub fn draw_embers(time: f64, lights: &SceneLights) {
             Vec3::new(x - size * 0.5, y + size * 0.5, EMBER_Z),
             Vec3::X * size,
             Vec3::NEG_Y * size,
-            None,
+            textures.white(),
             [color; 4],
         );
     }
@@ -72,7 +73,7 @@ pub fn draw_embers(time: f64, lights: &SceneLights) {
 
 /// Translucent streaks down every column a hard-dropped piece fell through,
 /// fading out upward and over time.
-pub fn draw_hard_drop_trail(trail: &HardDropTrail, strength: f32) {
+pub fn draw_hard_drop_trail(trail: &HardDropTrail, strength: f32, textures: &SceneTextures) {
     let lines_dropped = (trail.landing_row - trail.start_row).max(0);
     if lines_dropped == 0 || strength <= 0.0 {
         return;
@@ -123,7 +124,7 @@ pub fn draw_hard_drop_trail(trail: &HardDropTrail, strength: f32) {
             Vec3::new(center_x - width * 0.5, top_y, TRAIL_Z),
             Vec3::X * width,
             Vec3::NEG_Y * (top_y - bottom_y),
-            None,
+            textures.white(),
             [faint, faint, bright, bright],
         );
     }
@@ -132,7 +133,12 @@ pub fn draw_hard_drop_trail(trail: &HardDropTrail, strength: f32) {
 /// A hot flash across each cleared row during the first part of the clear
 /// effect: white-hot at the instant of the clear, cooling through amber as it
 /// fades. Larger clears flash harder.
-pub fn draw_clear_flash(row_mask: u32, clear_remaining: f32, clear_count: usize) {
+pub fn draw_clear_flash(
+    row_mask: u32,
+    clear_remaining: f32,
+    clear_count: usize,
+    textures: &SceneTextures,
+) {
     const FLASH_PORTION: f32 = 0.3;
     let progress = ((clear_remaining - (1.0 - FLASH_PORTION)) / FLASH_PORTION).clamp(0.0, 1.0);
     if row_mask == 0 || progress <= 0.0 {
@@ -159,7 +165,7 @@ pub fn draw_clear_flash(row_mask: u32, clear_remaining: f32, clear_count: usize)
             Vec3::new(-half_w, top_y, FLASH_Z),
             Vec3::X * WELL_WIDTH,
             Vec3::NEG_Y,
-            None,
+            textures.white(),
             [color; 4],
         );
     }

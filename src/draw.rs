@@ -7,21 +7,20 @@ use crate::lighting::{lit, SceneLights};
 use crate::menu::Menu;
 use crate::piece::Piece;
 use crate::pixel_font::{
-    digit_text_width, draw_digit_text, draw_small_text, small_text_width, DIGIT_HEIGHT,
+    digit_text_glyphs, digit_text_width, small_text_glyphs, small_text_width, DIGIT_HEIGHT,
     SMALL_GLYPH_HEIGHT,
 };
 use crate::postfx::PostProcess;
 use crate::render3d::{
     cell_center, draw_block_cube, draw_block_cube_scaled, draw_ghost_cell, draw_lamp_glow,
-    draw_quad, draw_quad_uv, draw_shrapnel, draw_tumbling_cube, draw_well, lintel_front_bounds,
-    screen_to_world_on_plane, well_camera, world_to_screen, world_to_screen_with_shake,
-    BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
+    draw_quad_corners, draw_quad_corners_uv, draw_shrapnel, draw_tumbling_cube, draw_well,
+    lintel_front_bounds, set_depth_test, well_camera, world_to_screen, world_to_screen_with_shake,
+    ScreenPlane, BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
 };
-use crate::textures::{SceneTextures, BLOCK_TEXTURE_SIZE, STONE_TEXTURE_SIZE};
+use crate::textures::{Material, SceneTextures, BLOCK_TEXTURE_SIZE, STONE_TEXTURE_SIZE};
 use macroquad::prelude::*;
 use macroquad::texture::{render_target_ex, RenderTargetParams};
 use num_format::{Locale, ToFormattedString};
-use std::rc::Rc;
 
 /// The window is sized for the 3D scene rather than for a pixel-exact 2D grid:
 /// it has to fit the well plus a side panel on each side, with the well framed
@@ -33,11 +32,10 @@ pub const WINDOW_HEIGHT: f32 = 900.0;
 /// so this only shows through if a tile ever fails to.
 pub const BACKGROUND_COLOR: Color = color_u8!(10, 9, 7, 255);
 
-#[derive(Clone)]
 pub struct RenderSurface {
     pub target: RenderTarget,
-    pub textures: SceneTextures,
-    post_process: Rc<PostProcess>,
+    textures: SceneTextures,
+    post_process: PostProcess,
 }
 
 impl RenderSurface {
@@ -58,32 +56,29 @@ impl RenderSurface {
         Self {
             target,
             textures: SceneTextures::new(),
-            post_process: Rc::new(PostProcess::new(RENDER_WIDTH, RENDER_HEIGHT)),
+            post_process: PostProcess::new(RENDER_WIDTH, RENDER_HEIGHT),
         }
     }
 
-    fn camera_2d(&self) -> Camera2D {
-        let mut camera = Camera2D::from_display_rect(Rect::new(
-            0.0,
-            0.0,
-            RENDER_WIDTH as f32,
-            RENDER_HEIGHT as f32,
-        ));
-        camera.render_target = Some(self.target.clone());
-        camera
-    }
-
-    fn camera_3d(&self, shake: Vec2) -> Camera3D {
+    fn camera(&self, shake: Vec2) -> Camera3D {
         well_camera(Some(self.target.clone()), shake)
     }
 
-    pub fn begin_frame(&self) {
-        set_camera(&self.camera_2d());
+    /// Start a frame: aim the camera at the render target, shaken by `shake`,
+    /// clear it, and hand back the frame's drawing context.
+    ///
+    /// The whole frame is drawn through this one camera. Screen-fixed elements
+    /// are placed on planes in front of it (see [`ScreenPlane`]), so a frame
+    /// needs no camera switches and macroquad can submit it as a few batches.
+    pub fn begin_frame(&self, time: f64, shake: Vec2) -> Frame<'_> {
+        set_camera(&self.camera(shake));
         clear_background(BACKGROUND_COLOR);
-    }
 
-    fn restore_2d(&self) {
-        set_camera(&self.camera_2d());
+        Frame {
+            textures: &self.textures,
+            time,
+            shake,
+        }
     }
 
     pub fn present(&self) {
@@ -104,6 +99,130 @@ impl RenderSurface {
         );
 
         self.post_process.blit(&self.target.texture, origin, size);
+    }
+}
+
+/// The drawing context for one frame: the materials, the moment the frame
+/// depicts, and the camera shake it is drawn with.
+///
+/// A frame is one camera pass in three layers, drawn in this order: the
+/// screen-fixed elements behind the scene ([`Frame::backdrop`]), the
+/// depth-tested 3D scene ([`Frame::begin_scene`]), and the flat HUD on top
+/// ([`Frame::hud`]). The outer two layers are painted in submission order with
+/// depth testing off; only the scene between them uses the depth buffer.
+pub struct Frame<'a> {
+    textures: &'a SceneTextures,
+    time: f64,
+    shake: Vec2,
+}
+
+/// Depth of the stone wall behind the cabinet, used to place it in the scene's
+/// lighting. It sits a little behind the well's back wall.
+const BACKDROP_WALL_Z: f32 = -1.0;
+
+/// Depth of the HUD plane. The HUD layer is not depth tested, so this only has
+/// to lie inside the camera's clip range; ahead of the cabinet front keeps the
+/// plane's pixel mapping clear of any scene geometry.
+const HUD_Z: f32 = 1.5;
+
+impl<'a> Frame<'a> {
+    fn surface(&self, z: f32) -> Surface<'a> {
+        Surface {
+            plane: ScreenPlane::new(z, self.shake),
+            textures: self.textures,
+        }
+    }
+
+    /// Surface for the screen-fixed elements behind the scene: the stone wall
+    /// and the HUD housings mounted on it. Painted without depth testing, so
+    /// it must be drawn before the scene, which then covers it wherever there
+    /// is geometry.
+    pub fn backdrop(&self) -> Surface<'a> {
+        set_depth_test(false);
+        self.surface(BACKDROP_WALL_Z)
+    }
+
+    /// Switch to depth-tested drawing for the 3D scene. Call once the
+    /// backdrop is complete and before any scene geometry.
+    pub fn begin_scene(&self) {
+        set_depth_test(true);
+    }
+
+    /// Surface for the flat HUD on top of the scene. Switches depth testing
+    /// off for the rest of the frame, so everything drawn afterwards is
+    /// layered in submission order over the scene.
+    pub fn hud(&self) -> Surface<'a> {
+        set_depth_test(false);
+        self.surface(HUD_Z)
+    }
+
+    /// World position that appears at framebuffer pixel `screen` on the plane
+    /// at depth `z`, for 3D geometry anchored to a screen-space layout.
+    pub fn point_at(&self, screen: Vec2, z: f32) -> Vec3 {
+        ScreenPlane::new(z, self.shake).world(screen)
+    }
+}
+
+/// A screen-space drawing surface: a plane facing the camera, addressed in
+/// framebuffer pixels, with the materials to draw from. Everything the HUD
+/// draws goes through one of these, so it joins the scene's batch.
+pub struct Surface<'a> {
+    plane: ScreenPlane,
+    textures: &'a SceneTextures,
+}
+
+impl Surface<'_> {
+    /// The point of the resting scene under a pixel of this surface, for
+    /// sampling the scene lights.
+    fn resting_world(&self, screen: Vec2) -> Vec3 {
+        self.plane.resting_world(screen)
+    }
+
+    /// Fill a pixel rectangle with a flat colour.
+    fn fill(&self, rect: Rect, color: Color) {
+        draw_quad_corners(self.plane.corners(rect), self.textures.white(), [color; 4]);
+    }
+
+    /// One-pixel horizontal rule along row `y`, from `x1` to `x2`.
+    fn hline(&self, x1: f32, x2: f32, y: f32, color: Color) {
+        self.fill(Rect::new(x1, y, x2 - x1, 1.0), color);
+    }
+
+    /// One-pixel vertical rule down column `x`, from `y1` to `y2`.
+    fn vline(&self, x: f32, y1: f32, y2: f32, color: Color) {
+        self.fill(Rect::new(x, y1, 1.0, y2 - y1), color);
+    }
+
+    /// A material tile over `rect`, showing the material from its top-left
+    /// texel to `uv_max`, with a colour at each corner.
+    fn tile(&self, rect: Rect, material: Material, uv_max: Vec2, colors: [Color; 4]) {
+        draw_quad_corners_uv(
+            self.plane.corners(rect),
+            Vec2::ZERO,
+            uv_max,
+            material,
+            colors,
+        );
+    }
+
+    /// Draw `text` in the 5x7 face with its left edge at `x` and its baseline
+    /// at `baseline_y`. Characters without a glyph leave their cell empty.
+    fn small_text(&self, text: &str, x: f32, baseline_y: f32, pixel: f32, color: Color) {
+        for (character, cell) in small_text_glyphs(text, x, baseline_y, pixel) {
+            if let Some(glyph) = self.textures.small_glyph(character) {
+                draw_quad_corners(self.plane.corners(cell), glyph, [color; 4]);
+            }
+        }
+    }
+
+    /// Draw `text` in bold numerals with its left edge at `x` and its top at
+    /// `top_y`. Characters without a glyph leave their cell empty.
+    fn digit_text(&self, text: &str, x: f32, top_y: f32, pixel: f32, color: Color) {
+        for (character, cell) in digit_text_glyphs(text, x, top_y, pixel) {
+            if let Some(glyph) = self.textures.digit_glyph(character) {
+                draw_quad_corners(self.plane.corners(cell), glyph, [color; 4]);
+            }
+        }
     }
 }
 
@@ -228,23 +347,38 @@ fn pixel_text_metrics(text: &str, size: f32) -> (f32, f32, f32) {
     (small_text_width(text, pixel), SMALL_GLYPH_HEIGHT * pixel, pixel)
 }
 
-fn draw_pixel_text(text: &str, x: f32, baseline_y: f32, size: f32, color: Color) {
-    draw_small_text(text, x, baseline_y, text_pixel(size), color);
+fn draw_pixel_text(hud: &Surface, text: &str, x: f32, baseline_y: f32, size: f32, color: Color) {
+    hud.small_text(text, x, baseline_y, text_pixel(size), color);
 }
 
 /// Labels cut into a metal plate: a dark offset copy under the lit glyphs.
-fn draw_engraved_text(text: &str, x: f32, baseline_y: f32, size: f32, color: Color) {
-    draw_pixel_text(text, x + 1.0, baseline_y + 1.0, size, COLOR_ENGRAVE_SHADOW);
-    draw_pixel_text(text, x, baseline_y, size, color);
+fn draw_engraved_text(
+    hud: &Surface,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    size: f32,
+    color: Color,
+) {
+    draw_pixel_text(hud, text, x + 1.0, baseline_y + 1.0, size, COLOR_ENGRAVE_SHADOW);
+    draw_pixel_text(hud, text, x, baseline_y, size, color);
 }
 
 /// Fill a screen-space rectangle with a tiled material, one texel per pixel,
 /// each tile lit at its corners by the scene lights as if the rectangle were a
 /// plate mounted on the wall at `PANEL_Z`. The last column and row of tiles
 /// are clipped through their UVs rather than stretched.
-fn draw_tiled_rect(rect: Rect, texture: &Texture2D, tile: f32, tint: Color, lights: &SceneLights) {
+fn draw_tiled_rect(
+    surface: &Surface,
+    rect: Rect,
+    material: Material,
+    tile: f32,
+    tint: Color,
+    lights: &SceneLights,
+) {
     let columns = (rect.w / tile).ceil() as usize;
     let rows = (rect.h / tile).ceil() as usize;
+    let lighting = ScreenPlane::new(PANEL_Z, Vec2::ZERO);
 
     for row in 0..rows {
         for column in 0..columns {
@@ -252,24 +386,18 @@ fn draw_tiled_rect(rect: Rect, texture: &Texture2D, tile: f32, tint: Color, ligh
             let y = rect.y + row as f32 * tile;
             let width = tile.min(rect.x + rect.w - x);
             let height = tile.min(rect.y + rect.h - y);
-            let origin = Vec3::new(x, y, 0.0);
             let corners = [
-                origin,
-                origin + Vec3::X * width,
-                origin + Vec3::new(width, height, 0.0),
-                origin + Vec3::Y * height,
+                Vec2::new(x, y),
+                Vec2::new(x + width, y),
+                Vec2::new(x + width, y + height),
+                Vec2::new(x, y + height),
             ];
-            let colors = corners.map(|corner| {
-                lit(tint, lights.at(screen_to_world_on_plane(corner.truncate(), PANEL_Z)))
-            });
+            let colors = corners.map(|corner| lit(tint, lights.at(lighting.resting_world(corner))));
 
-            draw_quad_uv(
-                origin,
-                Vec3::X * width,
-                Vec3::Y * height,
-                Vec2::ZERO,
+            surface.tile(
+                Rect::new(x, y, width, height),
+                material,
                 Vec2::new(width / tile, height / tile),
-                Some(texture),
                 colors,
             );
         }
@@ -278,27 +406,27 @@ fn draw_tiled_rect(rect: Rect, texture: &Texture2D, tile: f32, tint: Color, ligh
 
 /// One-pixel chamfer around `rect`: lit along the top and left, shadowed along
 /// the bottom and right. `recessed` swaps them for an inset opening.
-fn draw_bevel(rect: Rect, light: Color, dark: Color, recessed: bool) {
+fn draw_bevel(surface: &Surface, rect: Rect, light: Color, dark: Color, recessed: bool) {
     let (top_left, bottom_right) = if recessed {
         (dark, light)
     } else {
         (light, dark)
     };
 
-    draw_rectangle(rect.x, rect.y, rect.w, 1.0, top_left);
-    draw_rectangle(rect.x, rect.y, 1.0, rect.h, top_left);
-    draw_rectangle(rect.x, rect.y + rect.h - 1.0, rect.w, 1.0, bottom_right);
-    draw_rectangle(rect.x + rect.w - 1.0, rect.y, 1.0, rect.h, bottom_right);
+    surface.fill(Rect::new(rect.x, rect.y, rect.w, 1.0), top_left);
+    surface.fill(Rect::new(rect.x, rect.y, 1.0, rect.h), top_left);
+    surface.fill(Rect::new(rect.x, rect.y + rect.h - 1.0, rect.w, 1.0), bottom_right);
+    surface.fill(Rect::new(rect.x + rect.w - 1.0, rect.y, 1.0, rect.h), bottom_right);
 }
 
 /// A 3x3 slotted screw head.
-fn draw_screw(center_x: f32, center_y: f32) {
+fn draw_screw(surface: &Surface, center_x: f32, center_y: f32) {
     let x = center_x.round() - 1.0;
     let y = center_y.round() - 1.0;
-    draw_rectangle(x, y, 3.0, 3.0, shaded(COLOR_SCREW, 0.55));
-    draw_rectangle(x, y, 2.0, 2.0, shaded(COLOR_SCREW, 1.05));
-    draw_rectangle(x, y, 1.0, 1.0, shaded(COLOR_SCREW, 1.4));
-    draw_rectangle(x, y + 1.0, 3.0, 1.0, shaded(COLOR_SCREW, 0.35));
+    surface.fill(Rect::new(x, y, 3.0, 3.0), shaded(COLOR_SCREW, 0.55));
+    surface.fill(Rect::new(x, y, 2.0, 2.0), shaded(COLOR_SCREW, 1.05));
+    surface.fill(Rect::new(x, y, 1.0, 1.0), shaded(COLOR_SCREW, 1.4));
+    surface.fill(Rect::new(x, y + 1.0, 3.0, 1.0), shaded(COLOR_SCREW, 0.35));
 }
 
 fn shaded(color: Color, shade: f32) -> Color {
@@ -320,7 +448,7 @@ const PANEL_Z: f32 = 1.0;
 /// A recessed instrument housing in the spirit of mid-90s shooter HUDs: a
 /// riveted gunmetal frame, lit by the room, around a dark inset face. The
 /// frame is neutral; amber is reserved for live state and selection.
-fn draw_instrument_panel(rect: Rect, textures: &SceneTextures, lights: &SceneLights) {
+fn draw_instrument_panel(surface: &Surface, rect: Rect, lights: &SceneLights) {
     let scale = hud_scale();
     let shadow = (6.0 * scale).round().max(1.0);
     let inner = Rect::new(
@@ -330,24 +458,22 @@ fn draw_instrument_panel(rect: Rect, textures: &SceneTextures, lights: &SceneLig
         rect.h - PANEL_FRAME * 2.0,
     );
 
-    draw_rectangle(
-        rect.x + shadow,
-        rect.y + shadow,
-        rect.w,
-        rect.h,
+    surface.fill(
+        Rect::new(rect.x + shadow, rect.y + shadow, rect.w, rect.h),
         color_u8!(3, 3, 2, 200),
     );
     draw_tiled_rect(
+        surface,
         rect,
-        textures.gunmetal(),
+        surface.textures.gunmetal(),
         BLOCK_TEXTURE_SIZE as f32,
         COLOR_PANEL_FRAME,
         lights,
     );
-    draw_bevel(rect, COLOR_PANEL_LIGHT, COLOR_PANEL_DARK, false);
+    draw_bevel(surface, rect, COLOR_PANEL_LIGHT, COLOR_PANEL_DARK, false);
 
-    draw_rectangle(inner.x, inner.y, inner.w, inner.h, COLOR_PANEL);
-    draw_bevel(inner, COLOR_PANEL_INNER_LIGHT, COLOR_PANEL_DARK, true);
+    surface.fill(inner, COLOR_PANEL);
+    draw_bevel(surface, inner, COLOR_PANEL_INNER_LIGHT, COLOR_PANEL_DARK, true);
 
     for (x, y) in [
         (rect.x + 3.0, rect.y + 3.0),
@@ -355,17 +481,13 @@ fn draw_instrument_panel(rect: Rect, textures: &SceneTextures, lights: &SceneLig
         (rect.x + 3.0, rect.y + rect.h - 3.0),
         (rect.x + rect.w - 3.0, rect.y + rect.h - 3.0),
     ] {
-        draw_screw(x, y);
+        draw_screw(surface, x, y);
     }
 }
 
 fn hash01(seed: f32) -> f32 {
     ((seed * 12.9898).sin() * 43_758.547).fract().abs()
 }
-
-/// Depth of the stone wall behind the cabinet, used to place it in the scene's
-/// lighting. It sits a little behind the well's back wall.
-const BACKDROP_WALL_Z: f32 = -1.0;
 
 /// Base tint of the backdrop masonry before lighting. Under ambient alone the
 /// wall is barely there; it is the lamps and the furnace that reveal it.
@@ -374,31 +496,28 @@ const COLOR_STONE: Color = color_u8!(70, 68, 64, 255);
 /// Cut-stone wall behind the cabinet, lit by the same lamps and furnace as the
 /// 3D scene. Each tile's corners sample the scene lights at the world position
 /// beneath that pixel, so the pools on the stone line up with the fixtures that
-/// cast them.
-pub fn draw_background(textures: &SceneTextures, lights: &SceneLights) {
+/// cast them. Drawn on the backdrop surface, whose plane is the wall itself.
+pub fn draw_background(backdrop: &Surface, lights: &SceneLights) {
     let tile = STONE_TEXTURE_SIZE as f32;
     let columns = (frame_width() / tile).ceil() as usize;
     let rows = (frame_height() / tile).ceil() as usize;
 
     for row in 0..rows {
         for column in 0..columns {
-            let top_left = Vec3::new(column as f32 * tile, row as f32 * tile, 0.0);
-            let light_at = |corner: Vec3| {
-                lights.at(screen_to_world_on_plane(corner.truncate(), BACKDROP_WALL_Z))
-            };
+            let top_left = Vec2::new(column as f32 * tile, row as f32 * tile);
             let corners = [
                 top_left,
-                top_left + Vec3::X * tile,
-                top_left + Vec3::new(tile, tile, 0.0),
-                top_left + Vec3::Y * tile,
+                top_left + Vec2::X * tile,
+                top_left + Vec2::new(tile, tile),
+                top_left + Vec2::Y * tile,
             ];
-            let colors = corners.map(|corner| lit(COLOR_STONE, light_at(corner)));
+            let colors =
+                corners.map(|corner| lit(COLOR_STONE, lights.at(backdrop.resting_world(corner))));
 
-            draw_quad(
-                top_left,
-                Vec3::X * tile,
-                Vec3::Y * tile,
-                Some(textures.stone()),
+            backdrop.tile(
+                Rect::new(top_left.x, top_left.y, tile, tile),
+                backdrop.textures.stone(),
+                Vec2::ONE,
                 colors,
             );
         }
@@ -410,14 +529,28 @@ pub fn draw_background(textures: &SceneTextures, lights: &SceneLights) {
 /// Position arguments are in framebuffer pixels, since they normally come
 /// straight out of [`world_to_screen`]. `size` is in logical points and is
 /// scaled by [`hud_scale`] here.
-fn draw_text_centered_at(text: &str, center_x: f32, baseline_y: f32, size: f32, color: Color) {
+fn draw_text_centered_at(
+    hud: &Surface,
+    text: &str,
+    center_x: f32,
+    baseline_y: f32,
+    size: f32,
+    color: Color,
+) {
     let (width, _, _) = pixel_text_metrics(text, size);
-    draw_pixel_text(text, center_x - (width * 0.5), baseline_y, size, color);
+    draw_pixel_text(hud, text, center_x - (width * 0.5), baseline_y, size, color);
 }
 
-fn draw_text_right_at(text: &str, right_x: f32, baseline_y: f32, size: f32, color: Color) {
+fn draw_text_right_at(
+    hud: &Surface,
+    text: &str,
+    right_x: f32,
+    baseline_y: f32,
+    size: f32,
+    color: Color,
+) {
     let (width, _, _) = pixel_text_metrics(text, size);
-    draw_pixel_text(text, right_x - width, baseline_y, size, color);
+    draw_pixel_text(hud, text, right_x - width, baseline_y, size, color);
 }
 
 /// Screen-space rectangle covering the front face of the well opening.
@@ -461,6 +594,8 @@ fn lintel_screen_rect() -> Rect {
     ))
 }
 
+/// Framebuffer rectangles of the HUD panels. Computed once per frame, since
+/// every panel projects the well through the camera to find its place.
 #[derive(Copy, Clone)]
 struct HudLayout {
     hold: Rect,
@@ -509,22 +644,6 @@ fn hud_layout() -> HudLayout {
     }
 }
 
-fn hold_card_rect() -> Rect {
-    hud_layout().hold
-}
-
-fn next_card_rect() -> Rect {
-    hud_layout().next
-}
-
-fn stats_card_rect() -> Rect {
-    hud_layout().stats
-}
-
-fn controls_card_rect() -> Rect {
-    hud_layout().controls
-}
-
 fn preview_content_vertical_bounds(rect: Rect) -> (f32, f32) {
     let scale = hud_scale();
     (
@@ -546,17 +665,17 @@ fn preview_anchor_at_screen_y(reference: Vec3, target_y: f32) -> Vec3 {
     )
 }
 
-fn hold_piece_anchor() -> Vec3 {
-    let (content_top, content_bottom) = preview_content_vertical_bounds(hold_card_rect());
+fn hold_piece_anchor(layout: &HudLayout) -> Vec3 {
+    let (content_top, content_bottom) = preview_content_vertical_bounds(layout.hold);
     preview_anchor_at_screen_y(
         HOLD_PREVIEW_REFERENCE,
         ((content_top + content_bottom) * 0.5).round(),
     )
 }
 
-fn next_piece_anchor(index: usize) -> Vec3 {
+fn next_piece_anchor(layout: &HudLayout, index: usize) -> Vec3 {
     debug_assert!(index < 3);
-    let (content_top, content_bottom) = preview_content_vertical_bounds(next_card_rect());
+    let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
     let slot_height = (content_bottom - content_top) / 3.0;
     let target_y = content_top + slot_height * (index as f32 + 0.5);
     preview_anchor_at_screen_y(NEXT_PREVIEW_REFERENCE, target_y.round())
@@ -564,7 +683,7 @@ fn next_piece_anchor(index: usize) -> Vec3 {
 
 /// Nameplate strip across the top of a panel face, with the label engraved
 /// into it and a rule underneath.
-fn draw_panel_header(rect: Rect, label: &str) {
+fn draw_panel_header(hud: &Surface, rect: Rect, label: &str) {
     let scale = hud_scale();
     let inset = PANEL_FRAME + 1.0;
     let left = rect.x + (16.0 * scale);
@@ -572,56 +691,57 @@ fn draw_panel_header(rect: Rect, label: &str) {
     let baseline = rect.y + (24.0 * scale);
     let divider_y = rect.y + (HUD_HEADER_DIVIDER_OFFSET * scale);
 
-    draw_rectangle(
-        rect.x + inset,
-        rect.y + inset,
-        rect.w - inset * 2.0,
-        divider_y - rect.y - inset,
+    hud.fill(
+        Rect::new(
+            rect.x + inset,
+            rect.y + inset,
+            rect.w - inset * 2.0,
+            divider_y - rect.y - inset,
+        ),
         COLOR_PANEL_HEADER,
     );
-    draw_engraved_text(label, left, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
-    draw_line(left, divider_y, right, divider_y, 1.0, COLOR_PANEL_BORDER);
+    draw_engraved_text(hud, label, left, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
+    hud.hline(left, right, divider_y, COLOR_PANEL_BORDER);
 }
 
-fn draw_next_slot_guides() {
-    let rect = next_card_rect();
+fn draw_next_slot_guides(hud: &Surface, layout: &HudLayout) {
+    let rect = layout.next;
     let (content_top, content_bottom) = preview_content_vertical_bounds(rect);
     let slot_height = (content_bottom - content_top) / 3.0;
     let inset = 16.0 * hud_scale();
 
     for slot in 1..3 {
         let y = (content_top + slot_height * slot as f32).round();
-        draw_line(
+        hud.hline(
             rect.x + inset,
-            y,
             rect.x + rect.w - inset,
             y,
-            1.0,
             color_u8!(69, 65, 54, 120),
         );
     }
 }
 
-fn draw_game_chrome(textures: &SceneTextures, lights: &SceneLights) {
-    draw_instrument_panel(hold_card_rect(), textures, lights);
-    draw_instrument_panel(next_card_rect(), textures, lights);
-    draw_instrument_panel(stats_card_rect(), textures, lights);
-    draw_instrument_panel(controls_card_rect(), textures, lights);
+/// The instrument housings, mounted on the wall behind the cabinet.
+fn draw_game_chrome(backdrop: &Surface, layout: &HudLayout, lights: &SceneLights) {
+    draw_instrument_panel(backdrop, layout.hold, lights);
+    draw_instrument_panel(backdrop, layout.next, lights);
+    draw_instrument_panel(backdrop, layout.stats, lights);
+    draw_instrument_panel(backdrop, layout.controls, lights);
 }
 
 /// Render the empty well on its own, as a backdrop for the main menu screen.
 ///
-/// Leaves the default 2D camera active so the caller can draw menu text
-/// immediately afterwards.
-pub fn draw_backdrop(surface: &RenderSurface) {
-    let time = get_time();
-    let lights = SceneLights::idle(time);
-    draw_background(&surface.textures, &lights);
-    set_camera(&surface.camera_3d(Vec2::ZERO));
-    draw_well(&surface.textures, &lights, time, &[]);
-    draw_embers(time, &lights);
-    draw_lamp_glow(&lights);
-    surface.restore_2d();
+/// Leaves the frame in its scene layer, so the caller starts the HUD layer
+/// for the menu on top.
+pub fn draw_backdrop(frame: &Frame) {
+    let lights = SceneLights::idle(frame.time);
+    let backdrop = frame.backdrop();
+    draw_background(&backdrop, &lights);
+
+    frame.begin_scene();
+    draw_well(frame.textures, &lights, frame.time, &[]);
+    draw_embers(frame.time, &lights, frame.textures);
+    draw_lamp_glow(&lights, frame.textures);
 }
 
 /// Glyph pixel size of the bold readout numerals.
@@ -634,20 +754,20 @@ const READOUT_PADDING: f32 = 4.0;
 /// inside it. `text` is right-aligned so growing numbers extend left, the way
 /// a mechanical counter reads; `ghost` is the counter's full width of unlit
 /// positions, shown faintly behind the live digits.
-fn draw_readout_window(rect: Rect, text: &str, ghost: &str, color: Color) {
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, color_u8!(6, 6, 5, 255));
-    draw_bevel(rect, COLOR_PANEL_INNER_LIGHT, color_u8!(1, 1, 1, 255), true);
+fn draw_readout_window(hud: &Surface, rect: Rect, text: &str, ghost: &str, color: Color) {
+    hud.fill(rect, color_u8!(6, 6, 5, 255));
+    draw_bevel(hud, rect, COLOR_PANEL_INNER_LIGHT, color_u8!(1, 1, 1, 255), true);
 
     let top = rect.y + ((rect.h - DIGIT_HEIGHT as f32 * READOUT_PIXEL) * 0.5).round();
     let right = rect.x + rect.w - READOUT_PADDING;
     let ghost_x = right - digit_text_width(ghost, READOUT_PIXEL);
     let x = right - digit_text_width(text, READOUT_PIXEL);
 
-    draw_digit_text(ghost, ghost_x, top, READOUT_PIXEL, shaded(color, 0.07));
+    hud.digit_text(ghost, ghost_x, top, READOUT_PIXEL, shaded(color, 0.07));
 
     // A dim copy under the lit digits gives them a faint phosphor bloom.
-    draw_digit_text(text, x + 1.0, top + 1.0, READOUT_PIXEL, shaded(color, 0.25));
-    draw_digit_text(text, x, top, READOUT_PIXEL, color);
+    hud.digit_text(text, x + 1.0, top + 1.0, READOUT_PIXEL, shaded(color, 0.25));
+    hud.digit_text(text, x, top, READOUT_PIXEL, color);
 }
 
 /// Height of a readout window tall enough for the bold numerals.
@@ -657,9 +777,9 @@ fn readout_height() -> f32 {
 
 /// Draw the score readout mounted on the lintel above the well: an engraved
 /// label beside a glass window, centred together on the beam.
-fn draw_score(score: usize) {
+fn draw_score(hud: &Surface, layout: &HudLayout, score: usize) {
     let text = score.to_formatted_string(&Locale::en);
-    let rect = hud_layout().score;
+    let rect = layout.score;
     let center_y = rect.y + rect.h * 0.5;
     let (label_width, label_height, _) = pixel_text_metrics("SCORE", 18.0);
     let gap = 8.0;
@@ -671,6 +791,7 @@ fn draw_score(score: usize) {
     let group_x = (rect.x + (rect.w - group_width) * 0.5).round();
 
     draw_engraved_text(
+        hud,
         "SCORE",
         group_x,
         (center_y + label_height * 0.5).round(),
@@ -678,6 +799,7 @@ fn draw_score(score: usize) {
         COLOR_TEXT_MUTED,
     );
     draw_readout_window(
+        hud,
         Rect::new(
             group_x + label_width + gap,
             (center_y - window_height * 0.5).round(),
@@ -691,35 +813,37 @@ fn draw_score(score: usize) {
 }
 
 /// Draw the captions for the hold slot and the next queue.
-///
-/// These live in the 2D pass rather than beside the cubes they label: `draw_text`
-/// emits screen-space geometry, so calling it while the 3D camera is active
-/// would push the glyphs through the perspective matrix and off the frame.
-fn draw_panel_labels() {
-    draw_panel_header(hold_card_rect(), "HOLD");
-    draw_panel_header(next_card_rect(), "NEXT");
-    draw_panel_header(controls_card_rect(), "CONTROLS");
-    draw_panel_header(stats_card_rect(), "STATUS");
-    draw_next_slot_guides();
+fn draw_panel_labels(hud: &Surface, layout: &HudLayout) {
+    draw_panel_header(hud, layout.hold, "HOLD");
+    draw_panel_header(hud, layout.next, "NEXT");
+    draw_panel_header(hud, layout.controls, "CONTROLS");
+    draw_panel_header(hud, layout.stats, "STATUS");
+    draw_next_slot_guides(hud, layout);
 }
 
 /// One indicator lamp in the level-progress bar.
-fn draw_indicator_pip(x: f32, y: f32, size: f32, lit: bool) {
-    draw_rectangle(x, y, size, size, color_u8!(8, 8, 7, 255));
+fn draw_indicator_pip(hud: &Surface, x: f32, y: f32, size: f32, lit: bool) {
+    hud.fill(Rect::new(x, y, size, size), color_u8!(8, 8, 7, 255));
     if lit {
-        draw_rectangle(x + 1.0, y + 1.0, size - 2.0, size - 2.0, COLOR_AMBER);
-        draw_rectangle(x + 1.0, y + 1.0, 1.0, 1.0, COLOR_TEXT);
+        hud.fill(
+            Rect::new(x + 1.0, y + 1.0, size - 2.0, size - 2.0),
+            COLOR_AMBER,
+        );
+        hud.fill(Rect::new(x + 1.0, y + 1.0, 1.0, 1.0), COLOR_TEXT);
     } else {
-        draw_rectangle(x + 1.0, y + 1.0, size - 2.0, size - 2.0, color_u8!(44, 42, 38, 255));
+        hud.fill(
+            Rect::new(x + 1.0, y + 1.0, size - 2.0, size - 2.0),
+            color_u8!(44, 42, 38, 255),
+        );
     }
 }
 
 /// Draw the level and cleared-line counts beneath the next queue, as two bold
 /// readouts over a row of ten indicator lamps counting lines toward the next
 /// level.
-fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
+fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
     let scale = hud_scale();
-    let rect = stats_card_rect();
+    let rect = layout.stats;
     let mid_x = (rect.x + rect.w * 0.5).round();
     let label_baseline = rect.y + (58.0 * scale);
     let window_top = rect.y + (64.0 * scale);
@@ -731,6 +855,7 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
     ] {
         let (label_width, _, _) = pixel_text_metrics(label, STATS_TEXT_SIZE);
         draw_engraved_text(
+            hud,
             label,
             (center_x - label_width * 0.5).round(),
             label_baseline,
@@ -738,6 +863,7 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
             COLOR_TEXT_MUTED,
         );
         draw_readout_window(
+            hud,
             Rect::new(
                 (center_x - window_width * 0.5).round(),
                 window_top,
@@ -750,12 +876,10 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
         );
     }
 
-    draw_line(
+    hud.vline(
         mid_x,
         rect.y + (48.0 * scale),
-        mid_x,
         window_top + readout_height(),
-        1.0,
         color_u8!(72, 68, 57, 180),
     );
 
@@ -767,6 +891,7 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
     let completed = rows_cleared % 10;
     for segment in 0..10 {
         draw_indicator_pip(
+            hud,
             bar_x + segment as f32 * (pip + gap),
             bar_y,
             pip,
@@ -776,13 +901,23 @@ fn draw_level_and_rows_cleared(level: usize, rows_cleared: usize) {
 }
 
 /// A raised keycap: lit along its top and left, shadowed bottom and right.
-fn draw_keycap(label: &str, x: f32, y: f32, width: f32) {
+fn draw_keycap(hud: &Surface, label: &str, x: f32, y: f32, width: f32) {
     let scale = hud_scale();
     let rect = Rect::new(x, y, (width * scale).round(), (22.0 * scale).round());
-    draw_rectangle(rect.x + 1.0, rect.y + 1.0, rect.w, rect.h, color_u8!(4, 4, 3, 255));
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, color_u8!(46, 46, 43, 255));
-    draw_bevel(rect, color_u8!(112, 112, 106, 255), color_u8!(10, 10, 9, 255), false);
+    hud.fill(
+        Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w, rect.h),
+        color_u8!(4, 4, 3, 255),
+    );
+    hud.fill(rect, color_u8!(46, 46, 43, 255));
+    draw_bevel(
+        hud,
+        rect,
+        color_u8!(112, 112, 106, 255),
+        color_u8!(10, 10, 9, 255),
+        false,
+    );
     draw_text_centered_at(
+        hud,
         label,
         rect.x + rect.w * 0.5,
         rect.y + (15.5 * scale),
@@ -791,9 +926,9 @@ fn draw_keycap(label: &str, x: f32, y: f32, width: f32) {
     );
 }
 
-fn draw_controls() {
+fn draw_controls(hud: &Surface, layout: &HudLayout) {
     let scale = hud_scale();
-    let rect = controls_card_rect();
+    let rect = layout.controls;
     let left = rect.x + (16.0 * scale);
     let right = rect.x + rect.w - (16.0 * scale);
 
@@ -806,36 +941,46 @@ fn draw_controls() {
 
     for (index, (key, action, key_width)) in rows.iter().enumerate() {
         let y = rect.y + ((48.0 + index as f32 * 28.0) * scale);
-        draw_keycap(key, left, y, *key_width);
-        draw_text_right_at(action, right, y + (15.5 * scale), 16.0, COLOR_TEXT_MUTED);
+        draw_keycap(hud, key, left, y, *key_width);
+        draw_text_right_at(hud, action, right, y + (15.5 * scale), 16.0, COLOR_TEXT_MUTED);
     }
 }
 
 /// Draw the next-piece queue into the right side panel.
-fn draw_piece_previews(piece_previews: [Piece; 3], textures: &SceneTextures, lights: SceneLights) {
+fn draw_piece_previews(
+    layout: &HudLayout,
+    piece_previews: [Piece; 3],
+    textures: &SceneTextures,
+    lights: SceneLights,
+) {
     for (offset, piece) in piece_previews.iter().enumerate() {
         piece.draw(PiecePreviewArgs {
-            center: next_piece_anchor(offset),
+            center: next_piece_anchor(layout, offset),
             scale: PREVIEW_SCALE,
-            textures: textures.clone(),
+            textures,
             lights,
         });
     }
 }
 
 /// Draw the held piece into the left side panel, if one is held.
-fn draw_held_piece(held_piece: Option<Piece>, textures: &SceneTextures, lights: SceneLights) {
+fn draw_held_piece(
+    layout: &HudLayout,
+    held_piece: Option<Piece>,
+    textures: &SceneTextures,
+    lights: SceneLights,
+) {
     if let Some(piece) = held_piece {
         piece.draw(PiecePreviewArgs {
-            center: hold_piece_anchor(),
+            center: hold_piece_anchor(layout),
             scale: PREVIEW_SCALE,
-            textures: textures.clone(),
+            textures,
             lights,
         });
     }
 }
 
-fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
+fn draw_game_effects(hud: &Surface, layout: &HudLayout, game_state: &GameState<'_>, shake: Vec2) {
     let scale = hud_scale();
     let impact = game_state.get_impact_effect();
 
@@ -865,18 +1010,22 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
             // Each supporting block gets its own flash, constrained to that
             // block's top edge instead of expanding across unrelated cells.
             let burst_width = (4.0 + elapsed * (block_width - 4.0)).floor();
-            draw_rectangle(
-                (origin.x - burst_width * 0.5).floor(),
-                origin.y,
-                burst_width,
-                2.0,
+            hud.fill(
+                Rect::new(
+                    (origin.x - burst_width * 0.5).floor(),
+                    origin.y,
+                    burst_width,
+                    2.0,
+                ),
                 Color::new(COLOR_AMBER.r, COLOR_AMBER.g, COLOR_AMBER.b, alpha),
             );
-            draw_rectangle(
-                (origin.x - burst_width * 0.25).floor(),
-                origin.y - 2.0,
-                (burst_width * 0.5).max(1.0),
-                1.0,
+            hud.fill(
+                Rect::new(
+                    (origin.x - burst_width * 0.25).floor(),
+                    origin.y - 2.0,
+                    (burst_width * 0.5).max(1.0),
+                    1.0,
+                ),
                 Color::new(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, alpha),
             );
 
@@ -904,11 +1053,8 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
                     2 => color_u8!(105, 91, 65, 255),
                     _ => impact_color,
                 };
-                draw_rectangle(
-                    x,
-                    y,
-                    size,
-                    size,
+                hud.fill(
+                    Rect::new(x, y, size, size),
                     Color::new(color.r, color.g, color.b, alpha),
                 );
             }
@@ -917,8 +1063,9 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
 
     // The pause hint sits under the controls panel, clear of the pit below
     // the well.
-    let controls = controls_card_rect();
+    let controls = layout.controls;
     draw_text_centered_at(
+        hud,
         "ESC  PAUSE",
         controls.x + controls.w * 0.5,
         controls.y + controls.h + (22.0 * scale),
@@ -927,100 +1074,112 @@ fn draw_game_effects(game_state: &GameState<'_>, shake: Vec2) {
     );
 }
 
-pub trait Drawable {
-    type Args;
+/// Camera shake for the frame: an impact pulse when a piece locks, and a
+/// heavier rumble while rows are clearing.
+pub fn camera_shake(game_state: &GameState<'_>, time: f64) -> Vec2 {
+    let impact_shake = game_state.get_impact_effect().powi(2) * 0.08;
+    let (clear_count, clear_remaining) = game_state.get_clear_effect();
+    let clear_shake = if clear_remaining > 0.0 {
+        clear_remaining.powi(2) * 0.05 * (clear_count as f32)
+    } else {
+        0.0
+    };
+    let shake_amount = (impact_shake + clear_shake).min(0.25);
 
-    fn draw(&self, args: Self::Args);
+    vec2(
+        (time as f32 * 91.0).sin() * shake_amount,
+        (time as f32 * 73.0).cos() * shake_amount,
+    )
 }
 
-impl<'a> Drawable for GameState<'a> {
-    type Args = RenderSurface;
+pub trait Drawable<Args> {
+    fn draw(&self, args: Args);
+}
 
-    /// Render a frame in two passes: the 3D scene with depth testing on, then
-    /// the flat HUD on top of it.
+impl Drawable<&Frame<'_>> for GameState<'_> {
+    /// Render a frame in its three layers: the wall and instrument housings
+    /// behind everything, the depth-tested 3D scene, and the flat HUD on top.
     ///
-    /// The order matters. `set_default_camera` disables depth testing, so the
-    /// HUD can only be drawn after every 3D element has been submitted; drawing
-    /// text first would leave it to be overwritten by the well.
-    fn draw(&self, args: RenderSurface) {
-        let time = get_time();
+    /// The order matters. The outer layers are painted without depth testing,
+    /// so the scene can only cover the backdrop if the backdrop comes first,
+    /// and the HUD can only sit over the scene if it comes last.
+    fn draw(&self, frame: &Frame<'_>) {
+        let time = frame.time;
+        let textures = frame.textures;
         let is_game_over = self.get_is_game_over();
         let lights = SceneLights::new(time, self.get_danger(), self.get_level_flare());
-        draw_background(&args.textures, &lights);
-        draw_game_chrome(&args.textures, &lights);
+        let layout = hud_layout();
 
-        let impact_shake = self.get_impact_effect().powi(2) * 0.08;
-        let (clear_count, clear_remaining) = self.get_clear_effect();
-        let clear_shake = if clear_remaining > 0.0 {
-            clear_remaining.powi(2) * 0.05 * (clear_count as f32)
-        } else {
-            0.0
-        };
-        let shake_amount = (impact_shake + clear_shake).min(0.25);
-        let shake = vec2(
-            (time as f32 * 91.0).sin() * shake_amount,
-            (time as f32 * 73.0).cos() * shake_amount,
-        );
-        set_camera(&args.camera_3d(shake));
+        let backdrop = frame.backdrop();
+        draw_background(&backdrop, &lights);
+        draw_game_chrome(&backdrop, &layout, &lights);
 
         // Opaque scene first, effects that live behind the stack next, then
         // the stack, and finally everything translucent that sits in front.
-        draw_well(&args.textures, &lights, time, self.get_lava_splashes());
-        draw_embers(time, &lights);
+        frame.begin_scene();
+        draw_well(textures, &lights, time, self.get_lava_splashes());
+        draw_embers(time, &lights, textures);
         if let Some((trail, strength)) = self.get_hard_drop_trail() {
-            draw_hard_drop_trail(&trail, strength);
+            draw_hard_drop_trail(&trail, strength, textures);
         }
 
         let wash = if is_game_over { GAME_OVER_WASH } else { 0.0 };
         self.get_grid_locked().draw(GridDrawArgs {
             style: BlockStyle::Solid,
-            textures: args.textures.clone(),
+            textures,
             lights,
+            time,
             wash,
         });
         self.get_grid_active().draw(GridDrawArgs {
             style: BlockStyle::Solid,
-            textures: args.textures.clone(),
+            textures,
             lights,
+            time,
             wash,
         });
         if !is_game_over {
             self.get_grid_ghost().draw(GridDrawArgs {
                 style: BlockStyle::Ghost,
-                textures: args.textures.clone(),
+                textures,
                 lights,
+                time,
                 wash: 0.0,
             });
         }
-        draw_piece_previews(self.get_piece_previews(), &args.textures, lights);
-        draw_held_piece(self.get_held_piece(), &args.textures, lights);
-        draw_shrapnel(self.get_shrapnel(), &args.textures);
-        draw_clear_flash(self.get_clear_row_mask(), clear_remaining, clear_count);
-        draw_lamp_glow(&lights);
+        draw_piece_previews(&layout, self.get_piece_previews(), textures, lights);
+        draw_held_piece(&layout, self.get_held_piece(), textures, lights);
+        draw_shrapnel(self.get_shrapnel(), textures);
+        let (clear_count, clear_remaining) = self.get_clear_effect();
+        draw_clear_flash(
+            self.get_clear_row_mask(),
+            clear_remaining,
+            clear_count,
+            textures,
+        );
+        draw_lamp_glow(&lights, textures);
 
-        args.restore_2d();
-
-        draw_score(self.get_score());
-        draw_panel_labels();
-        draw_level_and_rows_cleared(self.get_level(), self.get_rows_cleared());
-        draw_controls();
-        draw_game_effects(self, shake);
+        let hud = frame.hud();
+        draw_score(&hud, &layout, self.get_score());
+        draw_panel_labels(&hud, &layout);
+        draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
+        draw_controls(&hud, &layout);
+        draw_game_effects(&hud, &layout, self, frame.shake);
     }
 }
 
-pub struct GridDrawArgs {
+pub struct GridDrawArgs<'a> {
     style: BlockStyle,
-    textures: SceneTextures,
+    textures: &'a SceneTextures,
     lights: SceneLights,
+    time: f64,
     /// How far block colours are washed toward dead grey (0.0 = none). Used
     /// to drain the stack of life once the game is over.
     wash: f32,
 }
 
-impl Drawable for Grid {
-    type Args = GridDrawArgs;
-
-    fn draw(&self, args: GridDrawArgs) {
+impl Drawable<GridDrawArgs<'_>> for Grid {
+    fn draw(&self, args: GridDrawArgs<'_>) {
         for row_id in FIRST_VISIBLE_ROW_ID..GRID_COUNT_ROWS {
             for col_id in 0..GRID_COUNT_COLS {
                 let Some(block) = self.get_cell(row_id, col_id) else {
@@ -1031,7 +1190,7 @@ impl Drawable for Grid {
                 match args.style {
                     BlockStyle::Solid => block.draw(BlockArgs {
                         center,
-                        textures: args.textures.clone(),
+                        textures: args.textures,
                         lights: args.lights,
                         wash: args.wash,
                     }),
@@ -1052,7 +1211,7 @@ impl Drawable for Grid {
                             !occupied(row, col - 1),
                         ];
 
-                        draw_ghost_cell(center, block.color, exterior);
+                        draw_ghost_cell(center, block.color, exterior, args.time, args.textures);
                     }
                 }
             }
@@ -1064,19 +1223,17 @@ impl Drawable for Grid {
 ///
 /// Previews always show the piece in its spawn orientation, so no orientation is
 /// carried here.
-pub struct PiecePreviewArgs {
+pub struct PiecePreviewArgs<'a> {
     /// World-space point that the piece's bounding box is centred on.
     center: Vec3,
     /// Edge length of one block cube, in world units.
     scale: f32,
-    textures: SceneTextures,
+    textures: &'a SceneTextures,
     lights: SceneLights,
 }
 
-impl Drawable for Piece {
-    type Args = PiecePreviewArgs;
-
-    fn draw(&self, args: PiecePreviewArgs) {
+impl Drawable<PiecePreviewArgs<'_>> for Piece {
+    fn draw(&self, args: PiecePreviewArgs<'_>) {
         let PiecePreviewArgs {
             center,
             scale,
@@ -1103,7 +1260,7 @@ impl Drawable for Piece {
                         center.z,
                     );
 
-                    draw_block_cube_scaled(position, block.color, scale, &textures, &lights);
+                    draw_block_cube_scaled(position, block.color, scale, textures, &lights);
                 }
             }
         }
@@ -1111,9 +1268,9 @@ impl Drawable for Piece {
 }
 
 /// Placement and appearance of a single solid block inside the well.
-pub struct BlockArgs {
+pub struct BlockArgs<'a> {
     center: Vec3,
-    textures: SceneTextures,
+    textures: &'a SceneTextures,
     lights: SceneLights,
     wash: f32,
 }
@@ -1121,10 +1278,8 @@ pub struct BlockArgs {
 /// Dead, unlit steel that game-over blocks fade toward.
 const COLOR_DEAD_BLOCK: Color = color_u8!(92, 90, 86, 255);
 
-impl Drawable for Block {
-    type Args = BlockArgs;
-
-    fn draw(&self, args: BlockArgs) {
+impl Drawable<BlockArgs<'_>> for Block {
+    fn draw(&self, args: BlockArgs<'_>) {
         let BlockArgs {
             center,
             textures,
@@ -1133,50 +1288,44 @@ impl Drawable for Block {
         } = args;
         let color = mix_color(self.color, COLOR_DEAD_BLOCK, wash);
 
-        draw_block_cube(center, color, &textures, &lights);
+        draw_block_cube(center, color, textures, &lights);
     }
 }
 
 /// Edge length of the tumbling cube used as the menu cursor, in world units.
 const MENU_CURSOR_SIZE: f32 = 0.55;
 
-/// Depth of the menu cursor cube: ahead of every opaque element in the scene,
-/// so it always passes the depth test left behind by the 3D pass.
+/// Depth of the menu cursor cube. The HUD layer is not depth tested, so this
+/// only has to lie inside the camera's clip range, ahead of the cabinet.
 const MENU_CURSOR_Z: f32 = 1.7;
 
 /// Draw a slowly tumbling block cube at a framebuffer position, on top of the
-/// 2D menu. Switches to the 3D camera and back, so callers must be in the 2D
-/// pass when they call it.
-fn draw_menu_cursor(surface: &RenderSurface, screen_center: Vec2) {
-    let time = get_time() as f32;
-    let center = screen_to_world_on_plane(screen_center, MENU_CURSOR_Z);
+/// menu. Drawn in the HUD layer, where depth testing is off; a convex cube
+/// shows only its camera-facing faces, which never overlap, so it needs none.
+fn draw_menu_cursor(frame: &Frame, screen_center: Vec2) {
+    let time = frame.time as f32;
+    let center = frame.point_at(screen_center, MENU_CURSOR_Z);
     let rotation = Vec3::new(time * 0.9, time * 1.4, 0.35);
 
-    set_camera(&surface.camera_3d(Vec2::ZERO));
-    draw_tumbling_cube(center, rotation, MENU_CURSOR_SIZE, COLOR_AMBER, &surface.textures);
-    surface.restore_2d();
+    draw_tumbling_cube(center, rotation, MENU_CURSOR_SIZE, COLOR_AMBER, frame.textures);
 }
 
-impl<'a> Drawable for Menu<'a> {
-    type Args = RenderSurface;
-
-    fn draw(&self, surface: RenderSurface) {
+impl Drawable<&Frame<'_>> for Menu<'_> {
+    fn draw(&self, frame: &Frame<'_>) {
         if !self.is_visible {
             return;
         }
 
+        let hud = frame.hud();
         let scale = hud_scale();
         let well = well_screen_rect();
-        let lights = SceneLights::idle(get_time());
+        let lights = SceneLights::idle(frame.time);
         let item_height = MENU_ITEM_HEIGHT * scale;
         let is_main = self.title.eq_ignore_ascii_case("bloxide");
         let title = self.title.to_ascii_uppercase();
 
-        draw_rectangle(
-            0.0,
-            0.0,
-            frame_width(),
-            frame_height(),
+        hud.fill(
+            Rect::new(0.0, 0.0, frame_width(), frame_height()),
             color_u8!(6, 5, 4, if is_main { 96 } else { 180 }),
         );
 
@@ -1195,7 +1344,7 @@ impl<'a> Drawable for Menu<'a> {
         let panel_height = panel.h;
         let center_x = panel_x + (panel_width / 2.0);
 
-        draw_instrument_panel(panel, &surface.textures, &lights);
+        draw_instrument_panel(&hud, panel, &lights);
 
         let title_baseline = panel_y + ((MENU_PADDING_Y + MENU_TITLE_TEXT_SIZE) * scale);
         let title_size = if is_main { MENU_TITLE_TEXT_SIZE } else { 34.0 };
@@ -1203,6 +1352,7 @@ impl<'a> Drawable for Menu<'a> {
         // Embossed: a deep shadow down-right and a one-pixel lit rim up-left,
         // so the title reads as letters cast into the plate.
         draw_text_centered_at(
+            &hud,
             &title,
             center_x + (3.0 * scale),
             title_baseline + (3.0 * scale),
@@ -1210,20 +1360,19 @@ impl<'a> Drawable for Menu<'a> {
             color_u8!(3, 3, 2, 220),
         );
         draw_text_centered_at(
+            &hud,
             &title,
             center_x - 1.0,
             title_baseline - 1.0,
             title_size,
             color_u8!(255, 250, 232, 255),
         );
-        draw_text_centered_at(&title, center_x, title_baseline, title_size, COLOR_TEXT);
+        draw_text_centered_at(&hud, &title, center_x, title_baseline, title_size, COLOR_TEXT);
         let section_y = (title_baseline + (18.0 * scale)).round();
-        draw_line(
+        hud.hline(
             panel_x + (24.0 * scale),
-            section_y,
             panel_x + panel_width - (24.0 * scale),
             section_y,
-            1.0,
             COLOR_PANEL_BORDER,
         );
 
@@ -1245,6 +1394,7 @@ impl<'a> Drawable for Menu<'a> {
             }
 
             draw_pixel_text(
+                &hud,
                 item.label,
                 row.x + (30.0 * scale),
                 baseline,
@@ -1254,6 +1404,7 @@ impl<'a> Drawable for Menu<'a> {
         }
 
         draw_text_centered_at(
+            &hud,
             "UP/DOWN MOVE  ENTER SELECT",
             center_x,
             panel_y + panel_height - (16.0 * scale),
@@ -1262,22 +1413,22 @@ impl<'a> Drawable for Menu<'a> {
         );
 
         if let Some(center) = cursor_center {
-            draw_menu_cursor(&surface, center);
+            draw_menu_cursor(frame, center);
         }
     }
 }
 
-impl Drawable for HighScoreManager {
-    type Args = RenderSurface;
-
-    fn draw(&self, surface: RenderSurface) {
+impl Drawable<&Frame<'_>> for HighScoreManager {
+    fn draw(&self, frame: &Frame<'_>) {
+        let hud = frame.hud();
         let label = "PERSONAL BEST";
         let score = self.get_high_score().to_formatted_string(&Locale::en);
-        let lights = SceneLights::idle(get_time());
+        let lights = SceneLights::idle(frame.time);
         let rect = snap_rect(Rect::new(frame_width() - 112.0, 8.0, 102.0, 34.0));
-        draw_instrument_panel(rect, &surface.textures, &lights);
-        draw_engraved_text(label, rect.x + 8.0, rect.y + 14.0, 16.0, COLOR_TEXT_MUTED);
+        draw_instrument_panel(&hud, rect, &lights);
+        draw_engraved_text(&hud, label, rect.x + 8.0, rect.y + 14.0, 16.0, COLOR_TEXT_MUTED);
         draw_text_right_at(
+            &hud,
             &score,
             rect.x + rect.w - 8.0,
             rect.y + 28.0,
@@ -1359,8 +1510,9 @@ mod tests {
 
     #[test]
     fn hold_preview_is_vertically_centered_below_its_header() {
-        let (content_top, content_bottom) = preview_content_vertical_bounds(hold_card_rect());
-        let anchor_y = world_to_screen(hold_piece_anchor()).y;
+        let layout = hud_layout();
+        let (content_top, content_bottom) = preview_content_vertical_bounds(layout.hold);
+        let anchor_y = world_to_screen(hold_piece_anchor(&layout)).y;
         let expected_center = (content_top + content_bottom) * 0.5;
 
         assert!((anchor_y - expected_center).abs() <= 0.5);
@@ -1377,13 +1529,14 @@ mod tests {
             pieces::T,
             pieces::Z,
         ];
-        let (content_top, content_bottom) = preview_content_vertical_bounds(next_card_rect());
+        let layout = hud_layout();
+        let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
         let slot_height = (content_bottom - content_top) / 3.0;
         let minimum_slot_padding = 2.0;
         let anchors = [
-            next_piece_anchor(0),
-            next_piece_anchor(1),
-            next_piece_anchor(2),
+            next_piece_anchor(&layout, 0),
+            next_piece_anchor(&layout, 1),
+            next_piece_anchor(&layout, 2),
         ];
         let first_gap = world_to_screen(anchors[1]).y - world_to_screen(anchors[0]).y;
         let second_gap = world_to_screen(anchors[2]).y - world_to_screen(anchors[1]).y;
@@ -1407,5 +1560,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn camera_shake_is_still_for_a_settled_board() {
+        let high_scores = HighScoreManager::new();
+        let game_state = GameState::new(&high_scores);
+
+        assert_eq!(camera_shake(&game_state, 1.234), Vec2::ZERO);
     }
 }

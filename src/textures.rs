@@ -7,14 +7,167 @@
 //! native size the bevels, rivets and vent slots stay crisp and read as
 //! deliberate pixel art. All materials are neutral grey so they can be tinted
 //! by the piece palette and scene lighting at draw time.
+//!
+//! Everything is packed into one atlas texture: the materials, a plain white
+//! swatch for untextured geometry, and the glyphs of both bitmap fonts.
+//! macroquad starts a new GPU batch whenever the texture changes, so with a
+//! single texture a whole frame can go to the GPU in a handful of batches
+//! instead of one per block.
 
 use macroquad::prelude::*;
+
+use crate::pixel_font::{
+    digit_glyph, small_glyph, DIGIT_GLYPH_CHARS, DIGIT_HEIGHT, SMALL_GLYPH_CHARS,
+    SMALL_GLYPH_HEIGHT, SMALL_GLYPH_WIDTH,
+};
 
 /// Edge length of a block face material, in texels.
 pub const BLOCK_TEXTURE_SIZE: usize = 16;
 
 /// Edge length of the seamless stone tile used behind the cabinet.
 pub const STONE_TEXTURE_SIZE: usize = 32;
+
+/// Edge length of the atlas, in texels. Plenty for the four materials, the
+/// white swatch and about sixty small glyphs.
+const ATLAS_SIZE: usize = 128;
+
+/// Empty texels between packed regions. Nearest sampling inside a region never
+/// reaches its edge, but the gutter keeps rounding at the very edge from ever
+/// picking up a neighbour.
+const ATLAS_GUTTER: usize = 1;
+
+/// Edge length of the white swatch. Untextured quads sample its centre, so a
+/// few texels is more than enough.
+const WHITE_SWATCH_SIZE: usize = 4;
+
+/// A region of the atlas, in texture coordinates.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct UvRect {
+    min: Vec2,
+    max: Vec2,
+}
+
+impl UvRect {
+    /// Map a point in the region's own 0-1 space into the atlas.
+    fn at(&self, local: Vec2) -> Vec2 {
+        self.min + (self.max - self.min) * local
+    }
+}
+
+/// A drawable material: a region of the atlas together with the texture it
+/// lives in, so a draw call can bind the texture and map its own 0-1 texture
+/// coordinates into the region.
+#[derive(Copy, Clone, Debug)]
+pub struct Material<'a> {
+    texture: &'a Texture2D,
+    region: UvRect,
+}
+
+impl<'a> Material<'a> {
+    pub fn texture(&self) -> &'a Texture2D {
+        self.texture
+    }
+
+    /// Map a point in the material's own 0-1 texture space into the atlas.
+    pub fn uv(&self, local: Vec2) -> Vec2 {
+        self.region.at(local)
+    }
+}
+
+/// Packs regions into the atlas in shelves: left to right, then a new shelf
+/// below the tallest region of the last one.
+struct AtlasBuilder {
+    texels: Vec<[u8; 4]>,
+    cursor_x: usize,
+    cursor_y: usize,
+    shelf_height: usize,
+}
+
+impl AtlasBuilder {
+    fn new() -> Self {
+        Self {
+            texels: vec![[0; 4]; ATLAS_SIZE * ATLAS_SIZE],
+            cursor_x: 0,
+            cursor_y: 0,
+            shelf_height: 0,
+        }
+    }
+
+    /// Reserve a `width` x `height` region, returning its top-left texel.
+    fn reserve(&mut self, width: usize, height: usize) -> (usize, usize) {
+        assert!(width <= ATLAS_SIZE && height <= ATLAS_SIZE);
+
+        if self.cursor_x + width > ATLAS_SIZE {
+            self.cursor_y += self.shelf_height + ATLAS_GUTTER;
+            self.cursor_x = 0;
+            self.shelf_height = 0;
+        }
+        assert!(
+            self.cursor_y + height <= ATLAS_SIZE,
+            "material atlas is full"
+        );
+
+        let origin = (self.cursor_x, self.cursor_y);
+        self.cursor_x += width + ATLAS_GUTTER;
+        self.shelf_height = self.shelf_height.max(height);
+
+        origin
+    }
+
+    /// Pack a region whose texels are given by `texel(x, y)`.
+    fn add(
+        &mut self,
+        width: usize,
+        height: usize,
+        texel: impl Fn(usize, usize) -> [u8; 4],
+    ) -> UvRect {
+        let (x0, y0) = self.reserve(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                self.texels[(y0 + y) * ATLAS_SIZE + x0 + x] = texel(x, y);
+            }
+        }
+
+        let scale = 1.0 / ATLAS_SIZE as f32;
+        UvRect {
+            min: Vec2::new(x0 as f32, y0 as f32) * scale,
+            max: Vec2::new((x0 + width) as f32, (y0 + height) as f32) * scale,
+        }
+    }
+
+    /// Pack a greyscale canvas as an opaque material.
+    fn add_canvas(&mut self, canvas: &Canvas) -> UvRect {
+        self.add(canvas.size, canvas.size, |x, y| {
+            let grey = (canvas.get(x, y) * 255.0).round() as u8;
+            [grey, grey, grey, 255]
+        })
+    }
+
+    /// Pack a one-bit glyph: white where `set`, transparent elsewhere, so the
+    /// vertex colour alone decides what the glyph looks like on screen.
+    fn add_bitmap(
+        &mut self,
+        width: usize,
+        height: usize,
+        set: impl Fn(usize, usize) -> bool,
+    ) -> UvRect {
+        self.add(width, height, |x, y| {
+            if set(x, y) {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 0]
+            }
+        })
+    }
+
+    fn into_texture(self) -> Texture2D {
+        let bytes: Vec<u8> = self.texels.iter().flatten().copied().collect();
+        let texture = Texture2D::from_rgba8(ATLAS_SIZE as u16, ATLAS_SIZE as u16, &bytes);
+        texture.set_filter(FilterMode::Nearest);
+        texture
+    }
+}
 
 /// Brightness of a material's flat, undamaged surface. Chosen so a front face
 /// tinted at [`crate::render3d`]'s front shade lands close to the palette colour
@@ -180,18 +333,6 @@ impl Canvas {
         self.set(x + 1, y + 1, 0.36);
     }
 
-    pub fn into_texture(self) -> Texture2D {
-        let mut bytes = Vec::with_capacity(self.size * self.size * 4);
-        for value in &self.value {
-            let grey = (value * 255.0).round() as u8;
-            bytes.extend_from_slice(&[grey, grey, grey, 255]);
-        }
-
-        let texture = Texture2D::from_rgba8(self.size as u16, self.size as u16, &bytes);
-        texture.set_filter(FilterMode::Nearest);
-        texture
-    }
-
     /// Mean brightness, used to keep the materials' overall tint consistent
     /// with one another.
     #[cfg(test)]
@@ -316,46 +457,114 @@ pub fn stone_blocks() -> Canvas {
     canvas
 }
 
-/// Every material the renderer needs, generated once at startup.
-#[derive(Clone)]
+/// Glyph regions indexed by ASCII code.
+type GlyphRegions = [Option<UvRect>; 128];
+
+fn glyph_index(character: char) -> Option<usize> {
+    let index = character as usize;
+    (index < 128).then_some(index)
+}
+
+/// Every material the renderer needs, generated once at startup into a single
+/// atlas texture.
 pub struct SceneTextures {
-    armor: Texture2D,
-    vent: Texture2D,
-    gunmetal: Texture2D,
-    stone: Texture2D,
+    atlas: Texture2D,
+    armor: UvRect,
+    vent: UvRect,
+    gunmetal: UvRect,
+    stone: UvRect,
+    white: UvRect,
+    small_glyphs: GlyphRegions,
+    digit_glyphs: GlyphRegions,
 }
 
 impl SceneTextures {
     pub fn new() -> Self {
+        let mut builder = AtlasBuilder::new();
+        let stone = builder.add_canvas(&stone_blocks());
+        let armor = builder.add_canvas(&armor_plate());
+        let vent = builder.add_canvas(&vent_panel());
+        let gunmetal = builder.add_canvas(&gunmetal());
+        let white = builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true);
+
+        let mut small_glyphs: GlyphRegions = [None; 128];
+        for character in SMALL_GLYPH_CHARS.chars() {
+            let rows = small_glyph(character);
+            let region = builder.add_bitmap(
+                SMALL_GLYPH_WIDTH as usize,
+                SMALL_GLYPH_HEIGHT as usize,
+                |x, y| rows[y] & (1 << (SMALL_GLYPH_WIDTH as usize - 1 - x)) != 0,
+            );
+            small_glyphs[glyph_index(character).expect("small glyphs are ASCII")] = Some(region);
+        }
+
+        let mut digit_glyphs: GlyphRegions = [None; 128];
+        for character in DIGIT_GLYPH_CHARS.chars() {
+            let rows = digit_glyph(character).expect("every digit glyph character has a glyph");
+            let region = builder.add_bitmap(rows[0].len(), DIGIT_HEIGHT, |x, y| {
+                rows[y].as_bytes()[x] == b'#'
+            });
+            digit_glyphs[glyph_index(character).expect("digit glyphs are ASCII")] = Some(region);
+        }
+
         Self {
-            armor: armor_plate().into_texture(),
-            vent: vent_panel().into_texture(),
-            gunmetal: gunmetal().into_texture(),
-            stone: stone_blocks().into_texture(),
+            atlas: builder.into_texture(),
+            armor,
+            vent,
+            gunmetal,
+            stone,
+            white,
+            small_glyphs,
+            digit_glyphs,
+        }
+    }
+
+    fn material(&self, region: UvRect) -> Material<'_> {
+        Material {
+            texture: &self.atlas,
+            region,
         }
     }
 
     /// Choose a stable block material from the piece colour. Position-based
     /// variation would make an active piece visibly swap textures as it moves.
-    pub fn for_color(&self, color: Color) -> &Texture2D {
+    pub fn for_color(&self, color: Color) -> Material<'_> {
         let r = (color.r * 255.0).round() as u32;
         let g = (color.g * 255.0).round() as u32;
         let b = (color.b * 255.0).round() as u32;
         let signature = r * 3 + g * 5 + b * 7;
 
         if signature % 5 >= 3 {
-            &self.vent
+            self.material(self.vent)
         } else {
-            &self.armor
+            self.material(self.armor)
         }
     }
 
-    pub fn gunmetal(&self) -> &Texture2D {
-        &self.gunmetal
+    pub fn gunmetal(&self) -> Material<'_> {
+        self.material(self.gunmetal)
     }
 
-    pub fn stone(&self) -> &Texture2D {
-        &self.stone
+    pub fn stone(&self) -> Material<'_> {
+        self.material(self.stone)
+    }
+
+    /// Plain white, for geometry that is coloured by its vertices alone.
+    pub fn white(&self) -> Material<'_> {
+        self.material(self.white)
+    }
+
+    /// The 5x7 glyph for `character`, if the face has one. Lookups are
+    /// case-insensitive, like the face itself.
+    pub fn small_glyph(&self, character: char) -> Option<Material<'_>> {
+        let index = glyph_index(character.to_ascii_uppercase())?;
+        self.small_glyphs[index].map(|region| self.material(region))
+    }
+
+    /// The bold numeral glyph for `character`, if the face has one.
+    pub fn digit_glyph(&self, character: char) -> Option<Material<'_>> {
+        let index = glyph_index(character)?;
+        self.digit_glyphs[index].map(|region| self.material(region))
     }
 }
 
@@ -392,5 +601,83 @@ mod tests {
         let face = stone.get(5, STONE_TEXTURE_SIZE / 4);
 
         assert!(mortar < face - 0.2);
+    }
+
+    /// Texel bounds of a packed region.
+    fn texel_bounds(region: UvRect) -> (usize, usize, usize, usize) {
+        let scale = ATLAS_SIZE as f32;
+        (
+            (region.min.x * scale).round() as usize,
+            (region.min.y * scale).round() as usize,
+            (region.max.x * scale).round() as usize,
+            (region.max.y * scale).round() as usize,
+        )
+    }
+
+    #[test]
+    fn atlas_packs_every_region_inside_the_texture_without_overlap() {
+        let mut builder = AtlasBuilder::new();
+        let mut regions = vec![
+            builder.add_canvas(&stone_blocks()),
+            builder.add_canvas(&armor_plate()),
+            builder.add_canvas(&vent_panel()),
+            builder.add_canvas(&gunmetal()),
+            builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true),
+        ];
+        for _ in SMALL_GLYPH_CHARS.chars() {
+            regions.push(builder.add_bitmap(5, 7, |_, _| true));
+        }
+        for character in DIGIT_GLYPH_CHARS.chars() {
+            let width = digit_glyph(character).unwrap()[0].len();
+            regions.push(builder.add_bitmap(width, DIGIT_HEIGHT, |_, _| true));
+        }
+
+        let mut covered = vec![false; ATLAS_SIZE * ATLAS_SIZE];
+        for region in regions {
+            let (x0, y0, x1, y1) = texel_bounds(region);
+            assert!(x1 <= ATLAS_SIZE && y1 <= ATLAS_SIZE, "{region:?} escapes the atlas");
+
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    assert!(!covered[y * ATLAS_SIZE + x], "{region:?} overlaps another");
+                    covered[y * ATLAS_SIZE + x] = true;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_canvas_keeps_its_texel_size_and_values() {
+        let canvas = armor_plate();
+        let mut builder = AtlasBuilder::new();
+        let region = builder.add_canvas(&canvas);
+        let (x0, y0, x1, y1) = texel_bounds(region);
+
+        assert_eq!((x1 - x0, y1 - y0), (BLOCK_TEXTURE_SIZE, BLOCK_TEXTURE_SIZE));
+        let texel = builder.texels[(y0 + 3) * ATLAS_SIZE + x0 + 3];
+        assert_eq!(texel[0], (canvas.get(3, 3) * 255.0).round() as u8);
+        assert_eq!(texel[3], 255);
+    }
+
+    #[test]
+    fn packed_bitmap_is_white_where_set_and_transparent_elsewhere() {
+        let mut builder = AtlasBuilder::new();
+        let region = builder.add_bitmap(2, 1, |x, _| x == 0);
+        let (x0, y0, _, _) = texel_bounds(region);
+
+        assert_eq!(builder.texels[y0 * ATLAS_SIZE + x0], [255, 255, 255, 255]);
+        assert_eq!(builder.texels[y0 * ATLAS_SIZE + x0 + 1], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn region_maps_local_texture_coordinates_into_the_atlas() {
+        let region = UvRect {
+            min: Vec2::new(0.25, 0.5),
+            max: Vec2::new(0.5, 1.0),
+        };
+
+        assert_eq!(region.at(Vec2::ZERO), Vec2::new(0.25, 0.5));
+        assert_eq!(region.at(Vec2::ONE), Vec2::new(0.5, 1.0));
+        assert_eq!(region.at(Vec2::new(0.5, 0.5)), Vec2::new(0.375, 0.75));
     }
 }

@@ -12,28 +12,40 @@ mod piece;
 mod pixel_font;
 mod postfx;
 mod render3d;
+mod telemetry;
 mod textures;
 
-use draw::{draw_backdrop, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
+use draw::{camera_shake, draw_backdrop, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
 use game_state::{GameInput, GameState};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
 use menu::{Menu, MenuInput, MenuItem};
+use render3d::{FRAME_INDEX_CAPACITY, FRAME_VERTEX_CAPACITY};
+use telemetry::{Phase, Telemetry};
 
-fn window_conf() -> Conf {
-    // Screenshot runs are launched repeatedly from a shell; keep their window
-    // from appearing and stealing focus. This has to happen here, before the
-    // macroquad wrapper around `main` creates the window.
-    if screenshot_scene_from_args().is_some() {
+fn window_conf() -> macroquad::conf::Conf {
+    // Harness runs are launched repeatedly from a shell; keep their window
+    // from appearing and stealing focus unless `--visible` asks for it. This
+    // has to happen here, before the macroquad wrapper around `main` creates
+    // the window.
+    let wants_window = std::env::args().any(|arg| arg == "--visible");
+    if harness_scene_from_args().is_some() && !wants_window {
         headless::install();
     }
 
-    Conf {
-        window_title: String::from("BLOXIDE // Software Carnage"),
-        high_dpi: true,
-        window_resizable: false,
-        window_height: WINDOW_HEIGHT as i32,
-        window_width: WINDOW_WIDTH as i32,
+    macroquad::conf::Conf {
+        miniquad_conf: Conf {
+            window_title: String::from("BLOXIDE // Software Carnage"),
+            high_dpi: true,
+            window_resizable: false,
+            window_height: WINDOW_HEIGHT as i32,
+            window_width: WINDOW_WIDTH as i32,
+            ..Default::default()
+        },
+        // The renderer keeps a whole frame in a few batches; each batch has
+        // to be able to hold it.
+        draw_call_vertex_capacity: FRAME_VERTEX_CAPACITY,
+        draw_call_index_capacity: FRAME_INDEX_CAPACITY,
         ..Default::default()
     }
 }
@@ -44,10 +56,12 @@ enum CurrentScreen {
     MainMenu,
 }
 
-/// Which frame `--screenshot` captures before quitting. Each scene exercises a
-/// different slice of the renderer so visual changes can be checked headlessly.
+/// The seeded scene a harness run plays: the frame `--screenshot` captures
+/// before quitting, or the frames `--telemetry` times. Each scene exercises a
+/// different slice of the renderer so visual and performance changes can be
+/// checked headlessly.
 #[derive(Copy, Clone, PartialEq)]
-enum ScreenshotScene {
+enum HarnessScene {
     /// A seeded stack mid line-clear, with shrapnel and shake in flight.
     Carnage,
     /// The same seeded stack at rest, with nothing clearing.
@@ -58,22 +72,42 @@ enum ScreenshotScene {
     Menu,
 }
 
-fn screenshot_scene_from_args() -> Option<ScreenshotScene> {
-    let args: Vec<String> = std::env::args().collect();
-    if !args.iter().any(|arg| arg == "--screenshot") {
+impl HarnessScene {
+    fn label(self) -> &'static str {
+        match self {
+            HarnessScene::Carnage => "carnage",
+            HarnessScene::Still => "still",
+            HarnessScene::GameOver => "gameover",
+            HarnessScene::Menu => "menu",
+        }
+    }
+}
+
+fn harness_scene_from_args() -> Option<HarnessScene> {
+    if !is_screenshot_run() && telemetry::frames_from_args().is_none() {
         return None;
     }
 
+    let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--menu") {
-        Some(ScreenshotScene::Menu)
+        Some(HarnessScene::Menu)
     } else if args.iter().any(|arg| arg == "--still") {
-        Some(ScreenshotScene::Still)
+        Some(HarnessScene::Still)
     } else if args.iter().any(|arg| arg == "--gameover") {
-        Some(ScreenshotScene::GameOver)
+        Some(HarnessScene::GameOver)
     } else {
-        Some(ScreenshotScene::Carnage)
+        Some(HarnessScene::Carnage)
     }
 }
+
+fn is_screenshot_run() -> bool {
+    std::env::args().any(|arg| arg == "--screenshot")
+}
+
+/// Clock step per frame in a screenshot run, matching the game's tick rate.
+/// Time-driven effects are sampled at these fixed moments rather than the wall
+/// clock, so a capture of frame N is reproducible.
+const SCREENSHOT_FRAME_SECONDS: f64 = 1.0 / 60.0;
 
 /// How many frames to run before capturing, from `--frame=N`. Effects such as
 /// the clear flash and shrapnel burst evolve over the first second, so this
@@ -90,7 +124,7 @@ fn screenshot_frame_from_args() -> usize {
 /// so nothing is clearable and the stack simply sits there; `GameOver` piles
 /// the stack to the ceiling and ends the run.
 fn seed_screenshot_state<'a>(
-    scene: ScreenshotScene,
+    scene: HarnessScene,
     high_score_manager: &'a HighScoreManager,
 ) -> GameState<'a> {
     let mut game_state = GameState::new(high_score_manager);
@@ -103,14 +137,14 @@ fn seed_screenshot_state<'a>(
         piece::pieces::PIECE_COLOR_T,
         piece::pieces::PIECE_COLOR_Z,
     ];
-    let first_row = if scene == ScreenshotScene::GameOver { 4 } else { 17 };
+    let first_row = if scene == HarnessScene::GameOver { 4 } else { 17 };
 
     for row in first_row..22 {
         for col in 0..10 {
             let gap = (row == 17 && (col == 2 || col == 3 || col == 7))
                 || (row == 18 && (col == 4 || col == 5))
-                || (scene == ScreenshotScene::Still && col == 4)
-                || (scene == ScreenshotScene::GameOver && (row * 7 + col * 3) % 5 == 0);
+                || (scene == HarnessScene::Still && col == 4)
+                || (scene == HarnessScene::GameOver && (row * 7 + col * 3) % 5 == 0);
             if gap {
                 continue;
             }
@@ -124,9 +158,9 @@ fn seed_screenshot_state<'a>(
     }
 
     match scene {
-        ScreenshotScene::Carnage => game_state.trigger_line_clear(),
-        ScreenshotScene::GameOver => game_state.trigger_game_over(),
-        ScreenshotScene::Still | ScreenshotScene::Menu => {}
+        HarnessScene::Carnage => game_state.trigger_line_clear(),
+        HarnessScene::GameOver => game_state.trigger_game_over(),
+        HarnessScene::Still | HarnessScene::Menu => {}
     }
 
     game_state
@@ -150,12 +184,14 @@ async fn main() {
 
     // Game state
     let mut maybe_game_state: Option<GameState> = None;
-    let screenshot_scene = screenshot_scene_from_args();
+    let harness_scene = harness_scene_from_args();
+    let is_screenshot = is_screenshot_run();
     let screenshot_capture_frame = screenshot_frame_from_args();
     let mut screenshot_frame: usize = 0;
+    let mut telemetry = Telemetry::from_args(harness_scene.map_or("play", HarnessScene::label));
 
-    match screenshot_scene {
-        Some(ScreenshotScene::Menu) | None => {}
+    match harness_scene {
+        Some(HarnessScene::Menu) | None => {}
         Some(scene) => {
             current_screen = CurrentScreen::Game;
             maybe_game_state = Some(seed_screenshot_state(scene, &high_score_manager));
@@ -215,8 +251,19 @@ async fn main() {
     );
 
     loop {
-        render_surface.begin_frame();
+        if telemetry.begin_frame() {
+            telemetry.report();
+            quit();
+        }
 
+        // Screenshot runs advance the clock a fixed step per frame, so the
+        // lightstyle flicker, embers and lava look the same on every run and
+        // captures can be compared pixel for pixel.
+        let time = if is_screenshot {
+            screenshot_frame as f64 * SCREENSHOT_FRAME_SECONDS
+        } else {
+            get_time()
+        };
         let menu_input = MenuInput {
             up: is_key_pressed(KeyCode::Up),
             down: is_key_pressed(KeyCode::Down),
@@ -251,12 +298,6 @@ async fn main() {
                 Some("quit") => quit(),
                 _ => (),
             }
-
-            game_state.draw(render_surface.clone());
-            menu_game_over.draw(render_surface.clone());
-            menu_paused.draw(render_surface.clone());
-
-            game_state.clean_up();
         } else {
             match menu_main.update(menu_input) {
                 Some("new_game") => {
@@ -266,22 +307,47 @@ async fn main() {
                 Some("quit") => quit(),
                 _ => (),
             }
-
-            // The empty well is drawn behind the main menu so the 3D playfield
-            // frames the menu screen too, rather than it floating on a void.
-            draw_backdrop(&render_surface);
-
-            menu_main.draw(render_surface.clone());
-            high_score_manager.draw(render_surface.clone());
         }
 
+        // The frame's camera shake comes from the updated game state, so the
+        // frame can only begin once the update is done.
+        telemetry.enter(Phase::Draw);
+        let playing = match (&current_screen, maybe_game_state.as_mut()) {
+            (CurrentScreen::Game, Some(game_state)) => Some(game_state),
+            _ => None,
+        };
+        let shake = playing
+            .as_deref()
+            .map_or(Vec2::ZERO, |game_state| camera_shake(game_state, time));
+        let frame = render_surface.begin_frame(time, shake);
+
+        match playing {
+            Some(game_state) => {
+                game_state.draw(&frame);
+                menu_game_over.draw(&frame);
+                menu_paused.draw(&frame);
+
+                game_state.clean_up();
+            }
+            None => {
+                // The empty well is drawn behind the main menu so the 3D
+                // playfield frames the menu screen too, rather than it
+                // floating on a void.
+                draw_backdrop(&frame);
+                menu_main.draw(&frame);
+                high_score_manager.draw(&frame);
+            }
+        }
+
+        telemetry.enter(Phase::Present);
         render_surface.present();
+        telemetry.sync_gpu_then_wait();
 
         if is_key_pressed(KeyCode::F12) {
             export_opaque_png(get_screen_data(), "screenshot.png");
         }
 
-        if screenshot_scene.is_some() {
+        if is_screenshot {
             screenshot_frame += 1;
             if screenshot_frame >= screenshot_capture_frame {
                 export_opaque_png(get_screen_data(), "screenshot.png");
