@@ -1,0 +1,4 @@
+{
+  "name": "bloxide",
+  "install": "bash .cursor/install.sh"
+}
