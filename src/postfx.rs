@@ -21,12 +21,19 @@ const DITHER_STRENGTH: f32 = 0.5;
 /// How much the frame darkens toward its corners.
 const VIGNETTE_STRENGTH: f32 = 0.42;
 
+// The present pass samples the framebuffer texture at `highp`. At the original
+// `lowp`, texture coordinates toward the top of the frame (v approaching 1.0)
+// lost enough precision that on some GL stacks (Mesa/llvmpipe under Xvfb, used
+// for headless captures) the upper rows sampled outside the texture and came
+// back black, leaving the top third of the window blank. Both the `uv` varying
+// and the fragment shader's default float precision are `highp` so the sample
+// stays exact across the whole frame.
 const VERTEX_SHADER: &str = r#"#version 100
 attribute vec3 position;
 attribute vec2 texcoord;
 attribute vec4 color0;
 
-varying lowp vec2 uv;
+varying highp vec2 uv;
 varying lowp vec4 color;
 
 uniform mat4 Model;
@@ -39,9 +46,9 @@ void main() {
 }"#;
 
 const FRAGMENT_SHADER: &str = r#"#version 100
-precision mediump float;
+precision highp float;
 
-varying lowp vec2 uv;
+varying highp vec2 uv;
 varying lowp vec4 color;
 
 uniform sampler2D Texture;
