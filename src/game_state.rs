@@ -708,7 +708,7 @@ impl<'a> GameState<'a> {
 
         // Keep the debris integrator and its per-step drag at the original
         // 60 Hz. A slow render frame still runs every owed physics step.
-        if self.tick % EFFECT_TICK_INTERVAL == 0 {
+        if self.tick.is_multiple_of(EFFECT_TICK_INTERVAL) {
             self.update_shrapnel(1.0 / 60.0);
         }
 
