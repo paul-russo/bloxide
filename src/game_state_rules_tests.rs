@@ -10,6 +10,7 @@ use macroquad::prelude::WHITE;
 fn state_with_piece(high_scores: &HighScoreManager, piece: Piece) -> GameState<'_> {
     let mut state = GameState::new(high_scores);
     state.set_active_piece_and_reset_state(piece);
+
     state
 }
 
@@ -51,6 +52,7 @@ fn hard_drop_block_out_stops_before_moving_the_blocked_successor() {
     let mut state = state_with_piece(&high_scores, pieces::O);
     state.active_piece_row = 20;
     state.active_piece_col = 0;
+
     let next_piece = state.bag_manager.peek(1);
     let (canvas, height, width) = next_piece.get_blocks(0);
     let (row, col) = (0..height)
@@ -101,4 +103,57 @@ fn game_over_ignores_all_further_input_including_pause() {
     assert_eq!(state.score, 0);
     assert!(state.held_piece.is_none());
     assert_eq!(state.get_piece_previews().map(|piece| piece.name), previews);
+}
+
+#[test]
+fn levels_advance_at_each_ten_line_boundary_and_stop_at_twenty() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_with_piece(&high_scores, pieces::O);
+
+    for (lines, level) in [
+        (0, 1),
+        (1, 1),
+        (9, 1),
+        (10, 2),
+        (11, 2),
+        (19, 2),
+        (20, 3),
+        (21, 3),
+        (189, 19),
+        (190, 20),
+        (191, 20),
+        (200, 20),
+        (usize::MAX, 20),
+    ] {
+        state.rows_cleared = lines;
+        assert_eq!(state.get_level(), level, "after {lines} cleared lines");
+    }
+}
+
+#[test]
+fn tenth_line_levels_up_and_preserves_pre_clear_scoring() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_with_piece(&high_scores, pieces::O);
+    state.rows_cleared = 9;
+
+    for col in 0..GRID_COUNT_COLS {
+        state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+    }
+
+    state.clear_filled_rows_and_update_score();
+
+    assert_eq!(state.get_rows_cleared(), 10);
+    assert_eq!(state.get_level(), 2);
+    assert_eq!(state.get_score(), 100);
+    assert_eq!(state.get_level_flare(), 1.0);
+
+    for col in 0..GRID_COUNT_COLS {
+        state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+    }
+
+    state.clear_filled_rows_and_update_score();
+
+    assert_eq!(state.get_rows_cleared(), 11);
+    assert_eq!(state.get_level(), 2);
+    assert_eq!(state.get_score(), 300);
 }

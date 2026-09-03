@@ -1002,7 +1002,7 @@ impl<'a> GameState<'a> {
 
     pub fn get_level(&self) -> usize {
         // Minimum level is 1. Maximum is 20.
-        (self.rows_cleared as f32 / 10.0).ceil().max(1.0).min(20.0) as usize
+        (self.rows_cleared / 10 + 1).min(20)
     }
 
     pub fn get_gravity(&self) -> f32 {
