@@ -17,6 +17,7 @@ mod textures;
 
 use draw::{camera_shake, draw_backdrop, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
 use game_state::{GameInput, GameState};
+use grid::{FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
 use menu::{Menu, MenuInput, MenuItem};
@@ -137,14 +138,24 @@ fn seed_screenshot_state<'a>(
         piece::pieces::PIECE_COLOR_T,
         piece::pieces::PIECE_COLOR_Z,
     ];
-    let first_row = if scene == HarnessScene::GameOver { 4 } else { 17 };
+    let stack_top = VISIBLE_GRID_COUNT_ROWS - 5;
+    let first_visible_row = if scene == HarnessScene::GameOver {
+        2
+    } else {
+        stack_top
+    };
 
-    for row in first_row..22 {
-        for col in 0..10 {
-            let gap = (row == 17 && (col == 2 || col == 3 || col == 7))
-                || (row == 18 && (col == 4 || col == 5))
+    for visible_row in first_visible_row..VISIBLE_GRID_COUNT_ROWS {
+        let row = FIRST_VISIBLE_ROW_ID + visible_row;
+        // A fixed pattern phase preserves the fixture's colours and holes
+        // independently of how many hidden rows the matrix contains.
+        let pattern_row = visible_row + 2;
+
+        for col in 0..GRID_COUNT_COLS {
+            let gap = (visible_row == stack_top && (col == 2 || col == 3 || col == 7))
+                || (visible_row == stack_top + 1 && (col == 4 || col == 5))
                 || (scene == HarnessScene::Still && col == 4)
-                || (scene == HarnessScene::GameOver && (row * 7 + col * 3) % 5 == 0);
+                || (scene == HarnessScene::GameOver && (pattern_row * 7 + col * 3) % 5 == 0);
             if gap {
                 continue;
             }
@@ -152,7 +163,9 @@ fn seed_screenshot_state<'a>(
             game_state.get_grid_locked_mut().set_cell(
                 row,
                 col,
-                Some(block::Block::new(colors[(row * 3 + col) % colors.len()])),
+                Some(block::Block::new(
+                    colors[(pattern_row * 3 + col) % colors.len()],
+                )),
             );
         }
     }
@@ -358,5 +371,65 @@ async fn main() {
         }
 
         next_frame().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        seed_screenshot_state, HarnessScene, HighScoreManager, FIRST_VISIBLE_ROW_ID,
+        GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS,
+    };
+    use crate::grid::{Grid, GRID_COUNT_ROWS};
+
+    fn occupied_in_row(grid: &Grid, row: usize) -> usize {
+        (0..GRID_COUNT_COLS)
+            .filter(|&col| grid.has_block_at_cell(row, col))
+            .count()
+    }
+
+    #[test]
+    fn seeded_stacks_remain_in_the_visible_well_when_the_buffer_grows() {
+        let high_scores = HighScoreManager::new();
+
+        for (scene, first_visible_row) in [
+            (HarnessScene::Still, VISIBLE_GRID_COUNT_ROWS - 5),
+            (HarnessScene::GameOver, 2),
+        ] {
+            let state = seed_screenshot_state(scene, &high_scores);
+            let grid = state.get_grid_locked();
+            let first_occupied = (0..GRID_COUNT_ROWS).find(|&row| occupied_in_row(grid, row) > 0);
+
+            assert_eq!(
+                first_occupied,
+                Some(FIRST_VISIBLE_ROW_ID + first_visible_row)
+            );
+            assert!((0..FIRST_VISIBLE_ROW_ID).all(|row| occupied_in_row(grid, row) == 0));
+            assert!(occupied_in_row(grid, GRID_COUNT_ROWS - 1) > 0);
+            assert_eq!(state.get_rows_cleared(), 0);
+            assert_eq!(state.get_is_game_over(), scene == HarnessScene::GameOver);
+        }
+    }
+
+    #[test]
+    fn seeded_line_clear_still_clears_three_rows_at_the_bottom() {
+        let high_scores = HighScoreManager::new();
+        let state = seed_screenshot_state(HarnessScene::Carnage, &high_scores);
+        let grid = state.get_grid_locked();
+        let occupied_rows: Vec<_> = (0..GRID_COUNT_ROWS)
+            .filter(|&row| occupied_in_row(grid, row) > 0)
+            .collect();
+        let clear_mask = (VISIBLE_GRID_COUNT_ROWS - 3..VISIBLE_GRID_COUNT_ROWS)
+            .fold(0, |mask, row| mask | (1 << row));
+
+        assert_eq!(state.get_rows_cleared(), 3);
+        assert_eq!(state.get_score(), 500);
+        assert_eq!(state.get_clear_row_mask(), clear_mask);
+        assert_eq!(
+            occupied_rows,
+            vec![GRID_COUNT_ROWS - 2, GRID_COUNT_ROWS - 1]
+        );
+        assert_eq!(occupied_in_row(grid, GRID_COUNT_ROWS - 2), 7);
+        assert_eq!(occupied_in_row(grid, GRID_COUNT_ROWS - 1), 8);
     }
 }

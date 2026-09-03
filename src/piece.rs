@@ -1,5 +1,5 @@
 use crate::block::Block;
-use crate::grid::GRID_COUNT_COLS;
+use crate::grid::{FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS};
 use macroquad::prelude::Color;
 use std::fmt::Display;
 
@@ -55,6 +55,12 @@ impl Piece {
 
     pub fn get_initial_col(&self) -> isize {
         ((GRID_COUNT_COLS - self.bounds_width) / 2) as isize
+    }
+
+    /// Keep the bottom occupied spawn row at the top of the visible well.
+    /// The I's larger canvas needs a different origin, not different SRS data.
+    pub fn get_initial_row(&self) -> isize {
+        FIRST_VISIBLE_ROW_ID as isize - (self.orientations[0].bounds_y.1 as isize - 1)
     }
 }
 
@@ -479,4 +485,63 @@ pub mod pieces {
             },
         ],
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pieces, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS};
+
+    #[test]
+    fn all_spawn_canvases_align_their_bottom_row_and_center_their_occupied_columns() {
+        for piece in [
+            pieces::I,
+            pieces::J,
+            pieces::L,
+            pieces::O,
+            pieces::S,
+            pieces::T,
+            pieces::Z,
+        ] {
+            let (canvas, _, _) = piece.get_blocks(0);
+            let mut occupied = Vec::new();
+
+            for (row, cells) in canvas.iter().enumerate() {
+                for (col, block) in cells.iter().enumerate() {
+                    if block.is_some() {
+                        occupied.push((
+                            piece.get_initial_row() + row as isize,
+                            piece.get_initial_col() + col as isize,
+                        ));
+                    }
+                }
+            }
+
+            let first_visible = FIRST_VISIBLE_ROW_ID as isize;
+            let top = if piece.name == "I" {
+                first_visible
+            } else {
+                first_visible - 1
+            };
+            let width = match piece.name {
+                "I" => 4,
+                "O" => 2,
+                _ => 3,
+            };
+            let left = ((GRID_COUNT_COLS - width) / 2) as isize;
+
+            assert_eq!(occupied.len(), 4, "{}", piece.name);
+            assert_eq!(occupied.iter().map(|cell| cell.0).min(), Some(top));
+            assert_eq!(
+                occupied.iter().map(|cell| cell.0).max(),
+                Some(first_visible),
+                "{} must not enter a row too low",
+                piece.name
+            );
+            assert_eq!(occupied.iter().map(|cell| cell.1).min(), Some(left));
+            assert_eq!(
+                occupied.iter().map(|cell| cell.1).max(),
+                Some(left + width as isize - 1)
+            );
+        }
+    }
 }

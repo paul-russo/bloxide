@@ -43,7 +43,7 @@ pub const RENDER_HEIGHT: u32 = 450;
 pub const WELL_WIDTH: f32 = GRID_COUNT_COLS as f32;
 
 /// Height of the playable well in world units, covering only the visible rows.
-/// The two hidden spawn rows above the well are intentionally outside the frame.
+/// The hidden buffer above the well is intentionally outside the frame.
 pub const WELL_HEIGHT: f32 = VISIBLE_GRID_COUNT_ROWS as f32;
 
 /// Depth of the well cavity. Blocks are one unit deep and centred on `z == 0`,

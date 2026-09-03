@@ -3,7 +3,8 @@ use crate::piece::BlockCanvas;
 use macroquad::prelude::Color;
 
 pub const VISIBLE_GRID_COUNT_ROWS: usize = 20;
-pub const GRID_COUNT_ROWS: usize = 22;
+pub const HIDDEN_GRID_COUNT_ROWS: usize = 20;
+pub const GRID_COUNT_ROWS: usize = VISIBLE_GRID_COUNT_ROWS + HIDDEN_GRID_COUNT_ROWS;
 pub const FIRST_VISIBLE_ROW_ID: usize = GRID_COUNT_ROWS - VISIBLE_GRID_COUNT_ROWS;
 pub const GRID_COUNT_COLS: usize = 10;
 pub const MAX_CLEARED_CELLS: usize = 40;
@@ -145,8 +146,13 @@ impl Grid {
         bounds_width: usize,
     ) -> isize {
         for next_row_offset in row_offset..GRID_COUNT_ROWS as isize {
-            let has_collision =
-                self.collision_check(next_row_offset, col_offset, canvas, bounds_height, bounds_width);
+            let has_collision = self.collision_check(
+                next_row_offset,
+                col_offset,
+                canvas,
+                bounds_height,
+                bounds_width,
+            );
 
             if has_collision {
                 return next_row_offset - 1;
@@ -265,22 +271,68 @@ mod tests {
         let mut grid = Grid::new();
         let block = Some(Block::new(RED));
 
-        // Fill row 21 (bottom-most visible row)
+        // Fill the bottom-most visible row.
         for col in 0..GRID_COUNT_COLS {
-            grid.set_cell(21, col, block);
+            grid.set_cell(GRID_COUNT_ROWS - 1, col, block);
         }
 
         let (cleared_rows, cleared_blocks, cleared_count) = grid.clear_all_filled_rows_detailed();
         assert_eq!(cleared_rows, 1);
         assert_eq!(cleared_count, GRID_COUNT_COLS);
 
-        for col in 0..GRID_COUNT_COLS {
-            let cleared = cleared_blocks[col].expect("Expected cleared block");
-            assert_eq!(cleared.visible_row, 19);
+        for (col, cleared) in cleared_blocks[..cleared_count].iter().enumerate() {
+            let cleared = cleared.expect("Expected cleared block");
+            assert_eq!(cleared.visible_row, VISIBLE_GRID_COUNT_ROWS - 1);
             assert_eq!(cleared.col, col);
             assert_eq!(cleared.color, RED);
         }
 
         assert_eq!(grid.clear_all_filled_rows(), 0);
+    }
+
+    #[test]
+    fn clearing_the_first_visible_row_pulls_hidden_blocks_into_view() {
+        let mut grid = Grid::new();
+        let block = Some(Block::new(RED));
+        grid.set_cell(0, 1, block);
+        grid.set_cell(FIRST_VISIBLE_ROW_ID - 1, 0, block);
+
+        for col in 0..GRID_COUNT_COLS {
+            grid.set_cell(FIRST_VISIBLE_ROW_ID, col, block);
+        }
+
+        let (cleared_rows, cleared_blocks, cleared_count) = grid.clear_all_filled_rows_detailed();
+
+        assert_eq!(cleared_rows, 1);
+        assert_eq!(cleared_count, GRID_COUNT_COLS);
+        assert!(cleared_blocks[..cleared_count]
+            .iter()
+            .flatten()
+            .all(|cleared| cleared.visible_row == 0));
+        assert!(grid.has_block_at_cell(FIRST_VISIBLE_ROW_ID, 0));
+        assert!(!grid.has_block_at_cell(FIRST_VISIBLE_ROW_ID - 1, 0));
+        assert!(grid.has_block_at_cell(1, 1));
+        assert!(!grid.has_block_at_cell(0, 1));
+    }
+
+    #[test]
+    fn clearing_a_hidden_row_does_not_report_visible_debris_or_move_rows_below_it() {
+        let mut grid = Grid::new();
+        let block = Some(Block::new(RED));
+        grid.set_cell(FIRST_VISIBLE_ROW_ID - 2, 2, block);
+        grid.set_cell(FIRST_VISIBLE_ROW_ID, 4, block);
+
+        for col in 0..GRID_COUNT_COLS {
+            grid.set_cell(FIRST_VISIBLE_ROW_ID - 1, col, block);
+        }
+
+        let (cleared_rows, cleared_blocks, cleared_count) = grid.clear_all_filled_rows_detailed();
+
+        assert_eq!(cleared_rows, 1);
+        assert_eq!(cleared_count, 0);
+        assert!(cleared_blocks.iter().all(Option::is_none));
+        assert!(grid.has_block_at_cell(FIRST_VISIBLE_ROW_ID - 1, 2));
+        assert!(!grid.has_block_at_cell(FIRST_VISIBLE_ROW_ID - 2, 2));
+        assert!(grid.has_block_at_cell(FIRST_VISIBLE_ROW_ID, 4));
     }
 }
