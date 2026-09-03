@@ -283,6 +283,9 @@ impl<'a> GameState<'a> {
     fn end_game(&mut self) {
         self.clean_up();
         self.is_game_over = true;
+        self.grid_active.clear();
+        self.grid_ghost.clear();
+
         self.high_score_manager.add_score(self.score);
     }
 
@@ -591,11 +594,15 @@ impl<'a> GameState<'a> {
     }
 
     pub fn update(&mut self, input: GameInput) {
+        if self.is_game_over {
+            return;
+        }
+
         if input.toggle_pause {
             self.toggle_pause();
         }
 
-        if self.is_game_over || self.is_paused {
+        if self.is_paused {
             return;
         }
 
@@ -625,6 +632,9 @@ impl<'a> GameState<'a> {
 
         if input.hold_piece {
             self.swap_active_piece();
+            if self.is_game_over {
+                return;
+            }
         }
 
         if input.rotate_right {
@@ -633,6 +643,9 @@ impl<'a> GameState<'a> {
 
         if input.hard_drop {
             self.hard_drop();
+            if self.is_game_over {
+                return;
+            }
         }
 
         // Try and move the piece horizontally,
@@ -640,6 +653,9 @@ impl<'a> GameState<'a> {
 
         // Drop the piece, or lock it if dropping would cause a collision.
         self.try_gravity_drop(input.soft_drop);
+        if self.is_game_over {
+            return;
+        }
 
         // Only update grids if piece state changed
         if self.piece_dirty {
@@ -1093,6 +1109,10 @@ impl<'a> GameState<'a> {
         &self.lava_splashes
     }
 }
+
+#[cfg(test)]
+#[path = "game_state_rules_tests.rs"]
+mod rules_tests;
 
 #[cfg(test)]
 mod tests {
