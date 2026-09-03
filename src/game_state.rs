@@ -619,6 +619,15 @@ impl<'a> GameState<'a> {
             self.is_paused = !self.is_paused;
         }
 
+        // Menu resume happens outside update(), so keep continuous keys current
+        // even while paused without advancing DAS or retaining one-shot presses.
+        self.held_input = GameInput {
+            soft_drop: input.soft_drop,
+            shift_left: input.shift_left,
+            shift_right: input.shift_right,
+            ..Default::default()
+        };
+
         if self.is_paused {
             self.refresh_piece_grids();
             return;
@@ -642,12 +651,6 @@ impl<'a> GameState<'a> {
             }
         }
 
-        self.held_input = GameInput {
-            soft_drop: input.soft_drop,
-            shift_left: input.shift_left,
-            shift_right: input.shift_right,
-            ..Default::default()
-        };
         self.try_move_horizontal(input.shift_left, input.shift_right, 0);
 
         self.refresh_piece_grids();

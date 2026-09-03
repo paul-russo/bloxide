@@ -664,6 +664,74 @@ fn menu_resume_does_not_repeat_a_direction_released_while_paused() {
 }
 
 #[test]
+fn menu_resume_preserves_held_das_phase_and_ignores_paused_actions() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_with_piece(&high_scores, pieces::O);
+    let held_input = GameInput {
+        shift_right: true,
+        ..Default::default()
+    };
+    state.update_with_elapsed(Duration::ZERO, held_input);
+    state.update_with_elapsed(
+        Duration::from_millis(180),
+        GameInput {
+            toggle_pause: true,
+            ..held_input
+        },
+    );
+
+    assert!(state.is_paused);
+    assert_eq!(state.tick, 43);
+    assert_eq!(state.ticks_to_repeat, 1);
+
+    let frozen = state;
+    state.update_with_elapsed(
+        Duration::from_secs(60),
+        GameInput {
+            rotate_right: true,
+            hard_drop: true,
+            hold_piece: true,
+            ..held_input
+        },
+    );
+
+    assert!(state.is_paused);
+    assert!(state.held_piece.is_none());
+    assert_eq!(occupied_cells(&state.grid_locked), 0);
+    assert_matching_motion(&state, &frozen);
+    assert!(state.held_input.shift_right);
+    assert!(!state.held_input.rotate_right);
+    assert!(!state.held_input.hard_drop);
+    assert!(!state.held_input.hold_piece);
+    assert!(!state.held_input.toggle_pause);
+
+    state.toggle_pause();
+
+    assert!(!state.is_paused);
+    assert_matching_motion(&state, &frozen);
+
+    state.update_with_elapsed(Duration::from_millis(3), held_input);
+
+    assert_eq!(state.tick, frozen.tick);
+    assert_eq!(state.active_piece_col, frozen.active_piece_col);
+    assert_eq!(state.ticks_to_repeat, 1);
+
+    state.update_with_elapsed(Duration::from_millis(1), held_input);
+
+    assert_eq!(state.tick, frozen.tick + 1);
+    assert_eq!(state.active_piece_col, frozen.active_piece_col + 1);
+    assert_eq!(state.ticks_to_repeat, REPEAT_INTERVAL_TICKS);
+    assert_eq!(state.active_piece_row, frozen.active_piece_row);
+    assert_eq!(
+        state.active_piece_orientation,
+        frozen.active_piece_orientation
+    );
+    assert!(state.held_piece.is_none());
+    assert_eq!(occupied_cells(&state.grid_locked), 0);
+    assert_eq!(state.score, frozen.score);
+}
+
+#[test]
 fn blocked_gravity_does_not_bank_an_unbounded_fall_after_moving_off_a_surface() {
     let high_scores = HighScoreManager::new();
     let mut state = state_with_piece(&high_scores, pieces::O);
