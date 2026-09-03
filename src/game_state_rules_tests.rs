@@ -22,6 +22,28 @@ fn state_with_piece(high_scores: &HighScoreManager, piece: Piece) -> GameState<'
     state
 }
 
+fn state_on_floor(
+    high_scores: &HighScoreManager,
+    piece: Piece,
+    orientation: usize,
+) -> GameState<'_> {
+    let mut state = state_with_piece(high_scores, piece);
+    state.active_piece_orientation = orientation;
+    state.refresh_cached_blocks();
+    state.active_piece_row = state.grid_locked.find_landing_row(
+        state.active_piece_row,
+        state.active_piece_col,
+        &state.cached_blocks,
+        state.cached_bounds_height,
+        state.cached_bounds_width,
+    );
+    state.update_with_elapsed(Duration::ZERO, GameInput::default());
+
+    assert!(state.has_touched_ground);
+
+    state
+}
+
 fn occupied_cells(grid: &Grid) -> usize {
     (0..GRID_COUNT_ROWS)
         .map(|row| {
@@ -30,6 +52,33 @@ fn occupied_cells(grid: &Grid) -> usize {
                 .count()
         })
         .sum()
+}
+
+fn occupied_positions(grid: &Grid) -> Vec<(usize, usize)> {
+    (0..GRID_COUNT_ROWS)
+        .flat_map(|row| {
+            (0..GRID_COUNT_COLS)
+                .filter(move |&col| grid.has_block_at_cell(row, col))
+                .map(move |col| (row, col))
+        })
+        .collect()
+}
+
+fn block_next_spawn(state: &mut GameState<'_>) -> Piece {
+    let next_piece = state.bag_manager.peek(1);
+    let (canvas, height, width) = next_piece.get_blocks(0);
+    let (row, col) = (0..height)
+        .find_map(|row| {
+            (0..width)
+                .find(|&col| canvas[row][col].is_some())
+                .map(|col| (row + 1, col + next_piece.get_initial_col() as usize))
+        })
+        .expect("every piece has an occupied spawn cell");
+    state
+        .grid_locked
+        .set_cell(row, col, Some(Block::new(WHITE)));
+
+    next_piece
 }
 
 fn duration_for_ticks(ticks: u64) -> Duration {
@@ -79,6 +128,8 @@ fn assert_matching_motion(actual: &GameState<'_>, expected: &GameState<'_>) {
         actual.lock_reset_moves_remaining,
         expected.lock_reset_moves_remaining
     );
+    assert_eq!(actual.has_touched_ground, expected.has_touched_ground);
+    assert_eq!(actual.lowest_piece_row, expected.lowest_piece_row);
     assert_eq!(actual.score, expected.score);
     assert_eq!(actual.cached_ghost_row, expected.cached_ghost_row);
 }
@@ -115,18 +166,7 @@ fn hard_drop_block_out_stops_before_moving_the_blocked_successor() {
     state.active_piece_row = 20;
     state.active_piece_col = 0;
 
-    let next_piece = state.bag_manager.peek(1);
-    let (canvas, height, width) = next_piece.get_blocks(0);
-    let (row, col) = (0..height)
-        .find_map(|row| {
-            (0..width)
-                .find(|&col| canvas[row][col].is_some())
-                .map(|col| (row + 1, col + next_piece.get_initial_col() as usize))
-        })
-        .expect("every piece has an occupied spawn cell");
-    state
-        .grid_locked
-        .set_cell(row, col, Some(Block::new(WHITE)));
+    let next_piece = block_next_spawn(&mut state);
 
     state.update_with_elapsed(
         Duration::ZERO,
@@ -370,6 +410,677 @@ fn soft_drop_is_thirty_rows_per_second_unless_natural_gravity_is_faster() {
 }
 
 #[test]
+fn contact_locks_at_exactly_five_hundred_ms_for_natural_soft_and_released_soft_drop() {
+    let high_scores = HighScoreManager::new();
+    let just_before_lock = Duration::from_millis(500) - Duration::from_nanos(1);
+
+    for (mode, lines, soft_before, soft_after, landing_ticks) in [
+        ("natural", 0, false, false, 240),
+        ("soft", 0, true, true, 8),
+        ("released soft", 0, true, false, 8),
+        ("natural 1G", 190, false, false, 4),
+        ("soft 1G", 190, true, true, 4),
+        ("released soft 1G", 190, true, false, 4),
+    ] {
+        for fps in FRAME_RATES.into_iter().chain([1]) {
+            let mut state = state_with_piece(&high_scores, pieces::O);
+            state.active_piece_row = 19;
+            state.rows_cleared = lines;
+            let landing_input = GameInput {
+                soft_drop: soft_before,
+                ..Default::default()
+            };
+            advance_at_fps(
+                &mut state,
+                duration_for_ticks(landing_ticks),
+                fps,
+                landing_input,
+            );
+
+            assert_eq!(state.tick, landing_ticks as usize, "{mode}, {fps} FPS");
+            assert_eq!(state.active_piece_row, 20);
+            assert!(state.has_touched_ground);
+            assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS, "{mode}, {fps} FPS");
+            assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+            assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+            let contact_input = GameInput {
+                soft_drop: soft_after,
+                ..Default::default()
+            };
+            advance_at_fps(&mut state, just_before_lock, fps, contact_input);
+
+            assert_eq!(state.tick, landing_ticks as usize + 119);
+            assert_eq!(state.ticks_to_lock, 1, "{mode}, {fps} FPS");
+            assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+            state.update_with_elapsed(Duration::from_nanos(1), contact_input);
+
+            assert_eq!(state.tick, landing_ticks as usize + 120);
+            assert_eq!(occupied_cells(&state.grid_locked), 4, "{mode}, {fps} FPS");
+            assert_eq!(state.score, if soft_before { 1 } else { 0 });
+            assert_eq!(state.active_piece_row, 1);
+            assert_eq!(state.fall_progress, 0.0);
+            assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+            assert!(!state.has_touched_ground);
+        }
+    }
+}
+
+#[test]
+fn contact_deadlines_match_when_single_or_irregular_frames_span_the_landing() {
+    let high_scores = HighScoreManager::new();
+
+    for (soft_drop, landing_ticks) in [(false, 240), (true, 8)] {
+        let mut initial = state_with_piece(&high_scores, pieces::O);
+        initial.active_piece_row = 19;
+        let input = GameInput {
+            soft_drop,
+            ..Default::default()
+        };
+        initial.update_with_elapsed(Duration::ZERO, input);
+        let deadline = duration_for_ticks(landing_ticks) + Duration::from_millis(500);
+        let just_before_lock = deadline - Duration::from_nanos(1);
+        let mut single_frame = initial;
+        single_frame.update_with_elapsed(just_before_lock, input);
+
+        assert!(single_frame.has_touched_ground);
+        assert_eq!(single_frame.ticks_to_lock, 1);
+        assert_eq!(occupied_cells(&single_frame.grid_locked), 0);
+
+        let mut irregular = initial;
+        let mut previous = Duration::ZERO;
+
+        for boundary in [
+            Duration::from_millis(3),
+            Duration::from_millis(53),
+            Duration::from_millis(211),
+            just_before_lock,
+        ] {
+            irregular.update_with_elapsed(boundary - previous, input);
+            previous = boundary;
+        }
+
+        assert_matching_motion(&irregular, &single_frame);
+
+        for mut state in [single_frame, irregular] {
+            state.update_with_elapsed(Duration::from_nanos(1), input);
+
+            assert_eq!(state.tick, landing_ticks as usize + 120);
+            assert_eq!(occupied_cells(&state.grid_locked), 4);
+            assert_eq!(state.active_piece_row, 1);
+        }
+    }
+}
+
+#[test]
+fn first_contact_from_a_shift_or_rotation_keeps_the_full_delay_and_reset_allowance() {
+    let high_scores = HighScoreManager::new();
+
+    for rotate in [false, true] {
+        let piece = if rotate { pieces::T } else { pieces::O };
+        let mut state = state_with_piece(&high_scores, piece);
+        state.active_piece_row = if rotate { 19 } else { 18 };
+        state.active_piece_col = if rotate { 3 } else { 0 };
+
+        if !rotate {
+            state.grid_locked.set_cell(20, 3, Some(Block::new(WHITE)));
+        }
+
+        state.update_with_elapsed(Duration::ZERO, GameInput::default());
+        assert!(!state.has_touched_ground);
+
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                rotate_right: rotate,
+                shift_right: !rotate,
+                ..Default::default()
+            },
+        );
+
+        assert!(state.has_touched_ground);
+        assert!(state.collide(Some(state.active_piece_row + 1), None, None));
+        assert_eq!(state.tick, 0);
+        assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+
+        state.update_with_elapsed(duration_for_ticks(1), GameInput::default());
+
+        assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS - 1);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+    }
+}
+
+#[test]
+fn grounded_shifts_and_rotations_restart_the_full_contact_delay() {
+    let high_scores = HighScoreManager::new();
+
+    for rotate in [false, true] {
+        let mut state = state_on_floor(&high_scores, pieces::O, 0);
+        state.update_with_elapsed(Duration::from_millis(250), GameInput::default());
+
+        assert_eq!(state.ticks_to_lock, 60);
+
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                rotate_right: rotate,
+                shift_left: !rotate,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.tick, 60);
+        assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - 1);
+        assert_eq!(state.lowest_piece_row, 20);
+        assert!(state.collide(Some(state.active_piece_row + 1), None, None));
+
+        state.update_with_elapsed(Duration::ZERO, GameInput::default());
+        state.update_with_elapsed(
+            Duration::from_millis(500) - Duration::from_nanos(1),
+            GameInput::default(),
+        );
+
+        assert_eq!(state.ticks_to_lock, 1);
+        assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+        state.update_with_elapsed(Duration::from_nanos(1), GameInput::default());
+
+        assert_eq!(occupied_cells(&state.grid_locked), 4);
+        assert_eq!(state.tick, 180);
+    }
+}
+
+#[test]
+fn grounded_das_resets_after_debiting_the_elapsed_interval() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::O, 0);
+    let held_input = GameInput {
+        shift_right: true,
+        ..Default::default()
+    };
+    state.update_with_elapsed(Duration::ZERO, held_input);
+    state.ticks_to_lock = 1;
+    state.ticks_to_repeat = 1;
+    let before_col = state.active_piece_col;
+
+    state.update_with_elapsed(duration_for_ticks(1), held_input);
+
+    assert_eq!(state.active_piece_col, before_col + 1);
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - 2);
+    assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+    state.update_with_elapsed(duration_for_ticks(1), GameInput::default());
+
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS - 1);
+}
+
+#[test]
+fn failed_shifts_and_rotations_do_not_reset_contact_delay_or_budget() {
+    let high_scores = HighScoreManager::new();
+
+    for rotate in [false, true] {
+        let piece = if rotate { pieces::T } else { pieces::O };
+        let mut state = state_on_floor(&high_scores, piece, 0);
+        state.active_piece_col = if rotate { 0 } else { 7 };
+        state.piece_dirty = true;
+
+        if rotate {
+            // This blocks the T's only floor-kick candidate that fits the well.
+            state.grid_locked.set_cell(19, 0, Some(Block::new(WHITE)));
+        }
+
+        state.update_with_elapsed(Duration::from_millis(250), GameInput::default());
+        let before_cells = occupied_positions(&state.grid_active);
+        let locked_before = occupied_cells(&state.grid_locked);
+        let input = GameInput {
+            rotate_right: rotate,
+            shift_right: !rotate,
+            ..Default::default()
+        };
+        state.update_with_elapsed(Duration::ZERO, input);
+
+        assert_eq!(occupied_positions(&state.grid_active), before_cells);
+        assert_eq!(state.ticks_to_lock, 60);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+
+        // Includes a blocked horizontal repeat, or another failed rotation.
+        state.update_with_elapsed(duration_for_ticks(44), input);
+
+        assert_eq!(occupied_positions(&state.grid_active), before_cells);
+        assert_eq!(state.ticks_to_lock, 16);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+        assert_eq!(occupied_cells(&state.grid_locked), locked_before);
+
+        state.update_with_elapsed(duration_for_ticks(16), GameInput::default());
+
+        assert_eq!(occupied_cells(&state.grid_locked), locked_before + 4);
+    }
+}
+
+#[test]
+fn zero_tick_floor_shifts_and_o_spins_lock_on_the_fifteenth_reset() {
+    let high_scores = HighScoreManager::new();
+
+    for orientation in 0..4 {
+        for rotate in [false, true] {
+            let mut state = state_on_floor(&high_scores, pieces::O, orientation);
+            let initial_cells = occupied_positions(&state.grid_active);
+            let next_piece = state.bag_manager.peek(1);
+
+            for moves in 1..=RESET_MOVES {
+                state.update_with_elapsed(
+                    Duration::ZERO,
+                    GameInput {
+                        rotate_right: rotate,
+                        shift_left: !rotate && moves % 2 == 1,
+                        shift_right: !rotate && moves % 2 == 0,
+                        ..Default::default()
+                    },
+                );
+
+                assert_eq!(state.tick, 0);
+
+                if moves < RESET_MOVES {
+                    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+                    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+                    assert_eq!(state.lowest_piece_row, 20);
+                    assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+                    if rotate {
+                        assert_eq!(
+                            state.active_piece_orientation,
+                            (orientation + moves as usize) % 4
+                        );
+                        assert_eq!(occupied_positions(&state.grid_active), initial_cells);
+                    }
+                }
+            }
+
+            assert_eq!(occupied_cells(&state.grid_locked), 4);
+            assert_eq!(state.active_piece.name, next_piece.name);
+            assert_eq!(state.active_piece_row, 1);
+            assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+            assert!(!state.has_touched_ground);
+
+            if rotate {
+                assert_eq!(occupied_positions(&state.grid_locked), initial_cells);
+            }
+        }
+    }
+}
+
+#[test]
+fn airborne_shifts_after_contact_still_spend_the_reset_allowance() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::I, 1);
+    state.update_with_elapsed(
+        Duration::ZERO,
+        GameInput {
+            rotate_right: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(!state.collide(Some(state.active_piece_row + 1), None, None));
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - 1);
+
+    for (moves, shift_left) in [(2, true), (3, false)] {
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                shift_left,
+                shift_right: !shift_left,
+                ..Default::default()
+            },
+        );
+
+        assert!(!state.collide(Some(state.active_piece_row + 1), None, None));
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+        assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+        assert_eq!(state.lowest_piece_row, 17);
+        assert_eq!(occupied_cells(&state.grid_locked), 0);
+    }
+}
+
+#[test]
+fn i_rotation_offsets_do_not_refill_or_bypass_an_exhausted_budget() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::I, 1);
+    let rotate = GameInput {
+        rotate_right: true,
+        ..Default::default()
+    };
+
+    for moves in 1..RESET_MOVES {
+        state.update_with_elapsed(Duration::ZERO, rotate);
+
+        assert_eq!(state.active_piece_orientation, (1 + moves as usize) % 4);
+        assert_eq!(state.lowest_piece_row, 17);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+        assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+        if moves == 1 {
+            assert_eq!(
+                state.active_piece_row, 18,
+                "the canvas moves, not the SRS reference"
+            );
+        }
+    }
+
+    assert!(state.collide(Some(state.active_piece_row + 1), None, None));
+    state.update_with_elapsed(Duration::from_millis(250), GameInput::default());
+    assert_eq!(state.ticks_to_lock, 60);
+
+    // The fifteenth rotation lifts the blocks off the floor without translating
+    // the rotation reference. No further move may reset the airborne piece.
+    state.update_with_elapsed(Duration::ZERO, rotate);
+
+    assert_eq!(state.active_piece_orientation, 0);
+    assert!(!state.collide(Some(state.active_piece_row + 1), None, None));
+    assert_eq!(state.lock_reset_moves_remaining, 0);
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+
+    state.update_with_elapsed(Duration::from_millis(500), GameInput::default());
+    state.update_with_elapsed(
+        Duration::ZERO,
+        GameInput {
+            shift_left: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(state.active_piece_row, 17);
+    assert_eq!(state.lowest_piece_row, 17);
+    assert_eq!(state.lock_reset_moves_remaining, 0);
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+    assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+    let before_tick = state.tick;
+    state.update_with_elapsed(Duration::ZERO, rotate);
+
+    assert_eq!(state.tick, before_tick);
+    assert_eq!(occupied_cells(&state.grid_locked), 4);
+    assert_eq!(state.active_piece_row, 1);
+    assert!(!state.has_touched_ground);
+}
+
+#[test]
+fn t_floor_kick_cycles_exhaust_the_budget_without_refilling_at_the_old_height() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::T, 0);
+    state.active_piece_col = 0;
+    state.piece_dirty = true;
+    state.rows_cleared = 190;
+    let rotate = GameInput {
+        rotate_right: true,
+        ..Default::default()
+    };
+
+    for moves in 1..RESET_MOVES {
+        state.update_with_elapsed(duration_for_ticks(40), rotate);
+
+        assert_eq!(state.active_piece_orientation, moves as usize % 4);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+        assert_eq!(state.lowest_piece_row, 20);
+        assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+        if moves % 4 == 0 {
+            assert_eq!(state.active_piece_row, 19);
+
+            state.update_with_elapsed(duration_for_ticks(4), GameInput::default());
+
+            assert_eq!(state.active_piece_row, 20);
+            assert_eq!(state.active_piece_col, 0);
+            assert_eq!(state.lowest_piece_row, 20);
+            assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+            assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS - 3);
+        }
+    }
+
+    state.update_with_elapsed(duration_for_ticks(40), rotate);
+
+    assert_eq!(occupied_cells(&state.grid_locked), 4);
+    assert_eq!(state.active_piece_row, 1);
+    assert_eq!(state.score, 0);
+    assert!(!state.is_game_over);
+}
+
+#[test]
+fn leaving_a_ledge_on_the_fifteenth_move_refills_only_below_the_previous_lowest_row() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_with_piece(&high_scores, pieces::O);
+    state.active_piece_row = 8;
+    state.rows_cleared = 190;
+    state.grid_locked.set_cell(10, 4, Some(Block::new(WHITE)));
+    state.update_with_elapsed(Duration::ZERO, GameInput::default());
+
+    assert!(state.has_touched_ground);
+    assert_eq!(state.lowest_piece_row, 8);
+
+    for _ in 1..RESET_MOVES {
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                rotate_right: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    assert_eq!(state.lock_reset_moves_remaining, 1);
+
+    state.update_with_elapsed(
+        Duration::ZERO,
+        GameInput {
+            shift_right: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(!state.collide(Some(state.active_piece_row + 1), None, None));
+    assert_eq!(state.lowest_piece_row, 8);
+    assert_eq!(state.lock_reset_moves_remaining, 0);
+    assert_eq!(occupied_cells(&state.grid_locked), 1);
+
+    let first_row_time = duration_for_ticks(4);
+    state.update_with_elapsed(first_row_time, GameInput::default());
+
+    assert_eq!(state.lowest_piece_row, 9);
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+    assert!(state.has_touched_ground);
+    assert!(!state.collide(Some(state.active_piece_row + 1), None, None));
+
+    state.update_with_elapsed(
+        Duration::from_millis(200) - first_row_time,
+        GameInput::default(),
+    );
+
+    assert_eq!(state.lowest_piece_row, 20);
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+    assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+    assert!(state.collide(Some(state.active_piece_row + 1), None, None));
+    assert_eq!(occupied_cells(&state.grid_locked), 1);
+
+    state.update_with_elapsed(
+        Duration::from_millis(500) - Duration::from_nanos(1),
+        GameInput::default(),
+    );
+
+    assert_eq!(state.ticks_to_lock, 1);
+    assert_eq!(occupied_cells(&state.grid_locked), 1);
+
+    state.update_with_elapsed(Duration::from_nanos(1), GameInput::default());
+
+    assert_eq!(occupied_cells(&state.grid_locked), 5);
+    assert_eq!(state.score, 0);
+}
+
+#[test]
+fn pause_freezes_contact_delay_and_reset_budget() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::O, 0);
+    state.update_with_elapsed(
+        Duration::ZERO,
+        GameInput {
+            shift_left: true,
+            ..Default::default()
+        },
+    );
+    state.update_with_elapsed(Duration::ZERO, GameInput::default());
+    state.update_with_elapsed(
+        Duration::from_millis(250),
+        GameInput {
+            toggle_pause: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(state.ticks_to_lock, 60);
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - 1);
+
+    let frozen = state;
+    state.update_with_elapsed(
+        Duration::from_secs(60),
+        GameInput {
+            soft_drop: true,
+            shift_left: true,
+            rotate_right: true,
+            hard_drop: true,
+            hold_piece: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(state.is_paused);
+    assert!(state.held_piece.is_none());
+    assert_matching_motion(&state, &frozen);
+
+    state.update_with_elapsed(
+        Duration::from_secs(3600),
+        GameInput {
+            toggle_pause: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(!state.is_paused);
+    assert_matching_motion(&state, &frozen);
+
+    state.update_with_elapsed(
+        Duration::from_millis(250) - Duration::from_nanos(1),
+        GameInput::default(),
+    );
+
+    assert_eq!(state.ticks_to_lock, 1);
+    assert_eq!(occupied_cells(&state.grid_locked), 0);
+
+    state.update_with_elapsed(Duration::from_nanos(1), GameInput::default());
+
+    assert_eq!(state.tick, 120);
+    assert_eq!(occupied_cells(&state.grid_locked), 4);
+}
+
+#[test]
+fn hard_drop_locks_immediately_during_a_fresh_or_partially_spent_contact_delay() {
+    let high_scores = HighScoreManager::new();
+
+    for elapsed in [Duration::ZERO, Duration::from_millis(250)] {
+        let mut state = state_on_floor(&high_scores, pieces::O, 0);
+        state.update_with_elapsed(elapsed, GameInput::default());
+        let before_tick = state.tick;
+        let next_piece = state.bag_manager.peek(1);
+
+        assert!(state.ticks_to_lock > 0);
+
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                hard_drop: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.tick, before_tick);
+        assert_eq!(occupied_cells(&state.grid_locked), 4);
+        assert_eq!(state.active_piece.name, next_piece.name);
+        assert_eq!(state.active_piece_row, 1);
+        assert_eq!(state.ticks_to_lock, LOCK_DELAY_TICKS);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+        assert!(!state.has_touched_ground);
+        assert_eq!(state.score, 0);
+    }
+}
+
+#[test]
+fn sampled_rotation_after_the_contact_deadline_applies_only_to_the_successor() {
+    let high_scores = HighScoreManager::new();
+    let mut state = state_on_floor(&high_scores, pieces::O, 0);
+    let next_piece = state.bag_manager.peek(1);
+    state.update_with_elapsed(
+        Duration::from_millis(500),
+        GameInput {
+            rotate_right: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(state.tick, 120);
+    assert_eq!(occupied_cells(&state.grid_locked), 4);
+    assert_eq!(state.active_piece.name, next_piece.name);
+    assert_eq!(state.active_piece_orientation, 1);
+    assert_eq!(state.fall_progress, 0.0);
+    assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+    assert!(!state.has_touched_ground);
+    assert_eq!(state.score, 0);
+}
+
+#[test]
+fn exhausted_instant_actions_stop_at_top_out_before_following_input() {
+    let high_scores = HighScoreManager::new();
+
+    for rotate in [false, true] {
+        let mut state = state_on_floor(&high_scores, pieces::O, 0);
+
+        for _ in 1..RESET_MOVES {
+            state.update_with_elapsed(
+                Duration::ZERO,
+                GameInput {
+                    rotate_right: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let next_piece = block_next_spawn(&mut state);
+        state.update_with_elapsed(
+            Duration::ZERO,
+            GameInput {
+                rotate_right: rotate,
+                hard_drop: rotate,
+                shift_left: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(state.is_game_over);
+        assert_eq!(state.tick, 0);
+        assert_eq!(state.active_piece.name, next_piece.name);
+        assert_eq!(state.active_piece_row, 1);
+        assert_eq!(state.active_piece_col, next_piece.get_initial_col());
+        assert_eq!(state.active_piece_orientation, 0);
+        assert_eq!(state.score, 0);
+        assert_eq!(occupied_cells(&state.grid_locked), 5);
+        assert_eq!(occupied_cells(&state.grid_active), 0);
+        assert_eq!(occupied_cells(&state.grid_ghost), 0);
+    }
+}
+
+#[test]
 fn das_and_arr_fire_at_the_same_ticks_at_every_frame_rate() {
     let high_scores = HighScoreManager::new();
     let held_input = GameInput {
@@ -394,7 +1105,8 @@ fn das_and_arr_fire_at_the_same_ticks_at_every_frame_rate() {
             assert_eq!(state.tick, ticks as usize);
             assert_eq!(state.active_piece_col, initial_col + moves);
             assert_eq!(state.ticks_to_repeat, repeat_remaining);
-            assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES - moves);
+            assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+            assert!(!state.has_touched_ground);
         }
     }
 }
@@ -489,6 +1201,8 @@ fn rotation_presses_execute_once_with_zero_or_many_elapsed_ticks() {
 
         assert_eq!(state.active_piece_orientation, 1);
         assert_eq!(state.active_piece_row, 1 + fallen_rows);
+        assert_eq!(state.lock_reset_moves_remaining, RESET_MOVES);
+        assert!(!state.has_touched_ground);
 
         state.update_with_elapsed(Duration::ZERO, GameInput::default());
         state.update_with_elapsed(Duration::from_millis(50), GameInput::default());
@@ -761,22 +1475,12 @@ fn catch_up_stops_at_top_out_before_later_ticks_or_newly_sampled_actions() {
     state.active_piece_row = 20;
     state.active_piece_col = 0;
     state.fall_progress = f64::from(TICKS_PER_SECOND);
+
+    let next_piece = block_next_spawn(&mut state);
+    state.update_with_elapsed(Duration::ZERO, GameInput::default());
     state.ticks_to_lock = 1;
 
-    let next_piece = state.bag_manager.peek(1);
-    let (canvas, height, width) = next_piece.get_blocks(0);
-    let (row, col) = (0..height)
-        .find_map(|row| {
-            (0..width)
-                .find(|&col| canvas[row][col].is_some())
-                .map(|col| (row + 1, col + next_piece.get_initial_col() as usize))
-        })
-        .expect("every piece has an occupied spawn cell");
-    state
-        .grid_locked
-        .set_cell(row, col, Some(Block::new(WHITE)));
-    state.update_with_elapsed(Duration::ZERO, GameInput::default());
-
+    assert!(state.has_touched_ground);
     assert_eq!(occupied_cells(&state.grid_active), 4);
     assert_eq!(occupied_cells(&state.grid_ghost), 4);
 

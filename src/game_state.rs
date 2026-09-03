@@ -22,7 +22,7 @@ const SOFT_DROP_ROWS_PER_SECOND: f64 = 30.0;
 const REPEAT_DELAY_TICKS: isize = 44; // 183.333ms before repeating horizontal movement.
 const REPEAT_INTERVAL_TICKS: isize = 16; // 66.667ms, or 15 repeats per second.
 const LOCK_DELAY_TICKS: isize = 120; // 500ms before the active piece locks.
-const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before lock delay can no longer be reset.
+const RESET_MOVES: isize = 15; // Successful post-contact moves per lowest row before grounded lock.
 const EFFECT_TICK_INTERVAL: usize = TICKS_PER_SECOND as usize / 60;
 const LOCK_IMPACT_TICKS: usize = 10 * EFFECT_TICK_INTERVAL;
 const LINE_CLEAR_EFFECT_TICKS: usize = 40 * EFFECT_TICK_INTERVAL;
@@ -145,6 +145,9 @@ pub struct GameState<'a> {
     ticks_to_repeat: isize,
     ticks_to_lock: isize,
     lock_reset_moves_remaining: isize,
+    has_touched_ground: bool,
+    // Lowest rotation-stable reference row reached by this piece, not its canvas origin.
+    lowest_piece_row: isize,
     shift_direction: ShiftDirection,
     held_piece: Option<Piece>,
     last_piece_swapped: bool,
@@ -213,6 +216,9 @@ impl<'a> GameState<'a> {
             ticks_to_repeat: REPEAT_DELAY_TICKS,
             ticks_to_lock: LOCK_DELAY_TICKS,
             lock_reset_moves_remaining: RESET_MOVES,
+            has_touched_ground: false,
+            lowest_piece_row: active_piece_row
+                - active_piece.orientations[active_piece_orientation].offsets[0].1,
             shift_direction: ShiftDirection::Neither,
             held_piece: None,
             last_piece_swapped: false,
@@ -249,6 +255,8 @@ impl<'a> GameState<'a> {
         self.last_piece_swapped = false;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
         self.lock_reset_moves_remaining = RESET_MOVES;
+        self.has_touched_ground = false;
+        self.lowest_piece_row = self.lock_reference_row();
         self.refresh_cached_blocks();
     }
 
@@ -260,10 +268,42 @@ impl<'a> GameState<'a> {
         self.piece_dirty = true;
     }
 
+    fn lock_reference_row(&self) -> isize {
+        // SRS test zero includes the I/O canvas-origin correction. Removing it
+        // keeps pure rotations at the same height; real kicks still translate it.
+        self.active_piece_row
+            - self.active_piece.orientations[self.active_piece_orientation].offsets[0].1
+    }
+
+    fn update_lock_contact(&mut self) -> bool {
+        let row = self.lock_reference_row();
+        if row > self.lowest_piece_row {
+            self.lowest_piece_row = row;
+            self.lock_reset_moves_remaining = RESET_MOVES;
+            self.ticks_to_lock = LOCK_DELAY_TICKS;
+        }
+
+        let grounded = self.collide(Some(self.active_piece_row + 1), None, None);
+        if grounded && !self.has_touched_ground {
+            self.has_touched_ground = true;
+            self.ticks_to_lock = LOCK_DELAY_TICKS;
+        }
+
+        grounded
+    }
+
     fn try_reset_lock_delay_for_move(&mut self) {
-        if self.lock_reset_moves_remaining > 0 {
+        if self.has_touched_ground && self.lock_reset_moves_remaining > 0 {
             self.lock_reset_moves_remaining -= 1;
             self.ticks_to_lock = LOCK_DELAY_TICKS;
+        }
+    }
+
+    fn lock_if_due(&mut self) {
+        if self.update_lock_contact()
+            && (self.ticks_to_lock <= 0 || self.lock_reset_moves_remaining <= 0)
+        {
+            self.lock_active_piece_and_get_next();
         }
     }
 
@@ -306,7 +346,10 @@ impl<'a> GameState<'a> {
 
         if is_block_out {
             self.end_game();
+            return;
         }
+
+        self.update_lock_contact();
     }
 
     fn next_piece(&mut self) {
@@ -540,13 +583,6 @@ impl<'a> GameState<'a> {
         }
     }
 
-    fn set_active_piece_row_and_reset_ticks(&mut self, new_active_piece_row: isize) {
-        self.active_piece_row = new_active_piece_row;
-        self.lock_reset_moves_remaining = RESET_MOVES;
-        self.ticks_to_lock = LOCK_DELAY_TICKS;
-        self.piece_dirty = true;
-    }
-
     fn try_gravity_drop(&mut self, is_soft_drop: bool) {
         let natural_rows_per_second = self.get_gravity() * ROWS_PER_SECOND_PER_G;
         let rows_per_second = if is_soft_drop {
@@ -563,17 +599,6 @@ impl<'a> GameState<'a> {
                 // Keep one pending row so a blocked fall is retried each tick,
                 // but never bank a burst of fall distance against a surface.
                 self.fall_progress = TICKS_PER_SECOND as f64;
-                self.ticks_to_lock -= 1;
-
-                // TODO: Need to mitigate "stalling" with certain pieces that can floor kick, as the gravity drop
-                // will reset the move counter and allow for infinite stalling.
-                // Tetra Legends seems to store the row at which contact was last made, and only reset the move
-                // counter when the piece descends below that row. This allows for spinning out of cliffs, but
-                // prevents stalling at a given row.
-                if self.ticks_to_lock <= 0 {
-                    self.lock_active_piece_and_get_next();
-                }
-
                 return;
             }
 
@@ -583,7 +608,8 @@ impl<'a> GameState<'a> {
                 self.score += 1;
             }
 
-            self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
+            self.active_piece_row = next_active_piece_row;
+            self.piece_dirty = true;
         }
     }
 
@@ -640,8 +666,14 @@ impl<'a> GameState<'a> {
             }
         }
 
+        self.update_lock_contact();
+
         if input.rotate_right {
             self.try_rotate_right();
+            self.lock_if_due();
+            if self.is_game_over {
+                return;
+            }
         }
 
         if input.hard_drop {
@@ -652,11 +684,21 @@ impl<'a> GameState<'a> {
         }
 
         self.try_move_horizontal(input.shift_left, input.shift_right, 0);
+        self.lock_if_due();
+        if self.is_game_over {
+            return;
+        }
 
         self.refresh_piece_grids();
     }
 
     fn step_tick(&mut self) {
+        // Charge the interval that began in contact, before movement can reset
+        // it. A piece landing later in this tick receives the full 120 ticks.
+        if self.update_lock_contact() {
+            self.ticks_to_lock -= 1;
+        }
+
         self.tick += 1;
         self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(1);
         self.clear_effect_ticks_remaining = self.clear_effect_ticks_remaining.saturating_sub(1);
@@ -673,6 +715,7 @@ impl<'a> GameState<'a> {
         let input = self.held_input;
         self.try_move_horizontal(input.shift_left, input.shift_right, 1);
         self.try_gravity_drop(input.soft_drop);
+        self.lock_if_due();
     }
 
     fn refresh_piece_grids(&mut self) {
