@@ -13,20 +13,22 @@ use crate::{
 };
 use macroquad::prelude::{Color, Vec3};
 use rand::Rng;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const TICKS_PER_SECOND: f32 = 60.0;
-const INITIAL_GRAVITY: f32 = 1.0 / 60.0; // 1/60G. 1 row per 60 ticks (1 second)
-const G_SOFT_DROP: f32 = 30.0 / 60.0; // 1/2G. 30 rows per 60 ticks (1 second)
-const REPEAT_DELAY_TICKS: isize = 11; // ~183ms. Delay before repeating horizontal movement.
-const REPEAT_INTERVAL_TICKS: isize = 4; // ~67ms, or 15 times per second. Repeat interval for horizontal movement.
-const LOCK_DELAY_TICKS: isize = 30; // 30 ticks, 500ms. Delay after which the active piece is locked in place.
+const TICKS_PER_SECOND: u32 = 240;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const ROWS_PER_SECOND_PER_G: f64 = 60.0;
+const SOFT_DROP_ROWS_PER_SECOND: f64 = 30.0;
+const REPEAT_DELAY_TICKS: isize = 44; // 183.333ms before repeating horizontal movement.
+const REPEAT_INTERVAL_TICKS: isize = 16; // 66.667ms, or 15 repeats per second.
+const LOCK_DELAY_TICKS: isize = 120; // 500ms before the active piece locks.
 const RESET_MOVES: isize = 15; // Number of shifts or rotations allowed before lock delay can no longer be reset.
-const LOCK_IMPACT_TICKS: usize = 10;
-const LINE_CLEAR_EFFECT_TICKS: usize = 40;
+const EFFECT_TICK_INTERVAL: usize = TICKS_PER_SECOND as usize / 60;
+const LOCK_IMPACT_TICKS: usize = 10 * EFFECT_TICK_INTERVAL;
+const LINE_CLEAR_EFFECT_TICKS: usize = 40 * EFFECT_TICK_INTERVAL;
 const MAX_IMPACT_CONTACTS: usize = 4;
-const HARD_DROP_TRAIL_TICKS: usize = 9;
-const LEVEL_FLARE_TICKS: usize = 45;
+const HARD_DROP_TRAIL_TICKS: usize = 9 * EFFECT_TICK_INTERVAL;
+const LEVEL_FLARE_TICKS: usize = 45 * EFFECT_TICK_INTERVAL;
 
 /// The path a hard-dropped piece just travelled, so the renderer can streak
 /// it. Rows are grid rows of the piece's canvas origin, before and after the
@@ -101,7 +103,7 @@ fn impact_contact_origins(
     (contacts, contact_count)
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GameInput {
     pub soft_drop: bool,
     pub shift_left: bool,
@@ -128,12 +130,18 @@ pub struct GameState<'a> {
     active_piece: Piece,
     score: usize,
     tick: usize,
-    last_tick: usize,
-    start: Instant,
+    last_update: Instant,
+    // Nanoseconds scaled by the tick rate; one tick costs NANOS_PER_SECOND.
+    // Keeping the remainder avoids rounding 1/240 second to whole nanoseconds.
+    tick_accumulator: u128,
+    // Only continuous keys are stored; sampled presses execute once immediately.
+    held_input: GameInput,
     active_piece_col: isize,
     active_piece_row: isize,
     active_piece_orientation: usize,
-    ticks_to_next_row_inc: isize,
+    // Fall distance in 1/TICKS_PER_SECOND cells. At level 1, adding exactly
+    // one unit per tick avoids floating-point drift at the one-second boundary.
+    fall_progress: f64,
     ticks_to_repeat: isize,
     ticks_to_lock: isize,
     lock_reset_moves_remaining: isize,
@@ -179,13 +187,9 @@ impl<'a> GameState<'a> {
         let active_piece = bag_manager.next();
         let score: usize = 0;
         let tick: usize = 0;
-        let last_tick: usize = 0;
         let active_piece_col = active_piece.get_initial_col();
         let active_piece_row = 1;
         let active_piece_orientation: usize = 0;
-        let gravity: f32 = INITIAL_GRAVITY;
-        let ticks_to_next_row_inc: isize = (1.0 / gravity).ceil() as isize;
-        let start = Instant::now();
 
         // Initialize cached blocks
         let (cached_blocks, cached_bounds_height, cached_bounds_width) =
@@ -199,12 +203,13 @@ impl<'a> GameState<'a> {
             active_piece,
             score,
             tick,
-            last_tick,
-            start,
+            last_update: Instant::now(),
+            tick_accumulator: 0,
+            held_input: GameInput::default(),
             active_piece_col,
             active_piece_row,
             active_piece_orientation,
-            ticks_to_next_row_inc,
+            fall_progress: 0.0,
             ticks_to_repeat: REPEAT_DELAY_TICKS,
             ticks_to_lock: LOCK_DELAY_TICKS,
             lock_reset_moves_remaining: RESET_MOVES,
@@ -236,29 +241,11 @@ impl<'a> GameState<'a> {
         }
     }
 
-    pub fn clean_up(&mut self) {
-        if self.is_game_over || self.is_paused {
-            return;
-        }
-
-        self.last_tick = self.tick;
-    }
-
-    /// Returns the number of ticks elapsed between the last rendered tick and the current one.
-    /// At 60fps or higher, this should be either 1 or 0. It may be more than 1 at lower frame rates.
-    fn get_tick_delta(&self) -> usize {
-        self.tick - self.last_tick
-    }
-
-    fn get_new_ticks_to_next_row_inc(&self) -> isize {
-        (1.0 / self.get_gravity()).ceil() as isize
-    }
-
     fn reset_piece_state(&mut self) {
         self.active_piece_orientation = 0;
         self.active_piece_col = self.active_piece.get_initial_col();
         self.active_piece_row = 1;
-        self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
+        self.fall_progress = 0.0;
         self.last_piece_swapped = false;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
         self.lock_reset_moves_remaining = RESET_MOVES;
@@ -281,7 +268,6 @@ impl<'a> GameState<'a> {
     }
 
     fn end_game(&mut self) {
-        self.clean_up();
         self.is_game_over = true;
         self.grid_active.clear();
         self.grid_ghost.clear();
@@ -290,14 +276,15 @@ impl<'a> GameState<'a> {
     }
 
     pub fn toggle_pause(&mut self) {
-        if self.is_paused {
-            self.tick = 0;
-            self.last_tick = 0;
-            self.start = Instant::now();
-            self.is_paused = false;
-        } else {
-            self.is_paused = true;
+        if self.is_game_over {
+            return;
         }
+
+        self.is_paused = !self.is_paused;
+
+        // The pause menu can resume outside update(). Exclude paused wall time
+        // while preserving the simulation's tick phase and partial tick.
+        self.last_update = Instant::now();
     }
 
     /// Check if the active piece, if it were locked, would be entirely outside the visible bounds of the playfield.
@@ -406,20 +393,12 @@ impl<'a> GameState<'a> {
 
         // Longer drops land with a little more visual weight, while the cap
         // keeps the pulse brief enough not to distract from the next piece.
-        self.impact_ticks_remaining =
-            (LOCK_IMPACT_TICKS + lines_dropped as usize).min(LOCK_IMPACT_TICKS + 12);
+        let drop_impact_ticks = (lines_dropped as usize).min(12) * EFFECT_TICK_INTERVAL;
+        self.impact_ticks_remaining = LOCK_IMPACT_TICKS + drop_impact_ticks;
 
         self.score += 2 * lines_dropped as usize;
 
         self.lock_active_piece_and_get_next();
-    }
-
-    fn get_next_active_piece_row(&self) -> isize {
-        if self.ticks_to_next_row_inc <= 0 {
-            self.active_piece_row + 1
-        } else {
-            self.active_piece_row
-        }
     }
 
     fn collide(
@@ -491,8 +470,12 @@ impl<'a> GameState<'a> {
         self.shift_direction = new_shift_direction;
     }
 
-    fn try_move_horizontal(&mut self, is_shift_left: bool, is_shift_right: bool) {
-        let tick_delta = self.get_tick_delta();
+    fn try_move_horizontal(
+        &mut self,
+        is_shift_left: bool,
+        is_shift_right: bool,
+        elapsed_ticks: isize,
+    ) {
         let mut col_offset = 0;
 
         if !is_shift_left && !is_shift_right {
@@ -507,7 +490,7 @@ impl<'a> GameState<'a> {
                         col_offset = 1;
                     }
                 } else {
-                    self.ticks_to_repeat -= tick_delta as isize;
+                    self.ticks_to_repeat -= elapsed_ticks;
                 }
             }
 
@@ -518,7 +501,7 @@ impl<'a> GameState<'a> {
                         col_offset = -1;
                     }
                 } else {
-                    self.ticks_to_repeat -= tick_delta as isize;
+                    self.ticks_to_repeat -= elapsed_ticks;
                 }
             }
 
@@ -559,21 +542,28 @@ impl<'a> GameState<'a> {
 
     fn set_active_piece_row_and_reset_ticks(&mut self, new_active_piece_row: isize) {
         self.active_piece_row = new_active_piece_row;
-        self.ticks_to_next_row_inc = self.get_new_ticks_to_next_row_inc();
         self.lock_reset_moves_remaining = RESET_MOVES;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
         self.piece_dirty = true;
     }
 
     fn try_gravity_drop(&mut self, is_soft_drop: bool) {
-        let next_active_piece_row = self.get_next_active_piece_row();
+        let natural_rows_per_second = self.get_gravity() * ROWS_PER_SECOND_PER_G;
+        let rows_per_second = if is_soft_drop {
+            natural_rows_per_second.max(SOFT_DROP_ROWS_PER_SECOND)
+        } else {
+            natural_rows_per_second
+        };
+        self.fall_progress += rows_per_second;
 
-        // Vertical collision check
-        if next_active_piece_row != self.active_piece_row {
+        while self.fall_progress >= TICKS_PER_SECOND as f64 {
+            let next_active_piece_row = self.active_piece_row + 1;
             let has_collision = self.collide(Some(next_active_piece_row), None, None);
-
             if has_collision {
-                self.ticks_to_lock -= self.get_tick_delta() as isize;
+                // Keep one pending row so a blocked fall is retried each tick,
+                // but never bank a burst of fall distance against a surface.
+                self.fall_progress = TICKS_PER_SECOND as f64;
+                self.ticks_to_lock -= 1;
 
                 // TODO: Need to mitigate "stalling" with certain pieces that can floor kick, as the gravity drop
                 // will reset the move counter and allow for infinite stalling.
@@ -583,52 +573,56 @@ impl<'a> GameState<'a> {
                 if self.ticks_to_lock <= 0 {
                     self.lock_active_piece_and_get_next();
                 }
-            } else {
-                if is_soft_drop {
-                    self.score += 1;
-                }
 
-                self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
+                return;
             }
+
+            self.fall_progress -= TICKS_PER_SECOND as f64;
+
+            if is_soft_drop {
+                self.score += 1;
+            }
+
+            self.set_active_piece_row_and_reset_ticks(next_active_piece_row);
         }
     }
 
     pub fn update(&mut self, input: GameInput) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update);
+        self.last_update = now;
+
+        self.update_with_elapsed(elapsed, input);
+    }
+
+    /// Elapsed time precedes this input sample. Catch up using the previous
+    /// held keys, then apply new presses once, even when no tick is due.
+    /// This deterministic entry point never reads the wall clock.
+    fn update_with_elapsed(&mut self, elapsed: Duration, input: GameInput) {
         if self.is_game_over {
             return;
         }
 
+        if !self.is_paused {
+            self.tick_accumulator += elapsed.as_nanos() * u128::from(TICKS_PER_SECOND);
+
+            while self.tick_accumulator >= NANOS_PER_SECOND {
+                self.tick_accumulator -= NANOS_PER_SECOND;
+                self.step_tick();
+                if self.is_game_over {
+                    return;
+                }
+            }
+        }
+
         if input.toggle_pause {
-            self.toggle_pause();
+            self.is_paused = !self.is_paused;
         }
 
         if self.is_paused {
+            self.refresh_piece_grids();
             return;
         }
-
-        self.tick = (self.start.elapsed().as_secs_f32() * TICKS_PER_SECOND).floor() as usize;
-
-        let tick_delta = self.get_tick_delta();
-        self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(tick_delta);
-        self.clear_effect_ticks_remaining =
-            self.clear_effect_ticks_remaining.saturating_sub(tick_delta);
-        self.hard_drop_trail_ticks_remaining =
-            self.hard_drop_trail_ticks_remaining.saturating_sub(tick_delta);
-        self.level_flare_ticks_remaining =
-            self.level_flare_ticks_remaining.saturating_sub(tick_delta);
-
-        if tick_delta > 0 {
-            let dt = (tick_delta as f32 / TICKS_PER_SECOND).min(0.1);
-            self.update_shrapnel(dt);
-        }
-
-        let speed_modifier = if input.soft_drop {
-            (G_SOFT_DROP / self.get_gravity()).ceil().max(1.0) as usize
-        } else {
-            1
-        };
-
-        self.ticks_to_next_row_inc -= (self.get_tick_delta() * speed_modifier) as isize;
 
         if input.hold_piece {
             self.swap_active_piece();
@@ -648,43 +642,66 @@ impl<'a> GameState<'a> {
             }
         }
 
-        // Try and move the piece horizontally,
-        self.try_move_horizontal(input.shift_left, input.shift_right);
+        self.held_input = GameInput {
+            soft_drop: input.soft_drop,
+            shift_left: input.shift_left,
+            shift_right: input.shift_right,
+            ..Default::default()
+        };
+        self.try_move_horizontal(input.shift_left, input.shift_right, 0);
 
-        // Drop the piece, or lock it if dropping would cause a collision.
+        self.refresh_piece_grids();
+    }
+
+    fn step_tick(&mut self) {
+        self.tick += 1;
+        self.impact_ticks_remaining = self.impact_ticks_remaining.saturating_sub(1);
+        self.clear_effect_ticks_remaining = self.clear_effect_ticks_remaining.saturating_sub(1);
+        self.hard_drop_trail_ticks_remaining =
+            self.hard_drop_trail_ticks_remaining.saturating_sub(1);
+        self.level_flare_ticks_remaining = self.level_flare_ticks_remaining.saturating_sub(1);
+
+        // Keep the debris integrator and its per-step drag at the original
+        // 60 Hz. A slow render frame still runs every owed physics step.
+        if self.tick % EFFECT_TICK_INTERVAL == 0 {
+            self.update_shrapnel(1.0 / 60.0);
+        }
+
+        let input = self.held_input;
+        self.try_move_horizontal(input.shift_left, input.shift_right, 1);
         self.try_gravity_drop(input.soft_drop);
-        if self.is_game_over {
+    }
+
+    fn refresh_piece_grids(&mut self) {
+        if !self.piece_dirty {
             return;
         }
 
-        // Only update grids if piece state changed
-        if self.piece_dirty {
-            self.grid_active.clear().set_cells(
-                self.active_piece_row,
-                self.active_piece_col,
-                &self.cached_blocks,
-                self.cached_bounds_height,
-                self.cached_bounds_width,
-            );
+        self.grid_active.clear().set_cells(
+            self.active_piece_row,
+            self.active_piece_col,
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
+        );
 
-            self.cached_ghost_row = self.grid_locked.find_landing_row(
-                self.active_piece_row,
-                self.active_piece_col,
-                &self.cached_blocks,
-                self.cached_bounds_height,
-                self.cached_bounds_width,
-            );
+        self.cached_ghost_row = self.grid_locked.find_landing_row(
+            self.active_piece_row,
+            self.active_piece_col,
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
+        );
 
-            self.grid_ghost.clear().set_cells(
-                self.cached_ghost_row,
-                self.active_piece_col,
-                &self.cached_blocks,
-                self.cached_bounds_height,
-                self.cached_bounds_width,
-            );
+        self.grid_ghost.clear().set_cells(
+            self.cached_ghost_row,
+            self.active_piece_col,
+            &self.cached_blocks,
+            self.cached_bounds_height,
+            self.cached_bounds_width,
+        );
 
-            self.piece_dirty = false;
-        }
+        self.piece_dirty = false;
     }
 
     fn increase_rows_cleared(&mut self, new_rows_cleared: usize) {
@@ -1005,13 +1022,13 @@ impl<'a> GameState<'a> {
         (self.rows_cleared / 10 + 1).min(20)
     }
 
-    pub fn get_gravity(&self) -> f32 {
+    pub fn get_gravity(&self) -> f64 {
         let level = self.get_level();
-        let gravity_seconds = (0.8 - ((level - 1) as f32 * 0.007)).powi(level as i32 - 1);
-        let gravity_ticks_per_row = 1.0 / gravity_seconds;
-        let gravity = gravity_ticks_per_row / 60.0;
+        let gravity_seconds = (0.8 - ((level - 1) as f64 * 0.007)).powi(level as i32 - 1);
+        let rows_per_second = 1.0 / gravity_seconds;
+        let gravity = rows_per_second / ROWS_PER_SECOND_PER_G;
 
-        // Cap at 1G, or 1 row per tick.
+        // Cap at conventional 1G (60 rows per second), not one row per new tick.
         gravity.min(1.0)
     }
 
@@ -1036,7 +1053,8 @@ impl<'a> GameState<'a> {
     }
 
     pub fn get_impact_effect(&self) -> f32 {
-        self.impact_ticks_remaining as f32 / (LOCK_IMPACT_TICKS + 12) as f32
+        self.impact_ticks_remaining as f32
+            / (LOCK_IMPACT_TICKS + 12 * EFFECT_TICK_INTERVAL) as f32
     }
 
     pub fn get_clear_effect(&self) -> (usize, f32) {

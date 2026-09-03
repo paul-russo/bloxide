@@ -104,7 +104,7 @@ fn is_screenshot_run() -> bool {
     std::env::args().any(|arg| arg == "--screenshot")
 }
 
-/// Clock step per frame in a screenshot run, matching the game's tick rate.
+/// Clock step per frame in a screenshot run, retaining the 60 Hz capture cadence.
 /// Time-driven effects are sampled at these fixed moments rather than the wall
 /// clock, so a capture of frame N is reproducible.
 const SCREENSHOT_FRAME_SECONDS: f64 = 1.0 / 60.0;
@@ -326,8 +326,6 @@ async fn main() {
                 game_state.draw(&frame);
                 menu_game_over.draw(&frame);
                 menu_paused.draw(&frame);
-
-                game_state.clean_up();
             }
             None => {
                 // The empty well is drawn behind the main menu so the 3D
