@@ -191,7 +191,7 @@ impl<'a> GameState<'a> {
         let score: usize = 0;
         let tick: usize = 0;
         let active_piece_col = active_piece.get_initial_col();
-        let active_piece_row = 1;
+        let active_piece_row = active_piece.get_initial_row();
         let active_piece_orientation: usize = 0;
 
         // Initialize cached blocks
@@ -250,7 +250,7 @@ impl<'a> GameState<'a> {
     fn reset_piece_state(&mut self) {
         self.active_piece_orientation = 0;
         self.active_piece_col = self.active_piece.get_initial_col();
-        self.active_piece_row = 1;
+        self.active_piece_row = self.active_piece.get_initial_row();
         self.fall_progress = 0.0;
         self.last_piece_swapped = false;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
@@ -1181,22 +1181,32 @@ mod rules_tests;
 #[cfg(test)]
 mod tests {
     use super::impact_contact_origins;
-    use crate::{block::Block, grid::Grid, piece::BlockCanvas};
+    use crate::{
+        block::Block,
+        grid::{
+            Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS, VISIBLE_GRID_COUNT_ROWS,
+        },
+        piece::BlockCanvas,
+    };
     use macroquad::prelude::WHITE;
 
     #[test]
     fn rotated_l_reports_each_contact_on_a_stepped_stack() {
         let mut locked = Grid::new();
         let block = Some(Block::new(WHITE));
+        let active_row = FIRST_VISIBLE_ROW_ID as isize + 8;
+        let upper_support = active_row as usize + 1;
+        let lower_support = active_row as usize + 2;
+
         // Supporting bed:
         //    [e][f]
         // [g][h][i]
         locked
-            .set_cell(11, 4, block)
-            .set_cell(11, 5, block)
-            .set_cell(12, 3, block)
-            .set_cell(12, 4, block)
-            .set_cell(12, 5, block);
+            .set_cell(upper_support, 4, block)
+            .set_cell(upper_support, 5, block)
+            .set_cell(lower_support, 3, block)
+            .set_cell(lower_support, 4, block)
+            .set_cell(lower_support, 5, block);
 
         // Clockwise-rotated L:
         // [a][b][c]
@@ -1207,12 +1217,17 @@ mod tests {
         canvas[0][2] = block;
         canvas[1][0] = block;
 
-        let (contacts, contact_count) = impact_contact_origins(&locked, 10, 3, &canvas, 2, 3);
+        let (contacts, contact_count) =
+            impact_contact_origins(&locked, active_row, 3, &canvas, 2, 3);
 
         assert_eq!(contact_count, 3);
         assert_eq!(
             &contacts[..contact_count],
-            &[(4.5, 11.0), (5.5, 11.0), (3.5, 12.0)]
+            &[
+                (4.5, upper_support as f32),
+                (5.5, upper_support as f32),
+                (3.5, lower_support as f32),
+            ]
         );
     }
 
@@ -1222,8 +1237,10 @@ mod tests {
         let mut game_state = super::GameState::new(&high_score_manager);
 
         // Fill bottom-most visible row (1-line clear)
-        for col in 0..crate::grid::GRID_COUNT_COLS {
-            game_state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+        for col in 0..GRID_COUNT_COLS {
+            game_state
+                .grid_locked
+                .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
         }
 
         game_state.clear_filled_rows_and_update_score();
@@ -1249,9 +1266,12 @@ mod tests {
         let high_score_manager = crate::high_score_manager::HighScoreManager::new();
         let mut game_state = super::GameState::new(&high_score_manager);
 
-        for col in 0..crate::grid::GRID_COUNT_COLS {
-            game_state.grid_locked.set_cell(21, col, Some(Block::new(WHITE)));
+        for col in 0..GRID_COUNT_COLS {
+            game_state
+                .grid_locked
+                .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
         }
+
         game_state.clear_filled_rows_and_update_score();
         assert!(game_state.get_lava_splashes().iter().all(|splash| !splash.active));
 
@@ -1288,8 +1308,8 @@ mod tests {
         let mut game_state = super::GameState::new(&high_score_manager);
 
         // Fill bottom 4 visible rows (4-line clear / Carnage)
-        for row in 18..=21 {
-            for col in 0..crate::grid::GRID_COUNT_COLS {
+        for row in GRID_COUNT_ROWS - 4..GRID_COUNT_ROWS {
+            for col in 0..GRID_COUNT_COLS {
                 game_state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
             }
         }
@@ -1316,9 +1336,12 @@ mod tests {
     fn line_clears_report_which_visible_rows_went() {
         let high_score_manager = crate::high_score_manager::HighScoreManager::new();
         let mut game_state = super::GameState::new(&high_score_manager);
+        let visible_rows = [VISIBLE_GRID_COUNT_ROWS - 3, VISIBLE_GRID_COUNT_ROWS - 1];
 
-        for row in [19, 21] {
-            for col in 0..crate::grid::GRID_COUNT_COLS {
+        for visible_row in visible_rows {
+            let row = FIRST_VISIBLE_ROW_ID + visible_row;
+
+            for col in 0..GRID_COUNT_COLS {
                 game_state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
             }
         }
@@ -1326,8 +1349,8 @@ mod tests {
         assert_eq!(game_state.get_clear_row_mask(), 0);
         game_state.clear_filled_rows_and_update_score();
 
-        // Grid rows 19 and 21 are visible rows 17 and 19.
-        assert_eq!(game_state.get_clear_row_mask(), (1 << 17) | (1 << 19));
+        let expected_mask = visible_rows.iter().fold(0, |mask, &row| mask | (1 << row));
+        assert_eq!(game_state.get_clear_row_mask(), expected_mask);
     }
 
     #[test]
@@ -1353,14 +1376,20 @@ mod tests {
         let mut game_state = super::GameState::new(&high_score_manager);
         assert_eq!(game_state.get_danger(), 0.0);
 
-        game_state.grid_locked.set_cell(21, 0, Some(Block::new(WHITE)));
+        game_state
+            .grid_locked
+            .set_cell(GRID_COUNT_ROWS - 1, 0, Some(Block::new(WHITE)));
         assert_eq!(game_state.get_danger(), 0.0);
 
-        game_state.grid_locked.set_cell(5, 0, Some(Block::new(WHITE)));
+        game_state
+            .grid_locked
+            .set_cell(FIRST_VISIBLE_ROW_ID + 3, 0, Some(Block::new(WHITE)));
         let high = game_state.get_danger();
         assert!(high > 0.0 && high < 1.0);
 
-        game_state.grid_locked.set_cell(2, 0, Some(Block::new(WHITE)));
+        game_state
+            .grid_locked
+            .set_cell(FIRST_VISIBLE_ROW_ID, 0, Some(Block::new(WHITE)));
         assert_eq!(game_state.get_danger(), 1.0);
     }
 }
