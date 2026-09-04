@@ -121,6 +121,11 @@ fn screenshot_frame_from_args() -> usize {
         .unwrap_or(DEFAULT_FRAME)
 }
 
+/// `--lines=N` seeds the HUD counter only for rendering/performance harnesses.
+fn parse_harness_line_count(arg: &str) -> Option<usize> {
+    arg.strip_prefix("--lines=")?.parse().ok()
+}
+
 /// Seed a partially filled stack for screenshots. `Carnage` leaves the bottom
 /// rows complete so a line clear can be triggered; `Still` punches a column out
 /// so nothing is clearable and the stack simply sits there; `GameOver` piles
@@ -208,7 +213,13 @@ async fn main() {
         Some(HarnessScene::Menu) | None => {}
         Some(scene) => {
             current_screen = CurrentScreen::Game;
-            maybe_game_state = Some(seed_screenshot_state(scene, &high_score_manager));
+            let mut game_state = seed_screenshot_state(scene, &high_score_manager);
+
+            if let Some(lines) = std::env::args().find_map(|arg| parse_harness_line_count(&arg)) {
+                game_state.set_line_count_for_harness(lines);
+            }
+
+            maybe_game_state = Some(game_state);
         }
     }
 
@@ -379,8 +390,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        seed_screenshot_state, HarnessScene, HighScoreManager, FIRST_VISIBLE_ROW_ID,
-        GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS,
+        parse_harness_line_count, seed_screenshot_state, HarnessScene, HighScoreManager,
+        FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS,
     };
     use crate::grid::{Grid, GRID_COUNT_ROWS};
 
@@ -388,6 +399,52 @@ mod tests {
         (0..GRID_COUNT_COLS)
             .filter(|&col| grid.has_block_at_cell(row, col))
             .count()
+    }
+
+    #[test]
+    fn harness_line_count_parses_unsigned_values_without_changing_normal_arguments() {
+        for lines in [0, 100, 12_345, 99_999, usize::MAX] {
+            assert_eq!(
+                parse_harness_line_count(&format!("--lines={lines}")),
+                Some(lines)
+            );
+        }
+
+        for arg in [
+            "--lines",
+            "--lines=",
+            "--lines=-1",
+            "--lines=abc",
+            "--frame=100",
+            "--still",
+        ] {
+            assert_eq!(parse_harness_line_count(arg), None);
+        }
+    }
+
+    #[test]
+    fn harness_counter_override_preserves_score_board_and_piece_queue() {
+        let high_scores = HighScoreManager::new();
+        let mut state = seed_screenshot_state(HarnessScene::Still, &high_scores);
+        let occupied_before: Vec<_> = (0..GRID_COUNT_ROWS)
+            .map(|row| occupied_in_row(state.get_grid_locked(), row))
+            .collect();
+        let previews = state.get_piece_previews().map(|piece| piece.name);
+
+        for (lines, level) in [(100, 11), (99_999, 20), (usize::MAX, 20)] {
+            state.set_line_count_for_harness(lines);
+
+            assert_eq!(state.get_rows_cleared(), lines);
+            assert_eq!(state.get_level(), level);
+            assert_eq!(state.get_score(), 0);
+            assert_eq!(state.get_piece_previews().map(|piece| piece.name), previews);
+            assert_eq!(
+                (0..GRID_COUNT_ROWS)
+                    .map(|row| occupied_in_row(state.get_grid_locked(), row))
+                    .collect::<Vec<_>>(),
+                occupied_before
+            );
+        }
     }
 
     #[test]

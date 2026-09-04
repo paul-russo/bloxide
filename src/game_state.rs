@@ -1139,6 +1139,12 @@ impl<'a> GameState<'a> {
         self.end_game();
     }
 
+    /// Seed large HUD counters for screenshot/telemetry layout checks. This is
+    /// not a gameplay transition and does not award points or consume pieces.
+    pub fn set_line_count_for_harness(&mut self, lines: usize) {
+        self.rows_cleared = lines;
+    }
+
     pub fn get_grid_active(&self) -> &Grid {
         &self.grid_active
     }
@@ -1157,6 +1163,12 @@ impl<'a> GameState<'a> {
         }
 
         self.last_score_award
+    }
+
+    /// Remaining presentation lifetime, from one to zero. Using simulation
+    /// ticks rather than wall time freezes award animations while paused.
+    pub fn get_score_announcement_remaining(&self) -> f32 {
+        self.score_announcement_ticks_remaining as f32 / SCORE_ANNOUNCEMENT_TICKS as f32
     }
 
     pub fn get_rows_cleared(&self) -> usize {

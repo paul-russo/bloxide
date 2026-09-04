@@ -817,8 +817,10 @@ fn score_announcements_expire_after_two_playing_seconds_and_freeze_on_pause() {
     state.lock_active_piece_and_get_next();
     let shown = state.get_score_announcement().expect("Tetris award");
     assert_eq!(shown.total(), 800);
+    assert_eq!(state.get_score_announcement_remaining(), 1.0);
 
     state.update_with_elapsed(Duration::from_millis(500), GameInput::default());
+    assert_eq!(state.get_score_announcement_remaining(), 0.75);
     state.toggle_pause();
     let remaining = state.score_announcement_ticks_remaining;
     state.update_with_elapsed(
@@ -833,6 +835,7 @@ fn score_announcements_expire_after_two_playing_seconds_and_freeze_on_pause() {
 
     assert_eq!(state.get_score_announcement(), Some(shown));
     assert_eq!(state.score_announcement_ticks_remaining, remaining);
+    assert_eq!(state.get_score_announcement_remaining(), 0.75);
     assert_eq!(state.score, 800);
 
     state.update_with_elapsed(
@@ -849,10 +852,12 @@ fn score_announcements_expire_after_two_playing_seconds_and_freeze_on_pause() {
 
     assert_eq!(state.get_score_announcement(), Some(shown));
     assert_eq!(state.score_announcement_ticks_remaining, 1);
+    assert!(state.get_score_announcement_remaining() > 0.0);
 
     state.update_with_elapsed(Duration::from_nanos(1), GameInput::default());
 
     assert!(state.get_score_announcement().is_none());
+    assert_eq!(state.get_score_announcement_remaining(), 0.0);
     assert_eq!(state.tick, 2 * TICKS_PER_SECOND as usize);
 }
 

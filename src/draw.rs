@@ -189,11 +189,6 @@ impl Surface<'_> {
         self.fill(Rect::new(x1, y, x2 - x1, 1.0), color);
     }
 
-    /// One-pixel vertical rule down column `x`, from `y1` to `y2`.
-    fn vline(&self, x: f32, y1: f32, y2: f32, color: Color) {
-        self.fill(Rect::new(x, y1, 1.0, y2 - y1), color);
-    }
-
     /// A material tile over `rect`, showing the material from its top-left
     /// texel to `uv_max`, with a colour at each corner.
     fn tile(&self, rect: Rect, material: Material, uv_max: Vec2, colors: [Color; 4]) {
@@ -256,11 +251,9 @@ const COLOR_AMBER: Color = color_u8!(231, 148, 49, 255);
 const COLOR_TEXT: Color = color_u8!(242, 229, 193, 255);
 const COLOR_TEXT_MUTED: Color = color_u8!(169, 157, 121, 255);
 
-/// Horizontal/depth references for preview pieces. Their world-space `y` is
-/// derived from the card's screen-space content area so previews stay centred
-/// and padded even when the camera or panel layout changes.
+/// Horizontal/depth reference for HOLD. Its world-space `y` is derived from
+/// the card's padded screen-space content area.
 const HOLD_PREVIEW_REFERENCE: Vec3 = Vec3::new(-10.2, 0.0, 0.0);
-const NEXT_PREVIEW_REFERENCE: Vec3 = Vec3::new(10.2, 0.0, 0.0);
 
 /// Edge length of a preview block. Pieces outside the well are drawn smaller
 /// than playfield blocks so a 4-wide I piece fits the side panel.
@@ -270,7 +263,9 @@ const PREVIEW_SCALE: f32 = 0.74;
 const GAME_OVER_WASH: f32 = 0.7;
 
 const LABEL_TEXT_SIZE: f32 = 20.0;
-const STATS_TEXT_SIZE: f32 = 18.0;
+const LINE_COUNT_TEXT_SIZE: f32 = 28.0;
+const LINE_COUNT_COMPACT_TEXT_SIZE: f32 = 16.0;
+const CONTROL_TEXT_SIZE: f32 = 16.0;
 const MENU_TITLE_TEXT_SIZE: f32 = 42.0;
 const MENU_ITEM_TEXT_SIZE: f32 = 19.0;
 
@@ -292,14 +287,33 @@ const HUD_TOP_OFFSET: f32 = -6.0;
 const HUD_LOWER_OFFSET: f32 = 320.0;
 const HUD_HOLD_HEIGHT: f32 = 144.0;
 const HUD_NEXT_HEIGHT: f32 = 280.0;
-const HUD_LOWER_HEIGHT: f32 = 164.0;
+const NEXT_SLOT_COUNT: usize = 3;
 const HUD_HEADER_DIVIDER_OFFSET: f32 = 36.0;
 const HUD_PREVIEW_TOP_PADDING: f32 = 12.0;
 const HUD_PREVIEW_BOTTOM_PADDING: f32 = 12.0;
 const HUD_AWARD_GAP: f32 = 16.0;
 const AWARD_TEXT_SIZE: f32 = 16.0;
-const AWARD_FIRST_BASELINE: f32 = 58.0;
-const AWARD_LINE_PITCH: f32 = 20.0;
+const AWARD_POINTS_TEXT_SIZE: f32 = 28.0;
+const AWARD_CLEAR_BASELINE: f32 = 58.0;
+const AWARD_POINTS_BASELINE: f32 = 94.0;
+const AWARD_B2B_BASELINE: f32 = 112.0;
+const AWARD_COMBO_BASELINE: f32 = 130.0;
+const AWARD_BADGE_PIXELS: f32 = 10.0;
+const AWARD_METER_SEGMENTS: usize = 8;
+const AWARD_METER_HEIGHT: f32 = 2.0;
+const CONTROL_ROW_TOP: f32 = 48.0;
+const CONTROL_ROW_PITCH: f32 = 28.0;
+const CONTROL_KEY_HEIGHT: f32 = 22.0;
+const CONTROL_BOTTOM_PADDING: f32 = 8.0;
+const PROGRESS_PIP_SIZE: f32 = 5.0;
+const PROGRESS_PIP_GAP: f32 = 2.0;
+const CONTROL_ROWS: [(&str, &str, f32); 5] = [
+    ("L/R", "MOVE", 42.0),
+    ("Z/X", "ROTATE", 42.0),
+    ("SPACE", "DROP", 62.0),
+    ("C", "HOLD", 28.0),
+    ("ESC", "PAUSE", 42.0),
+];
 
 /// How the blocks of a grid should be rendered inside the well.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -611,6 +625,47 @@ struct HudLayout {
     score: Rect,
 }
 
+fn controls_panel_height() -> f32 {
+    let scale = hud_scale();
+    let last_row_top =
+        ((CONTROL_ROW_TOP + (CONTROL_ROWS.len() - 1) as f32 * CONTROL_ROW_PITCH) * scale).round();
+    let key_height = (CONTROL_KEY_HEIGHT * scale).round();
+
+    // Include the keycap's one-pixel drop shadow, the frame, and inner padding.
+    (last_row_top + key_height + 1.0 + PANEL_FRAME + CONTROL_BOTTOM_PADDING * scale).ceil()
+}
+
+/// Round the desired height up to fit equal, whole-pixel clear slots.
+fn next_panel_height() -> f32 {
+    // Reserve the header, one pixel per header/separator rule, and the bottom
+    // inner bevel and frame. The remaining height belongs entirely to slots.
+    let fixed_height =
+        HUD_HEADER_DIVIDER_OFFSET * hud_scale() + NEXT_SLOT_COUNT as f32 + PANEL_FRAME + 1.0;
+    let slot_height = (((HUD_NEXT_HEIGHT * hud_scale()).round() - fixed_height)
+        / NEXT_SLOT_COUNT as f32)
+        .ceil();
+
+    fixed_height + slot_height * NEXT_SLOT_COUNT as f32
+}
+
+/// Clear face rectangles, excluding the header/separator rules and inner bevel.
+/// Both preview centres and separator positions come from these slots.
+fn next_slot_rects(rect: Rect) -> [Rect; NEXT_SLOT_COUNT] {
+    let inset = PANEL_FRAME + 1.0;
+    let top = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale() + 1.0;
+    let bottom = rect.y + rect.h - inset;
+    let slot_height = (bottom - top - (NEXT_SLOT_COUNT - 1) as f32) / NEXT_SLOT_COUNT as f32;
+
+    std::array::from_fn(|index| {
+        Rect::new(
+            rect.x + inset,
+            top + index as f32 * (slot_height + 1.0),
+            rect.w - inset * 2.0,
+            slot_height,
+        )
+    })
+}
+
 fn hud_layout() -> HudLayout {
     let scale = hud_scale();
     let well = well_screen_rect();
@@ -622,6 +677,7 @@ fn hud_layout() -> HudLayout {
     let right_x = (well.x + well.w + side_gap).round();
     let award_top = (top_y + (HUD_HOLD_HEIGHT + HUD_AWARD_GAP) * scale).round();
     let award_bottom = (lower_y - HUD_AWARD_GAP * scale).round();
+    let lower_height = controls_panel_height();
 
     HudLayout {
         hold: Rect::new(
@@ -635,24 +691,15 @@ fn hud_layout() -> HudLayout {
             right_x,
             top_y,
             panel_width,
-            (HUD_NEXT_HEIGHT * scale).round(),
+            next_panel_height(),
         ),
-        controls: Rect::new(
-            left_x,
-            lower_y,
-            panel_width,
-            (HUD_LOWER_HEIGHT * scale).round(),
-        ),
-        stats: Rect::new(
-            right_x,
-            lower_y,
-            panel_width,
-            (HUD_LOWER_HEIGHT * scale).round(),
-        ),
+        controls: Rect::new(left_x, lower_y, panel_width, lower_height),
+        stats: Rect::new(right_x, lower_y, panel_width, lower_height),
         score: lintel_screen_rect(),
     }
 }
 
+/// HOLD's padded preview range; NEXT uses the actual clear-slot rectangles.
 fn preview_content_vertical_bounds(rect: Rect) -> (f32, f32) {
     let scale = hud_scale();
     (
@@ -682,51 +729,67 @@ fn hold_piece_anchor(layout: &HudLayout) -> Vec3 {
     )
 }
 
-fn next_piece_anchor(layout: &HudLayout, index: usize) -> Vec3 {
-    debug_assert!(index < 3);
-    let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
-    let slot_height = (content_bottom - content_top) / 3.0;
-    let target_y = content_top + slot_height * (index as f32 + 0.5);
-    preview_anchor_at_screen_y(NEXT_PREVIEW_REFERENCE, target_y.round())
+fn next_piece_anchor(layout: &HudLayout, index: usize, shake: Vec2) -> Vec3 {
+    debug_assert!(index < NEXT_SLOT_COUNT);
+    let slot = next_slot_rects(layout.next)[index];
+    ScreenPlane::new(0.0, shake).world(vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5))
 }
 
-/// Nameplate strip across the top of a panel face, with the label engraved
-/// into it and a rule underneath.
+fn header_band_height() -> f32 {
+    HUD_HEADER_DIVIDER_OFFSET * hud_scale() - PANEL_FRAME - 1.0
+}
+
+/// Both outer titles and inner section headers use identical typography,
+/// colour, horizontal inset, and positioning within their header strip.
+fn panel_header_text_origin(rect: Rect, top: f32) -> Vec2 {
+    let text_height = SMALL_GLYPH_HEIGHT * text_pixel(LABEL_TEXT_SIZE);
+
+    vec2(
+        rect.x + 16.0 * hud_scale(),
+        (top + (header_band_height() - text_height - 1.0) * 0.5 + text_height).floor(),
+    )
+}
+
 fn draw_panel_header(hud: &Surface, rect: Rect, label: &str) {
-    let scale = hud_scale();
+    draw_panel_header_at(hud, rect, label, rect.y + PANEL_FRAME + 1.0);
+}
+
+fn draw_panel_header_at(hud: &Surface, rect: Rect, label: &str, top: f32) {
     let inset = PANEL_FRAME + 1.0;
-    let left = rect.x + (16.0 * scale);
-    let right = rect.x + rect.w - (16.0 * scale);
-    let baseline = rect.y + (24.0 * scale);
-    let divider_y = rect.y + (HUD_HEADER_DIVIDER_OFFSET * scale);
+    let origin = panel_header_text_origin(rect, top);
+    let right = rect.x + rect.w - 16.0 * hud_scale();
+    let divider_y = top + header_band_height();
 
     hud.fill(
         Rect::new(
             rect.x + inset,
-            rect.y + inset,
+            top,
             rect.w - inset * 2.0,
-            divider_y - rect.y - inset,
+            header_band_height(),
         ),
         COLOR_PANEL_HEADER,
     );
-    draw_engraved_text(hud, label, left, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
-    hud.hline(left, right, divider_y, COLOR_PANEL_BORDER);
+    draw_engraved_text(hud, label, origin.x, origin.y, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
+    hud.hline(origin.x, right, divider_y, COLOR_PANEL_BORDER);
+}
+
+fn next_slot_guides(rect: Rect) -> [Rect; NEXT_SLOT_COUNT - 1] {
+    let slots = next_slot_rects(rect);
+    let inset = 16.0 * hud_scale();
+
+    std::array::from_fn(|index| {
+        Rect::new(
+            rect.x + inset,
+            slots[index].y + slots[index].h,
+            rect.w - inset * 2.0,
+            1.0,
+        )
+    })
 }
 
 fn draw_next_slot_guides(hud: &Surface, layout: &HudLayout) {
-    let rect = layout.next;
-    let (content_top, content_bottom) = preview_content_vertical_bounds(rect);
-    let slot_height = (content_bottom - content_top) / 3.0;
-    let inset = 16.0 * hud_scale();
-
-    for slot in 1..3 {
-        let y = (content_top + slot_height * slot as f32).round();
-        hud.hline(
-            rect.x + inset,
-            rect.x + rect.w - inset,
-            y,
-            color_u8!(69, 65, 54, 120),
-        );
+    for guide in next_slot_guides(layout.next) {
+        hud.fill(guide, color_u8!(69, 65, 54, 120));
     }
 }
 
@@ -826,7 +889,7 @@ fn draw_panel_labels(hud: &Surface, layout: &HudLayout) {
     draw_panel_header(hud, layout.hold, "HOLD");
     draw_panel_header(hud, layout.next, "NEXT");
     draw_panel_header(hud, layout.controls, "CONTROLS");
-    draw_panel_header(hud, layout.stats, "STATUS");
+    draw_panel_header(hud, layout.stats, "LEVEL");
     draw_next_slot_guides(hud, layout);
 }
 
@@ -847,72 +910,133 @@ fn draw_indicator_pip(hud: &Surface, x: f32, y: f32, size: f32, lit: bool) {
     }
 }
 
-/// Draw the level and cleared-line counts beneath the next queue, as two bold
-/// readouts over a row of ten indicator lamps counting lines toward the next
-/// level.
-fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
-    let scale = hud_scale();
-    let rect = layout.stats;
-    let mid_x = (rect.x + rect.w * 0.5).round();
-    let label_baseline = rect.y + (58.0 * scale);
-    let window_top = rect.y + (64.0 * scale);
-    let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
+struct StatsReadoutLayout {
+    level_area: Rect,
+    lines_header_top: f32,
+    lines: Rect,
+    lines_size: f32,
+    progress: Rect,
+}
 
-    for (label, value, center_x) in [
-        ("LEVEL", level, rect.x + rect.w * 0.25),
-        ("LINES", rows_cleared, rect.x + rect.w * 0.75),
-    ] {
-        let (label_width, _, _) = pixel_text_metrics(label, STATS_TEXT_SIZE);
-        draw_engraved_text(
-            hud,
-            label,
-            (center_x - label_width * 0.5).round(),
-            label_baseline,
-            STATS_TEXT_SIZE,
-            COLOR_TEXT_MUTED,
-        );
-        draw_readout_window(
-            hud,
-            Rect::new(
-                (center_x - window_width * 0.5).round(),
-                window_top,
-                window_width,
-                readout_height(),
-            ),
-            &format!("{:02}", value),
-            "00",
-            COLOR_TEXT,
-        );
+fn line_count_text(rows_cleared: usize) -> String {
+    if rows_cleared > 99_999 {
+        return String::from("99,999+");
     }
 
-    hud.vline(
-        mid_x,
-        rect.y + (48.0 * scale),
-        window_top + readout_height(),
-        color_u8!(72, 68, 57, 180),
+    rows_cleared.to_formatted_string(&Locale::en)
+}
+
+fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
+    let scale = hud_scale();
+    let lines_size = if pixel_text_metrics(line_text, LINE_COUNT_TEXT_SIZE).0 <= rect.w - 32.0 * scale {
+        LINE_COUNT_TEXT_SIZE
+    } else {
+        LINE_COUNT_COMPACT_TEXT_SIZE
+    };
+    let (line_width, line_height, _) = pixel_text_metrics(line_text, lines_size);
+    let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
+    let window_height = readout_height();
+    let window_top = (rect.y + (HUD_HEADER_DIVIDER_OFFSET + 8.0) * scale).round();
+    let bar_width = PROGRESS_PIP_SIZE * 10.0 + PROGRESS_PIP_GAP * 9.0;
+    let progress = Rect::new(
+        (rect.x + (rect.w - bar_width) * 0.5).round(),
+        (rect.y + rect.h - PANEL_FRAME - 12.0 * scale - PROGRESS_PIP_SIZE).round(),
+        bar_width,
+        PROGRESS_PIP_SIZE,
     );
 
-    let pip = 5.0;
-    let gap = 2.0;
-    let bar_width = pip * 10.0 + gap * 9.0;
-    let bar_x = (rect.x + (rect.w - bar_width) * 0.5).round();
-    let bar_y = rect.y + rect.h - PANEL_FRAME - (12.0 * scale) - pip;
+    let lines_header_top = (window_top + window_height + 4.0 * scale).round();
+
+    StatsReadoutLayout {
+        level_area: Rect::new(
+            (rect.x + (rect.w - window_width) * 0.5).round(),
+            window_top,
+            window_width,
+            window_height,
+        ),
+        lines_header_top,
+        lines: Rect::new(
+            (rect.x + (rect.w - line_width) * 0.5).round(),
+            (lines_header_top + header_band_height() + 4.0 * scale).round(),
+            line_width,
+            line_height,
+        ),
+        lines_size,
+        progress,
+    }
+}
+
+fn level_digit_origin(area: Rect, text: &str) -> Vec2 {
+    vec2(
+        (area.x + (area.w - digit_text_width(text, READOUT_PIXEL)) * 0.5).round(),
+        (area.y + (area.h - DIGIT_HEIGHT as f32 * READOUT_PIXEL) * 0.5).round(),
+    )
+}
+
+/// Centred values beneath matching LEVEL and LINES section headers.
+fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
+    let line_text = line_count_text(rows_cleared);
+    let positions = stats_readout_layout(layout.stats, &line_text);
+    let level_text = format!("{level:02}");
+    let origin = level_digit_origin(positions.level_area, &level_text);
+
+    // Keep the numerals and their subtle bloom, without a separate glass inset.
+    hud.digit_text(
+        &level_text,
+        origin.x + 1.0,
+        origin.y + 1.0,
+        READOUT_PIXEL,
+        shaded(COLOR_TEXT, 0.25),
+    );
+    hud.digit_text(
+        &level_text,
+        origin.x,
+        origin.y,
+        READOUT_PIXEL,
+        COLOR_TEXT,
+    );
+    draw_panel_header_at(hud, layout.stats, "LINES", positions.lines_header_top);
+    draw_engraved_text(
+        hud,
+        &line_text,
+        positions.lines.x,
+        positions.lines.y + positions.lines.h,
+        positions.lines_size,
+        COLOR_TEXT,
+    );
+
     let completed = rows_cleared % 10;
+
     for segment in 0..10 {
         draw_indicator_pip(
             hud,
-            bar_x + segment as f32 * (pip + gap),
-            bar_y,
-            pip,
+            positions.progress.x + segment as f32 * (PROGRESS_PIP_SIZE + PROGRESS_PIP_GAP),
+            positions.progress.y,
+            PROGRESS_PIP_SIZE,
             segment < completed,
         );
     }
 }
 
-/// A raised keycap: lit along its top and left, shadowed bottom and right.
-fn draw_keycap(hud: &Surface, label: &str, x: f32, y: f32, width: f32) {
+fn control_keycap_rect(panel: Rect, index: usize, width: f32) -> Rect {
     let scale = hud_scale();
-    let rect = Rect::new(x, y, (width * scale).round(), (22.0 * scale).round());
+
+    Rect::new(
+        (panel.x + 16.0 * scale).round(),
+        (panel.y + (CONTROL_ROW_TOP + index as f32 * CONTROL_ROW_PITCH) * scale).round(),
+        (width * scale).round(),
+        (CONTROL_KEY_HEIGHT * scale).round(),
+    )
+}
+
+fn control_label_baseline(rect: Rect) -> f32 {
+    let text_height = SMALL_GLYPH_HEIGHT * text_pixel(CONTROL_TEXT_SIZE);
+
+    (rect.y + (rect.h + text_height - 1.0) * 0.5).floor()
+}
+
+/// A raised keycap: lit along its top and left, shadowed bottom and right.
+fn draw_keycap(hud: &Surface, label: &str, rect: Rect) {
     hud.fill(
         Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w, rect.h),
         color_u8!(4, 4, 3, 255),
@@ -929,45 +1053,45 @@ fn draw_keycap(hud: &Surface, label: &str, x: f32, y: f32, width: f32) {
         hud,
         label,
         rect.x + rect.w * 0.5,
-        rect.y + (15.5 * scale),
-        16.0,
+        control_label_baseline(rect),
+        CONTROL_TEXT_SIZE,
         COLOR_TEXT,
     );
 }
 
 fn draw_controls(hud: &Surface, layout: &HudLayout) {
-    let scale = hud_scale();
     let rect = layout.controls;
-    let left = rect.x + (16.0 * scale);
-    let right = rect.x + rect.w - (16.0 * scale);
+    let right = rect.x + rect.w - 16.0 * hud_scale();
 
-    let rows = [
-        ("L/R", "MOVE", 42.0),
-        ("Z/X", "ROTATE", 42.0),
-        ("SPACE", "DROP", 62.0),
-        ("C", "HOLD", 28.0),
-    ];
-
-    for (index, (key, action, key_width)) in rows.iter().enumerate() {
-        let y = rect.y + ((48.0 + index as f32 * 28.0) * scale);
-        draw_keycap(hud, key, left, y, *key_width);
-        draw_text_right_at(hud, action, right, y + (15.5 * scale), 16.0, COLOR_TEXT_MUTED);
+    for (index, (key, action, key_width)) in CONTROL_ROWS.iter().enumerate() {
+        let keycap = control_keycap_rect(rect, index, *key_width);
+        draw_keycap(hud, key, keycap);
+        draw_text_right_at(
+            hud,
+            action,
+            right,
+            control_label_baseline(keycap),
+            CONTROL_TEXT_SIZE,
+            COLOR_TEXT_MUTED,
+        );
     }
 }
 
 struct ScoreAnnouncementText {
     headline: &'static str,
     clear: &'static str,
+    medal: &'static str,
     points: String,
     back_to_back: &'static str,
     combo: String,
 }
 
 fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
-    let headline = match award.event.spin {
-        SpinKind::None => "LINE CLEAR",
-        SpinKind::Mini => "T-SPIN MINI",
-        SpinKind::Full => "T-SPIN",
+    let headline = match (award.event.spin, award.event.lines) {
+        (SpinKind::None, 4) => "CARNAGE",
+        (SpinKind::None, _) => "LINE CLEAR",
+        (SpinKind::Mini, _) => "T-SPIN MINI",
+        (SpinKind::Full, _) => "T-SPIN",
     };
     let clear = match award.event.lines {
         0 => "NO LINES",
@@ -976,6 +1100,14 @@ fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
         3 => "TRIPLE",
         4 => "TETRIS",
         _ => "CLEAR",
+    };
+    let medal = match (award.event.spin, award.event.lines) {
+        (SpinKind::None, 1) => "1",
+        (SpinKind::None, 2) => "2",
+        (SpinKind::None, 3) => "3",
+        (SpinKind::None, 4) => "4",
+        (SpinKind::None, _) => "!",
+        _ => "T",
     };
 
     // Keep even unusually long endless runs inside the small instrument panel.
@@ -998,51 +1130,186 @@ fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
     ScoreAnnouncementText {
         headline,
         clear,
+        medal,
         points,
         back_to_back: if award.back_to_back_bonus > 0 { "B2B" } else { "" },
         combo,
     }
 }
 
-fn draw_score_announcement(hud: &Surface, layout: &HudLayout, award: ScoreAward) {
+struct ScoreAnnouncementLayout {
+    medal: Rect,
+    clear: Rect,
+    points: Rect,
+    points_size: f32,
+    back_to_back: Rect,
+    combo: Rect,
+    meter: Rect,
+    impact: f32,
+}
+
+fn centered_label_bounds(rect: Rect, text: &str, baseline: f32, size: f32) -> Rect {
+    let (width, height, _) = pixel_text_metrics(text, size);
+
+    Rect::new(
+        (rect.x + (rect.w - width) * 0.5).round(),
+        (baseline - height).round(),
+        width,
+        height,
+    )
+}
+
+fn award_impact(remaining: f32) -> f32 {
+    // A quarter-second impact within the award's two-second lifetime.
+    ((remaining.clamp(0.0, 1.0) - 0.875) / 0.125).clamp(0.0, 1.0)
+}
+
+fn score_announcement_layout(
+    rect: Rect,
+    text: &ScoreAnnouncementText,
+    remaining: f32,
+) -> ScoreAnnouncementLayout {
+    let scale = hud_scale();
+    let pixel = text_pixel(AWARD_TEXT_SIZE);
+    let impact = award_impact(remaining);
+    let medal_size = AWARD_BADGE_PIXELS * pixel;
+    let (clear_width, clear_height, _) = pixel_text_metrics(text.clear, AWARD_TEXT_SIZE);
+    let gap = 4.0 * pixel;
+    let group_x = (rect.x + (rect.w - medal_size - gap - clear_width) * 0.5).round();
+    let clear_baseline = rect.y + AWARD_CLEAR_BASELINE * scale;
+    let available_width = rect.w - 32.0 * scale;
+    let points_size = if pixel_text_metrics(&text.points, AWARD_POINTS_TEXT_SIZE).0 <= available_width {
+        AWARD_POINTS_TEXT_SIZE
+    } else {
+        AWARD_TEXT_SIZE
+    };
+
+    ScoreAnnouncementLayout {
+        medal: Rect::new(
+            group_x,
+            (clear_baseline - (8.0 + impact.round()) * pixel).round(),
+            medal_size,
+            medal_size,
+        ),
+        clear: Rect::new(
+            group_x + medal_size + gap,
+            clear_baseline - clear_height,
+            clear_width,
+            clear_height,
+        ),
+        points: centered_label_bounds(
+            rect, &text.points, rect.y + AWARD_POINTS_BASELINE * scale, points_size,
+        ),
+        points_size,
+        back_to_back: centered_label_bounds(
+            rect, text.back_to_back, rect.y + AWARD_B2B_BASELINE * scale, AWARD_TEXT_SIZE,
+        ),
+        combo: centered_label_bounds(
+            rect, &text.combo, rect.y + AWARD_COMBO_BASELINE * scale, AWARD_TEXT_SIZE,
+        ),
+        meter: Rect::new(
+            rect.x + 16.0 * scale,
+            rect.y + rect.h - PANEL_FRAME - AWARD_METER_HEIGHT,
+            available_width,
+            AWARD_METER_HEIGHT,
+        ),
+        impact,
+    }
+}
+
+fn award_meter_segments(rect: Rect, remaining: f32) -> impl Iterator<Item = (Rect, f32)> {
+    let pitch = (rect.w / AWARD_METER_SEGMENTS as f32).floor();
+    let width = (pitch - 2.0).max(1.0);
+    let total_width = pitch * (AWARD_METER_SEGMENTS - 1) as f32 + width;
+    let left = (rect.x + (rect.w - total_width) * 0.5).round();
+    let units = remaining.clamp(0.0, 1.0) * AWARD_METER_SEGMENTS as f32;
+
+    (0..AWARD_METER_SEGMENTS).map(move |index| {
+        let segment = Rect::new(left + index as f32 * pitch, rect.y, width, rect.h);
+        let filled_width = (width * (units - index as f32).clamp(0.0, 1.0)).floor();
+
+        (segment, filled_width)
+    })
+}
+
+fn draw_score_announcement(
+    hud: &Surface,
+    layout: &HudLayout,
+    award: ScoreAward,
+    remaining: f32,
+) {
     let text = score_announcement_text(award);
     let rect = layout.award;
-    draw_panel_header(hud, rect, text.headline);
+    let positions = score_announcement_layout(rect, &text, remaining);
 
-    for (index, (line, color)) in [
-        (text.clear, COLOR_TEXT),
-        (text.points.as_str(), COLOR_AMBER),
-        (text.back_to_back, COLOR_AMBER),
-        (text.combo.as_str(), COLOR_TEXT_MUTED),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    if positions.impact > 0.0 {
+        let top = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale() + 1.0;
+        hud.fill(
+            Rect::new(
+                rect.x + PANEL_FRAME, top, rect.w - PANEL_FRAME * 2.0,
+                rect.y + rect.h - PANEL_FRAME - top,
+            ),
+            Color::new(COLOR_AMBER.r, COLOR_AMBER.g, COLOR_AMBER.b, positions.impact * 0.16),
+        );
+    }
+
+    draw_panel_header(hud, rect, text.headline);
+    hud.fill(
+        positions.medal,
+        mix_color(color_u8!(74, 44, 18, 255), COLOR_AMBER, 0.2 + positions.impact * 0.35),
+    );
+    draw_bevel(
+        hud,
+        positions.medal,
+        mix_color(COLOR_AMBER, COLOR_TEXT, positions.impact),
+        COLOR_PANEL_DARK,
+        false,
+    );
+    let pixel = text_pixel(AWARD_TEXT_SIZE);
+    draw_text_centered_at(
+        hud,
+        text.medal,
+        positions.medal.x + positions.medal.w * 0.5,
+        (positions.medal.y + (positions.medal.h + SMALL_GLYPH_HEIGHT * pixel - pixel) * 0.5).floor(),
+        AWARD_TEXT_SIZE,
+        COLOR_TEXT,
+    );
+
+    for (line, bounds, size, color) in [
+        (text.clear, positions.clear, AWARD_TEXT_SIZE, COLOR_TEXT),
+        (text.points.as_str(), positions.points, positions.points_size, COLOR_AMBER),
+        (text.back_to_back, positions.back_to_back, AWARD_TEXT_SIZE, COLOR_AMBER),
+        (text.combo.as_str(), positions.combo, AWARD_TEXT_SIZE, COLOR_TEXT_MUTED),
+    ] {
         if line.is_empty() {
             continue;
         }
 
-        draw_text_centered_at(
-            hud,
-            line,
-            rect.x + rect.w * 0.5,
-            rect.y + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale(),
-            AWARD_TEXT_SIZE,
-            color,
-        );
+        draw_pixel_text(hud, line, bounds.x, bounds.y + bounds.h, size, color);
+    }
+
+    for (segment, filled_width) in award_meter_segments(positions.meter, remaining) {
+        hud.fill(segment, color_u8!(44, 39, 25, 255));
+        if filled_width > 0.0 {
+            hud.fill(
+                Rect::new(segment.x, segment.y, filled_width, segment.h),
+                mix_color(COLOR_AMBER, COLOR_TEXT, positions.impact * 0.6),
+            );
+        }
     }
 }
 
 /// Draw the next-piece queue into the right side panel.
 fn draw_piece_previews(
     layout: &HudLayout,
-    piece_previews: [Piece; 3],
+    piece_previews: [Piece; NEXT_SLOT_COUNT],
     textures: &SceneTextures,
     lights: SceneLights,
+    shake: Vec2,
 ) {
     for (offset, piece) in piece_previews.iter().enumerate() {
         piece.draw(PiecePreviewArgs {
-            center: next_piece_anchor(layout, offset),
+            center: next_piece_anchor(layout, offset, shake),
             scale: PREVIEW_SCALE,
             textures,
             lights,
@@ -1067,8 +1334,7 @@ fn draw_held_piece(
     }
 }
 
-fn draw_game_effects(hud: &Surface, layout: &HudLayout, game_state: &GameState<'_>, shake: Vec2) {
-    let scale = hud_scale();
+fn draw_game_effects(hud: &Surface, game_state: &GameState<'_>, shake: Vec2) {
     let impact = game_state.get_impact_effect();
 
     if impact > 0.0 {
@@ -1147,18 +1413,6 @@ fn draw_game_effects(hud: &Surface, layout: &HudLayout, game_state: &GameState<'
             }
         }
     }
-
-    // The pause hint sits under the controls panel, clear of the pit below
-    // the well.
-    let controls = layout.controls;
-    draw_text_centered_at(
-        hud,
-        "ESC  PAUSE",
-        controls.x + controls.w * 0.5,
-        controls.y + controls.h + (22.0 * scale),
-        18.0,
-        color_u8!(156, 136, 93, 210),
-    );
 }
 
 /// Camera shake for the frame: an impact pulse when a piece locks, and a
@@ -1239,7 +1493,7 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
                 wash: 0.0,
             });
         }
-        draw_piece_previews(&layout, self.get_piece_previews(), textures, lights);
+        draw_piece_previews(&layout, self.get_piece_previews(), textures, lights, frame.shake);
         draw_held_piece(&layout, self.get_held_piece(), textures, lights);
         draw_shrapnel(self.get_shrapnel(), textures);
         let (clear_count, clear_remaining) = self.get_clear_effect();
@@ -1257,10 +1511,10 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
         draw_controls(&hud, &layout);
         if let Some(award) = announcement {
-            draw_score_announcement(&hud, &layout, award);
+            draw_score_announcement(&hud, &layout, award, self.get_score_announcement_remaining());
         }
 
-        draw_game_effects(&hud, &layout, self, frame.shake);
+        draw_game_effects(&hud, self, frame.shake);
     }
 }
 
@@ -1539,7 +1793,7 @@ mod tests {
     use super::*;
     use crate::piece::pieces;
 
-    fn preview_vertical_bounds(piece: Piece, center: Vec3) -> (f32, f32) {
+    fn preview_screen_bounds(piece: Piece, center: Vec3, shake: Vec2) -> Rect {
         let (blocks, _, _) = piece.get_blocks(0);
         let (min_row, max_row, min_col, max_col) = piece.get_trimmed_bounds(0);
         let span_cols = (max_col - min_col) as f32;
@@ -1547,8 +1801,8 @@ mod tests {
         let origin_x = center.x - (span_cols * PREVIEW_SCALE / 2.0) + (PREVIEW_SCALE / 2.0);
         let origin_y = center.y + (span_rows * PREVIEW_SCALE / 2.0) - (PREVIEW_SCALE / 2.0);
         let half_cube = BLOCK_INSET * PREVIEW_SCALE * 0.5;
-        let mut top = f32::INFINITY;
-        let mut bottom = f32::NEG_INFINITY;
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
 
         for row_id in min_row..max_row {
             for col_id in min_col..max_col {
@@ -1562,18 +1816,21 @@ mod tests {
                     center.z,
                 );
 
-                for y_sign in [-1.0, 1.0] {
-                    for z_sign in [-1.0, 1.0] {
-                        let corner = position + Vec3::new(0.0, y_sign, z_sign) * half_cube;
-                        let screen_y = world_to_screen(corner).y;
-                        top = top.min(screen_y);
-                        bottom = bottom.max(screen_y);
+                // Include the depth of every rendered cube, not just cell centres.
+                for x_sign in [-1.0, 1.0] {
+                    for y_sign in [-1.0, 1.0] {
+                        for z_sign in [-1.0, 1.0] {
+                            let corner = position + vec3(x_sign, y_sign, z_sign) * half_cube;
+                            let screen = world_to_screen_with_shake(corner, shake);
+                            min = min.min(screen);
+                            max = max.max(screen);
+                        }
                     }
                 }
             }
         }
 
-        (top, bottom)
+        Rect::new(min.x, min.y, max.x - min.x, max.y - min.y)
     }
 
     #[test]
@@ -1606,6 +1863,150 @@ mod tests {
     }
 
     #[test]
+    fn every_panel_title_fits_between_the_frame_and_header_divider() {
+        let layout = hud_layout();
+
+        for (rect, label) in [
+            (layout.hold, "HOLD"),
+            (layout.next, "NEXT"),
+            (layout.controls, "CONTROLS"),
+            (layout.stats, "LEVEL"),
+            (layout.award, "LINE CLEAR"),
+            (layout.award, "CARNAGE"),
+            (layout.award, "T-SPIN"),
+            (layout.award, "T-SPIN MINI"),
+        ] {
+            let baseline = panel_header_text_origin(rect, rect.y + PANEL_FRAME + 1.0).y;
+            let (width, height, _) = pixel_text_metrics(label, LABEL_TEXT_SIZE);
+            let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+
+            assert_eq!(baseline.fract(), 0.0);
+            assert!(baseline - height >= rect.y + PANEL_FRAME + 1.0, "{label}");
+            assert!(baseline + 1.0 < divider, "{label} engraving shadow");
+            assert!(
+                rect.x + 16.0 * hud_scale() + width + 1.0 <= rect.x + rect.w - PANEL_FRAME,
+                "{label} width"
+            );
+        }
+    }
+
+    #[test]
+    fn all_five_controls_and_their_shadows_fit_inside_the_frame() {
+        let rect = hud_layout().controls;
+        let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+        let right = rect.x + rect.w - 16.0 * hud_scale();
+
+        assert_eq!(CONTROL_ROWS.last().map(|row| (row.0, row.1)), Some(("ESC", "PAUSE")));
+        assert_eq!(CONTROL_ROWS.iter().filter(|row| row.0 == "ESC").count(), 1);
+
+        for (index, (key, action, width)) in CONTROL_ROWS.iter().enumerate() {
+            let keycap = control_keycap_rect(rect, index, *width);
+            let baseline = control_label_baseline(keycap);
+            let (key_width, key_height, _) = pixel_text_metrics(key, CONTROL_TEXT_SIZE);
+            let (action_width, action_height, _) = pixel_text_metrics(action, CONTROL_TEXT_SIZE);
+
+            assert!(keycap.y > divider, "{key}");
+            assert!(keycap.x >= rect.x + PANEL_FRAME + 1.0, "{key}");
+            assert!(keycap.x + keycap.w + 1.0 < right - action_width, "{key}/{action}");
+            assert!(
+                keycap.y + keycap.h + 1.0 + CONTROL_BOTTOM_PADDING * hud_scale()
+                    <= rect.y + rect.h - PANEL_FRAME,
+                "{key} bottom shadow"
+            );
+            assert!(key_width <= keycap.w - 2.0, "{key} glyph width");
+            assert!(baseline - key_height >= keycap.y + 1.0, "{key} glyph top");
+            assert!(baseline <= keycap.y + keycap.h - 1.0, "{key} glyph bottom");
+            assert!(baseline - action_height > divider, "{action}");
+        }
+    }
+
+    #[test]
+    fn five_digit_line_counts_fit_below_the_centered_level_without_overlapping() {
+        let rect = hud_layout().stats;
+        let original = stats_readout_layout(rect, &line_count_text(0));
+
+        for lines in [0, 99, 100, 999, 1000, 12_345, 99_999, 100_000, usize::MAX] {
+            let text = line_count_text(lines);
+            let positions = stats_readout_layout(rect, &text);
+            let value_center = positions.level_area.x + positions.level_area.w * 0.5;
+
+            assert_eq!(
+                positions.lines_size,
+                if lines <= 99_999 { LINE_COUNT_TEXT_SIZE } else { LINE_COUNT_COMPACT_TEXT_SIZE }
+            );
+            assert!((value_center - (rect.x + rect.w * 0.5)).abs() <= 0.5);
+            assert!(positions.level_area.x >= rect.x + PANEL_FRAME + 1.0);
+            assert!(
+                positions.level_area.y
+                    > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale()
+            );
+            assert!(positions.lines_header_top > positions.level_area.y + positions.level_area.h);
+            assert!(positions.lines.x >= rect.x + PANEL_FRAME + 1.0, "{text}");
+            assert!(
+                positions.lines.x + positions.lines.w + 1.0 <= rect.x + rect.w - PANEL_FRAME,
+                "{text}"
+            );
+            assert!(positions.lines.y > positions.lines_header_top + header_band_height());
+            assert!(positions.lines.y + positions.lines.h + 1.0 < positions.progress.y);
+            assert!(positions.progress.y + positions.progress.h < rect.y + rect.h - PANEL_FRAME);
+            assert_eq!(
+                (positions.level_area.x, positions.level_area.y),
+                (original.level_area.x, original.level_area.y)
+            );
+
+            for level in [1, 9, 10, 20] {
+                assert!(
+                    digit_text_width(&format!("{level:02}"), READOUT_PIXEL)
+                        <= positions.level_area.w - READOUT_PADDING * 2.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_level_digits_keep_their_size_and_centering() {
+        let panel = hud_layout().stats;
+        let area = stats_readout_layout(panel, &line_count_text(99_999)).level_area;
+        let height = DIGIT_HEIGHT as f32 * READOUT_PIXEL;
+
+        for level in [1, 9, 10, 20] {
+            let text = format!("{level:02}");
+            let width = digit_text_width(&text, READOUT_PIXEL);
+            let origin = level_digit_origin(area, &text);
+
+            assert_eq!(origin.x + width * 0.5, panel.x + panel.w * 0.5);
+            assert_eq!(origin.y + height * 0.5, area.y + area.h * 0.5);
+            assert!(origin.x >= area.x && origin.x + width + 1.0 <= area.x + area.w);
+            assert!(origin.y >= area.y && origin.y + height + 1.0 <= area.y + area.h);
+        }
+    }
+
+    #[test]
+    fn line_count_formatting_keeps_five_digits_and_bounds_larger_values() {
+        assert_eq!(line_count_text(0), "0");
+        assert_eq!(line_count_text(100), "100");
+        assert_eq!(line_count_text(12_345), "12,345");
+        assert_eq!(line_count_text(99_999), "99,999");
+        assert_eq!(line_count_text(100_000), "99,999+");
+        assert_eq!(line_count_text(usize::MAX), "99,999+");
+    }
+
+    #[test]
+    fn level_and_lines_headers_share_insets_and_vertical_text_metrics() {
+        let rect = hud_layout().stats;
+        let layout = stats_readout_layout(rect, &line_count_text(99_999));
+        let level_top = rect.y + PANEL_FRAME + 1.0;
+        let level = panel_header_text_origin(rect, level_top);
+        let lines = panel_header_text_origin(rect, layout.lines_header_top);
+
+        assert_eq!(level.x, lines.x);
+        assert_eq!(level.y - level_top, lines.y - layout.lines_header_top);
+        assert!(lines.y < layout.lines.y);
+        assert_eq!(level.x, rect.x + 16.0 * hud_scale());
+        assert_eq!(layout.lines_header_top.fract(), 0.0);
+    }
+
+    #[test]
     fn score_award_panel_fits_between_hold_and_controls_outside_the_well() {
         let layout = hud_layout();
         let well = well_screen_rect();
@@ -1615,15 +2016,6 @@ mod tests {
         assert!(layout.award.y > layout.hold.y + layout.hold.h);
         assert!(layout.award.y + layout.award.h < layout.controls.y);
         assert!(!layout.award.overlaps(&well));
-
-        for index in 0..4 {
-            let baseline = layout.award.y
-                + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale();
-            let height = SMALL_GLYPH_HEIGHT * text_pixel(AWARD_TEXT_SIZE);
-
-            assert!(baseline - height > layout.award.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale());
-            assert!(baseline < layout.award.y + layout.award.h - PANEL_FRAME);
-        }
     }
 
     #[test]
@@ -1635,8 +2027,9 @@ mod tests {
         let (_, award) = score_lock(event, state);
         let text = score_announcement_text(award);
 
-        assert_eq!(text.headline, "LINE CLEAR");
+        assert_eq!(text.headline, "CARNAGE");
         assert_eq!(text.clear, "TETRIS");
+        assert_eq!(text.medal, "4");
         assert_eq!(text.points, "+1,250");
         assert_eq!(text.back_to_back, "B2B");
         assert_eq!(text.combo, "COMBO 1");
@@ -1653,6 +2046,7 @@ mod tests {
 
             assert_eq!(text.headline, headline);
             assert_eq!(text.clear, "DOUBLE");
+            assert_eq!(text.medal, "T");
             assert_eq!(text.points, points);
             assert!(text.back_to_back.is_empty());
             assert!(text.combo.is_empty());
@@ -1669,12 +2063,16 @@ mod tests {
         let rect = hud_layout().award;
         let available_width = rect.w - 32.0 * hud_scale();
         let mut awards = Vec::new();
+        let (chain, _) = score_lock(
+            LockEvent { spin: SpinKind::None, lines: 4, level: 1 },
+            ScoringState::default(),
+        );
 
         for (spin, max_lines) in [(SpinKind::None, 4), (SpinKind::Mini, 2), (SpinKind::Full, 3)] {
             for lines in 0..=max_lines {
                 let (_, award) = score_lock(
                     LockEvent { spin, lines, level: 20 },
-                    ScoringState::default(),
+                    chain,
                 );
                 awards.push(award);
             }
@@ -1690,18 +2088,96 @@ mod tests {
 
         for award in awards {
             let text = score_announcement_text(award);
+            let positions = score_announcement_layout(rect, &text, 1.0);
 
             for (line, size) in [
                 (text.headline, LABEL_TEXT_SIZE),
                 (text.clear, AWARD_TEXT_SIZE),
-                (text.points.as_str(), AWARD_TEXT_SIZE),
+                (text.medal, AWARD_TEXT_SIZE),
+                (text.points.as_str(), positions.points_size),
                 (text.back_to_back, AWARD_TEXT_SIZE),
                 (text.combo.as_str(), AWARD_TEXT_SIZE),
             ] {
                 assert!(pixel_text_metrics(line, size).0 <= available_width, "{line}");
                 assert!(line.chars().all(|c| c == ' ' || SMALL_GLYPH_CHARS.contains(c)), "{line}");
             }
+
+            for remaining in [1.0, 0.95, 0.875, 0.5, 0.0] {
+                let positions = score_announcement_layout(rect, &text, remaining);
+
+                for bounds in [
+                    positions.medal, positions.clear, positions.points,
+                    positions.back_to_back, positions.combo, positions.meter,
+                ] {
+                    assert!(bounds.x >= rect.x + PANEL_FRAME + 1.0);
+                    assert!(bounds.x + bounds.w <= rect.x + rect.w - PANEL_FRAME - 1.0);
+                    assert!(bounds.y > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale());
+                    assert!(bounds.y + bounds.h <= rect.y + rect.h - PANEL_FRAME);
+
+                    for value in [bounds.x, bounds.y, bounds.w, bounds.h] {
+                        assert_eq!(value.fract(), 0.0);
+                    }
+                }
+
+                assert!(positions.clear.x > positions.medal.x + positions.medal.w);
+                assert!(positions.points.y > positions.medal.y + positions.medal.h);
+                assert!(positions.points.y > positions.clear.y + positions.clear.h);
+                assert!(positions.back_to_back.y > positions.points.y + positions.points.h);
+                assert!(positions.combo.y > positions.back_to_back.y + positions.back_to_back.h);
+                assert!(positions.meter.y > positions.combo.y + positions.combo.h);
+            }
         }
+    }
+
+    #[test]
+    fn common_awards_use_larger_points_and_long_awards_fall_back_without_clipping() {
+        use crate::scoring::{score_lock, LockEvent, ScoringState};
+
+        let rect = hud_layout().award;
+
+        for (event, expected_size) in [
+            (LockEvent { spin: SpinKind::None, lines: 3, level: 1 }, AWARD_POINTS_TEXT_SIZE),
+            (LockEvent { spin: SpinKind::Full, lines: 2, level: 1 }, AWARD_POINTS_TEXT_SIZE),
+            (LockEvent { spin: SpinKind::Full, lines: 3, level: 20 }, AWARD_TEXT_SIZE),
+        ] {
+            let (_, award) = score_lock(event, ScoringState::default());
+            let text = score_announcement_text(award);
+            let positions = score_announcement_layout(rect, &text, 1.0);
+
+            assert_eq!(positions.points_size, expected_size);
+            assert_eq!(text.points.replace(',', ""), format!("+{}", award.total()));
+        }
+    }
+
+    #[test]
+    fn award_flash_and_segmented_meter_follow_the_remaining_lifetime() {
+        let rect = Rect::new(8.0, 67.0, 72.0, AWARD_METER_HEIGHT);
+        let full: f32 = award_meter_segments(rect, 1.0).map(|(_, filled)| filled).sum();
+        let half: f32 = award_meter_segments(rect, 0.5).map(|(_, filled)| filled).sum();
+
+        assert_eq!(award_impact(1.0), 1.0);
+        assert!(award_impact(0.95) > 0.0 && award_impact(0.95) < 1.0);
+        assert_eq!(award_impact(0.875), 0.0);
+        assert_eq!(award_impact(0.0), 0.0);
+        assert_eq!(half, full * 0.5);
+
+        let mut previous = f32::INFINITY;
+
+        for remaining in [1.0, 0.875, 0.5, 0.125, 0.0] {
+            let mut total = 0.0;
+
+            for (segment, filled) in award_meter_segments(rect, remaining) {
+                assert!(segment.x >= rect.x && segment.x + segment.w <= rect.x + rect.w);
+                assert!(filled >= 0.0 && filled <= segment.w);
+                assert_eq!(filled.fract(), 0.0);
+                total += filled;
+            }
+
+            assert!(total <= previous);
+            previous = total;
+        }
+
+        assert_eq!(previous, 0.0);
     }
 
     #[test]
@@ -1715,7 +2191,49 @@ mod tests {
     }
 
     #[test]
-    fn every_next_piece_fits_inside_each_padded_queue_slot() {
+    fn next_slots_share_equal_clear_space_between_pixel_aligned_rules() {
+        let layout = hud_layout();
+        let panel = layout.next;
+        let slots = next_slot_rects(panel);
+        let guides = next_slot_guides(panel);
+        let header_divider = panel.y + PANEL_FRAME + 1.0 + header_band_height();
+        let bottom_bevel = panel.y + panel.h - PANEL_FRAME - 1.0;
+        let desired_height = (HUD_NEXT_HEIGHT * hud_scale()).round();
+        let centers = slots.map(|slot| vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5));
+
+        assert_eq!(panel.h, 142.0);
+        assert!(panel.h >= desired_height && panel.h < desired_height + NEXT_SLOT_COUNT as f32);
+        assert!(panel.y + panel.h < layout.stats.y);
+        assert_eq!(slots.map(|slot| slot.y - panel.y), [19.0, 58.0, 97.0]);
+        assert_eq!(slots.map(|slot| slot.y + slot.h - panel.y), [57.0, 96.0, 135.0]);
+        assert_eq!(slots.map(|slot| slot.h), [38.0; NEXT_SLOT_COUNT]);
+        assert_eq!(slots[0].y, header_divider + 1.0);
+        assert_eq!(slots[NEXT_SLOT_COUNT - 1].y + slots[NEXT_SLOT_COUNT - 1].h, bottom_bevel);
+        assert_eq!(centers[1] - centers[0], vec2(0.0, 39.0));
+        assert_eq!(centers[2] - centers[1], centers[1] - centers[0]);
+
+        for slot in slots {
+            assert_eq!(slot.x, panel.x + PANEL_FRAME + 1.0);
+            assert_eq!(slot.x + slot.w, panel.x + panel.w - PANEL_FRAME - 1.0);
+        }
+
+        for (index, guide) in guides.into_iter().enumerate() {
+            assert_eq!(guide.y, slots[index].y + slots[index].h);
+            assert_eq!(guide.y + guide.h, slots[index + 1].y);
+            assert_eq!(guide.h, 1.0);
+            assert_eq!(guide.x, panel.x + 16.0 * hud_scale());
+            assert_eq!(guide.x + guide.w, panel.x + panel.w - 16.0 * hud_scale());
+        }
+
+        for bounds in slots.into_iter().chain(guides) {
+            for value in [bounds.x, bounds.y, bounds.w, bounds.h] {
+                assert_eq!(value.fract(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn every_next_piece_stays_centered_inside_each_clear_slot_during_shake() {
         let pieces = [
             pieces::I,
             pieces::J,
@@ -1726,34 +2244,67 @@ mod tests {
             pieces::Z,
         ];
         let layout = hud_layout();
-        let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
-        let slot_height = (content_bottom - content_top) / 3.0;
-        let minimum_slot_padding = 2.0;
-        let anchors = [
-            next_piece_anchor(&layout, 0),
-            next_piece_anchor(&layout, 1),
-            next_piece_anchor(&layout, 2),
-        ];
-        let first_gap = world_to_screen(anchors[1]).y - world_to_screen(anchors[0]).y;
-        let second_gap = world_to_screen(anchors[2]).y - world_to_screen(anchors[1]).y;
+        let slots = next_slot_rects(layout.next);
+        let minimum_slot_padding = 5.0;
+        let tolerance = 0.001;
 
-        assert!((first_gap - second_gap).abs() <= 1.0);
+        for piece in pieces {
+            let resting_bounds = preview_screen_bounds(
+                piece,
+                next_piece_anchor(&layout, 0, Vec2::ZERO),
+                Vec2::ZERO,
+            );
+            let expected_clearance = vec2(
+                (slots[0].w - resting_bounds.w) * 0.5,
+                (slots[0].h - resting_bounds.h) * 0.5,
+            );
 
-        for (slot_index, anchor) in anchors.into_iter().enumerate() {
-            let slot_top = content_top + slot_height * slot_index as f32;
-            let slot_bottom = slot_top + slot_height;
-            for piece in pieces {
-                let (top, bottom) = preview_vertical_bounds(piece, anchor);
-                assert!(
-                    top >= slot_top + minimum_slot_padding,
-                    "{} exceeds the padded slot top",
-                    piece.name
-                );
-                assert!(
-                    bottom <= slot_bottom - minimum_slot_padding,
-                    "{} exceeds the padded slot bottom",
-                    piece.name
-                );
+            // Rest, signed axis maxima, and all corners of camera_shake's
+            // component envelope; the two oscillations need not peak together.
+            for shake_x in [-0.25, 0.0, 0.25] {
+                for shake_y in [-0.25, 0.0, 0.25] {
+                    let shake = vec2(shake_x, shake_y);
+
+                    for (slot_index, slot) in slots.into_iter().enumerate() {
+                        let anchor = next_piece_anchor(&layout, slot_index, shake);
+                        assert!(anchor.z.abs() < tolerance);
+
+                        let expected_center = vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5);
+                        let anchor_screen = world_to_screen_with_shake(anchor, shake);
+                        assert!((anchor_screen - expected_center).length() < tolerance);
+
+                        let bounds = preview_screen_bounds(piece, anchor, shake);
+                        let center = vec2(bounds.x + bounds.w * 0.5, bounds.y + bounds.h * 0.5);
+                        assert!(
+                            (center.x - expected_center.x).abs() < tolerance,
+                            "{} x centre in slot {slot_index} under {shake:?}",
+                            piece.name
+                        );
+                        assert!(
+                            (center.y - expected_center.y).abs() < tolerance,
+                            "{} y centre in slot {slot_index} under {shake:?}",
+                            piece.name
+                        );
+
+                        for (edge, clearance, expected) in [
+                            ("left", bounds.x - slot.x, expected_clearance.x),
+                            ("right", slot.x + slot.w - bounds.x - bounds.w, expected_clearance.x),
+                            ("top", bounds.y - slot.y, expected_clearance.y),
+                            ("bottom", slot.y + slot.h - bounds.y - bounds.h, expected_clearance.y),
+                        ] {
+                            assert!(
+                                clearance >= minimum_slot_padding,
+                                "{} {edge} clearance in slot {slot_index} under {shake:?}: {clearance}",
+                                piece.name
+                            );
+                            assert!(
+                                (clearance - expected).abs() < tolerance,
+                                "{} {edge} clearance changes in slot {slot_index} under {shake:?}",
+                                piece.name
+                            );
+                        }
+                    }
+                }
             }
         }
     }
