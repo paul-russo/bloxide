@@ -261,6 +261,14 @@ fn assert_matching_motion(actual: &GameState<'_>, expected: &GameState<'_>) {
     assert_eq!(actual.score, expected.score);
     assert_eq!(actual.scoring_state, expected.scoring_state);
     assert_eq!(actual.last_rotation, expected.last_rotation);
+    assert_eq!(
+        actual.get_score_announcement(),
+        expected.get_score_announcement()
+    );
+    assert_eq!(
+        actual.score_announcement_ticks_remaining,
+        expected.score_announcement_ticks_remaining
+    );
     assert_eq!(actual.cached_ghost_row, expected.cached_ghost_row);
 }
 

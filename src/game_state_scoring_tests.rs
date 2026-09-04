@@ -608,6 +608,14 @@ fn actual_locks_apply_combo_and_back_to_back_once_across_level_changes() {
         state.lock_active_piece_and_get_next();
 
         assert_eq!(state.score - before, increment, "after {total_lines} lines");
+        if lines > 0 {
+            let award = state
+                .get_score_announcement()
+                .expect("scoring announcement");
+            assert_eq!(award.total(), increment);
+            assert_eq!(award.event.lines, lines);
+        }
+
         assert_eq!(state.rows_cleared, total_lines);
         assert!(state.last_rotation.is_none());
         assert!(!state.is_game_over);
@@ -791,4 +799,154 @@ fn spin_locks_score_identically_across_catch_up_partitions() {
     assert_eq!(irregular.scoring_state, single.scoring_state);
     assert_eq!(irregular.rows_cleared, single.rows_cleared);
     assert_eq!(irregular.active_piece.name, single.active_piece.name);
+    assert_eq!(
+        irregular.get_score_announcement(),
+        single.get_score_announcement()
+    );
+    assert_eq!(
+        irregular.score_announcement_ticks_remaining,
+        single.score_announcement_ticks_remaining
+    );
+}
+
+#[test]
+fn score_announcements_expire_after_two_playing_seconds_and_freeze_on_pause() {
+    let high_scores = HighScoreManager::new();
+    let mut state = GameState::new(&high_scores);
+    prepare_i_clear(&mut state, 4);
+    state.lock_active_piece_and_get_next();
+    let shown = state.get_score_announcement().expect("Tetris award");
+    assert_eq!(shown.total(), 800);
+
+    state.update_with_elapsed(Duration::from_millis(500), GameInput::default());
+    state.toggle_pause();
+    let remaining = state.score_announcement_ticks_remaining;
+    state.update_with_elapsed(
+        Duration::from_secs(30),
+        GameInput {
+            hold_piece: true,
+            hard_drop: true,
+            rotate_left: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(state.get_score_announcement(), Some(shown));
+    assert_eq!(state.score_announcement_ticks_remaining, remaining);
+    assert_eq!(state.score, 800);
+
+    state.update_with_elapsed(
+        Duration::from_secs(30),
+        GameInput {
+            toggle_pause: true,
+            ..Default::default()
+        },
+    );
+    state.update_with_elapsed(
+        Duration::from_millis(1500) - Duration::from_nanos(1),
+        GameInput::default(),
+    );
+
+    assert_eq!(state.get_score_announcement(), Some(shown));
+    assert_eq!(state.score_announcement_ticks_remaining, 1);
+
+    state.update_with_elapsed(Duration::from_nanos(1), GameInput::default());
+
+    assert!(state.get_score_announcement().is_none());
+    assert_eq!(state.tick, 2 * TICKS_PER_SECOND as usize);
+}
+
+#[test]
+fn zero_point_locks_do_not_erase_or_extend_a_previous_announcement() {
+    let high_scores = HighScoreManager::new();
+    let mut state = GameState::new(&high_scores);
+    prepare_i_clear(&mut state, 4);
+    state.lock_active_piece_and_get_next();
+    state.update_with_elapsed(Duration::from_millis(500), GameInput::default());
+    let shown = state.get_score_announcement();
+    let remaining = state.score_announcement_ticks_remaining;
+
+    state.set_active_piece_and_reset_state(pieces::O);
+    state.active_piece_row = GRID_COUNT_ROWS as isize - 2;
+    state.active_piece_col = 0;
+    state.piece_dirty = true;
+    state.update_with_elapsed(Duration::ZERO, GameInput::default());
+    state.lock_active_piece_and_get_next();
+
+    assert_eq!(state.score, 800);
+    assert_eq!(state.get_score_announcement(), shown);
+    assert_eq!(state.score_announcement_ticks_remaining, remaining);
+
+    fill_except(&mut state.grid_locked, GRID_COUNT_ROWS as isize - 1, &[]);
+    state.trigger_line_clear();
+    let replacement = state.get_score_announcement().expect("new Single award");
+
+    assert_eq!(replacement.event.lines, 1);
+    assert_eq!(replacement.total(), 100);
+    assert_eq!(state.score, 900);
+    assert_eq!(
+        state.score_announcement_ticks_remaining,
+        2 * TICKS_PER_SECOND as usize
+    );
+}
+
+#[test]
+fn announcements_keep_the_pre_clear_level_and_full_bonus_breakdown() {
+    let high_scores = HighScoreManager::new();
+    let grid = north_slot(SpinKind::Full, 1, ROW, COL);
+    let mut state = rotate_into(
+        &high_scores,
+        grid,
+        0,
+        ROW,
+        COL,
+        RotationDirection::Clockwise,
+        0,
+    );
+    state.rows_cleared = 9;
+
+    lock_without_drop_distance(&mut state);
+    let spin = state.get_score_announcement().expect("T-spin Single");
+
+    assert_eq!(state.get_level(), 2);
+    assert_eq!(
+        spin.event,
+        LockEvent {
+            spin: SpinKind::Full,
+            lines: 1,
+            level: 1
+        }
+    );
+    assert_eq!(spin.base, 800);
+    assert_eq!(spin.total(), 800);
+
+    prepare_i_clear(&mut state, 4);
+    state.lock_active_piece_and_get_next();
+    let tetris = state.get_score_announcement().expect("B2B Tetris");
+
+    assert_eq!(tetris.event.level, 2);
+    assert_eq!(tetris.base, 1600);
+    assert_eq!(tetris.back_to_back_bonus, 800);
+    assert_eq!(tetris.combo_bonus, 100);
+    assert_eq!(tetris.combo, Some(1));
+    assert_eq!(tetris.total(), 2500);
+    assert_eq!(state.score, 3300);
+}
+
+#[test]
+fn drop_points_alone_do_not_create_a_clear_announcement() {
+    let high_scores = HighScoreManager::new();
+    let mut state = GameState::new(&high_scores);
+
+    state.update_with_elapsed(
+        Duration::ZERO,
+        GameInput {
+            hard_drop: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(state.score > 0);
+    assert_eq!(state.rows_cleared, 0);
+    assert!(state.get_score_announcement().is_none());
 }

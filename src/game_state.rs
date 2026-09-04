@@ -10,7 +10,7 @@ use crate::{
         cell_center, floor_gap_contains, LavaSplash, ShrapnelVoxel, FLOOR_Y, LAVA_Y,
         MAX_LAVA_SPLASHES, MAX_SHRAPNEL_VOXELS, SPLASH_SECONDS,
     },
-    scoring::{score_lock, LockEvent, ScoringState, SpinKind},
+    scoring::{score_lock, LockEvent, ScoreAward, ScoringState, SpinKind},
 };
 use macroquad::prelude::{Color, Vec3};
 use rand::Rng;
@@ -30,6 +30,7 @@ const LINE_CLEAR_EFFECT_TICKS: usize = 40 * EFFECT_TICK_INTERVAL;
 const MAX_IMPACT_CONTACTS: usize = 4;
 const HARD_DROP_TRAIL_TICKS: usize = 9 * EFFECT_TICK_INTERVAL;
 const LEVEL_FLARE_TICKS: usize = 45 * EFFECT_TICK_INTERVAL;
+const SCORE_ANNOUNCEMENT_TICKS: usize = 2 * TICKS_PER_SECOND as usize;
 
 /// The path a hard-dropped piece just travelled, so the renderer can streak
 /// it. Rows are grid rows of the piece's canvas origin, before and after the
@@ -196,6 +197,8 @@ pub struct GameState<'a> {
     hard_drop_trail: Option<HardDropTrail>,
     hard_drop_trail_ticks_remaining: usize,
     level_flare_ticks_remaining: usize,
+    last_score_award: Option<ScoreAward>,
+    score_announcement_ticks_remaining: usize,
 }
 
 impl<'a> GameState<'a> {
@@ -263,6 +266,8 @@ impl<'a> GameState<'a> {
             hard_drop_trail: None,
             hard_drop_trail_ticks_remaining: 0,
             level_flare_ticks_remaining: 0,
+            last_score_award: None,
+            score_announcement_ticks_remaining: 0,
         }
     }
 
@@ -780,6 +785,8 @@ impl<'a> GameState<'a> {
         self.hard_drop_trail_ticks_remaining =
             self.hard_drop_trail_ticks_remaining.saturating_sub(1);
         self.level_flare_ticks_remaining = self.level_flare_ticks_remaining.saturating_sub(1);
+        self.score_announcement_ticks_remaining =
+            self.score_announcement_ticks_remaining.saturating_sub(1);
 
         // Keep the debris integrator and its per-step drag at the original
         // 60 Hz. A slow render frame still runs every owed physics step.
@@ -1102,7 +1109,13 @@ impl<'a> GameState<'a> {
         let event = LockEvent { spin, lines, level };
         let (state, award) = score_lock(event, self.scoring_state);
         self.scoring_state = state;
-        self.score += award.total();
+        let points = award.total();
+        self.score += points;
+
+        if points > 0 {
+            self.last_score_award = Some(award);
+            self.score_announcement_ticks_remaining = SCORE_ANNOUNCEMENT_TICKS;
+        }
 
         self.increase_rows_cleared(lines);
     }
@@ -1136,6 +1149,14 @@ impl<'a> GameState<'a> {
 
     pub fn get_score(&self) -> usize {
         self.score
+    }
+
+    pub fn get_score_announcement(&self) -> Option<ScoreAward> {
+        if self.score_announcement_ticks_remaining == 0 {
+            return None;
+        }
+
+        self.last_score_award
     }
 
     pub fn get_rows_cleared(&self) -> usize {

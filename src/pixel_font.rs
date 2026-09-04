@@ -34,7 +34,7 @@ const DIGIT_GAP: usize = 1;
 
 /// Every character the 5x7 face has a glyph for. Lookups are
 /// case-insensitive, so lowercase letters share the uppercase glyphs.
-pub const SMALL_GLYPH_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/>!:,.-";
+pub const SMALL_GLYPH_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/+>!:,.-";
 
 /// Every character the bold numeral face has a glyph for.
 pub const DIGIT_GLYPH_CHARS: &str = "0123456789,";
@@ -153,6 +153,9 @@ pub fn small_glyph(character: char) -> [u8; 7] {
         ],
         '/' => [
             0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
         ],
         '>' => [
             0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000,
