@@ -265,7 +265,8 @@ const PREVIEW_SCALE: f32 = 0.74;
 const GAME_OVER_WASH: f32 = 0.7;
 
 const LABEL_TEXT_SIZE: f32 = 20.0;
-const LINE_COUNT_TEXT_SIZE: f32 = 16.0;
+const LINE_COUNT_TEXT_SIZE: f32 = 28.0;
+const LINE_COUNT_COMPACT_TEXT_SIZE: f32 = 16.0;
 const CONTROL_TEXT_SIZE: f32 = 16.0;
 const MENU_TITLE_TEXT_SIZE: f32 = 42.0;
 const MENU_ITEM_TEXT_SIZE: f32 = 19.0;
@@ -881,6 +882,7 @@ struct StatsReadoutLayout {
     level_window: Rect,
     lines_header_top: f32,
     lines: Rect,
+    lines_size: f32,
     progress: Rect,
 }
 
@@ -894,7 +896,12 @@ fn line_count_text(rows_cleared: usize) -> String {
 
 fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
     let scale = hud_scale();
-    let (line_width, line_height, _) = pixel_text_metrics(line_text, LINE_COUNT_TEXT_SIZE);
+    let lines_size = if pixel_text_metrics(line_text, LINE_COUNT_TEXT_SIZE).0 <= rect.w - 32.0 * scale {
+        LINE_COUNT_TEXT_SIZE
+    } else {
+        LINE_COUNT_COMPACT_TEXT_SIZE
+    };
+    let (line_width, line_height, _) = pixel_text_metrics(line_text, lines_size);
     let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
     let window_height = readout_height();
     let window_top = (rect.y + (HUD_HEADER_DIVIDER_OFFSET + 8.0) * scale).round();
@@ -918,10 +925,11 @@ fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
         lines_header_top,
         lines: Rect::new(
             (rect.x + (rect.w - line_width) * 0.5).round(),
-            (lines_header_top + header_band_height() + 10.0 * scale).round(),
+            (lines_header_top + header_band_height() + 4.0 * scale).round(),
             line_width,
             line_height,
         ),
+        lines_size,
         progress,
     }
 }
@@ -944,7 +952,7 @@ fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, 
         &line_text,
         positions.lines.x,
         positions.lines.y + positions.lines.h,
-        LINE_COUNT_TEXT_SIZE,
+        positions.lines_size,
         COLOR_TEXT,
     );
 
@@ -1869,6 +1877,10 @@ mod tests {
             let positions = stats_readout_layout(rect, &text);
             let window_center = positions.level_window.x + positions.level_window.w * 0.5;
 
+            assert_eq!(
+                positions.lines_size,
+                if lines <= 99_999 { LINE_COUNT_TEXT_SIZE } else { LINE_COUNT_COMPACT_TEXT_SIZE }
+            );
             assert!((window_center - (rect.x + rect.w * 0.5)).abs() <= 0.5);
             assert!(positions.level_window.x >= rect.x + PANEL_FRAME + 1.0);
             assert!(
