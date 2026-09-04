@@ -108,10 +108,17 @@ pub struct GameInput {
     pub soft_drop: bool,
     pub shift_left: bool,
     pub shift_right: bool,
+    pub rotate_left: bool,
     pub rotate_right: bool,
     pub hard_drop: bool,
     pub hold_piece: bool,
     pub toggle_pause: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RotationDirection {
+    Clockwise,
+    Counterclockwise,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -473,8 +480,11 @@ impl<'a> GameState<'a> {
         }
     }
 
-    fn try_rotate_right(&mut self) {
-        let next_orientation = (self.active_piece_orientation + 1) % 4;
+    fn try_rotate(&mut self, direction: RotationDirection) {
+        let next_orientation = match direction {
+            RotationDirection::Clockwise => (self.active_piece_orientation + 1) % 4,
+            RotationDirection::Counterclockwise => (self.active_piece_orientation + 3) % 4,
+        };
 
         let offsets_a = self.active_piece.orientations[self.active_piece_orientation].offsets;
         let offsets_b = self.active_piece.orientations[next_orientation].offsets;
@@ -668,8 +678,14 @@ impl<'a> GameState<'a> {
 
         self.update_lock_contact();
 
-        if input.rotate_right {
-            self.try_rotate_right();
+        // Opposite presses in the same sample cancel, rather than rotating twice.
+        let rotation = match (input.rotate_left, input.rotate_right) {
+            (true, false) => Some(RotationDirection::Counterclockwise),
+            (false, true) => Some(RotationDirection::Clockwise),
+            _ => None,
+        };
+        if let Some(direction) = rotation {
+            self.try_rotate(direction);
             self.lock_if_due();
             if self.is_game_over {
                 return;
@@ -1177,6 +1193,10 @@ impl<'a> GameState<'a> {
 #[cfg(test)]
 #[path = "game_state_rules_tests.rs"]
 mod rules_tests;
+
+#[cfg(test)]
+#[path = "game_state_rotation_tests.rs"]
+mod rotation_tests;
 
 #[cfg(test)]
 mod tests {

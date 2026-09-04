@@ -618,6 +618,7 @@ fn game_over_ignores_all_further_input_including_pause() {
             soft_drop: true,
             shift_left: true,
             shift_right: true,
+            rotate_left: true,
             rotate_right: true,
             hard_drop: true,
             hold_piece: true,
@@ -1846,6 +1847,7 @@ fn menu_resume_preserves_held_das_phase_and_ignores_paused_actions() {
     state.update_with_elapsed(
         Duration::from_secs(60),
         GameInput {
+            rotate_left: true,
             rotate_right: true,
             hard_drop: true,
             hold_piece: true,
@@ -1858,6 +1860,7 @@ fn menu_resume_preserves_held_das_phase_and_ignores_paused_actions() {
     assert_eq!(occupied_cells(&state.grid_locked), 0);
     assert_matching_motion(&state, &frozen);
     assert!(state.held_input.shift_right);
+    assert!(!state.held_input.rotate_left);
     assert!(!state.held_input.rotate_right);
     assert!(!state.held_input.hard_drop);
     assert!(!state.held_input.hold_piece);
@@ -1942,6 +1945,7 @@ fn catch_up_stops_at_top_out_before_later_ticks_or_newly_sampled_actions() {
             soft_drop: true,
             shift_left: true,
             shift_right: true,
+            rotate_left: true,
             rotate_right: true,
             hard_drop: true,
             hold_piece: true,

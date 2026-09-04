@@ -934,7 +934,7 @@ fn draw_controls(hud: &Surface, layout: &HudLayout) {
 
     let rows = [
         ("L/R", "MOVE", 42.0),
-        ("UP", "ROTATE", 28.0),
+        ("Z/X", "ROTATE", 42.0),
         ("SPACE", "DROP", 62.0),
         ("C", "HOLD", 28.0),
     ];
