@@ -251,11 +251,9 @@ const COLOR_AMBER: Color = color_u8!(231, 148, 49, 255);
 const COLOR_TEXT: Color = color_u8!(242, 229, 193, 255);
 const COLOR_TEXT_MUTED: Color = color_u8!(169, 157, 121, 255);
 
-/// Horizontal/depth references for preview pieces. Their world-space `y` is
-/// derived from the card's screen-space content area so previews stay centred
-/// and padded even when the camera or panel layout changes.
+/// Horizontal/depth reference for HOLD. Its world-space `y` is derived from
+/// the card's padded screen-space content area.
 const HOLD_PREVIEW_REFERENCE: Vec3 = Vec3::new(-10.2, 0.0, 0.0);
-const NEXT_PREVIEW_REFERENCE: Vec3 = Vec3::new(10.2, 0.0, 0.0);
 
 /// Edge length of a preview block. Pieces outside the well are drawn smaller
 /// than playfield blocks so a 4-wide I piece fits the side panel.
@@ -289,6 +287,7 @@ const HUD_TOP_OFFSET: f32 = -6.0;
 const HUD_LOWER_OFFSET: f32 = 320.0;
 const HUD_HOLD_HEIGHT: f32 = 144.0;
 const HUD_NEXT_HEIGHT: f32 = 280.0;
+const NEXT_SLOT_COUNT: usize = 3;
 const HUD_HEADER_DIVIDER_OFFSET: f32 = 36.0;
 const HUD_PREVIEW_TOP_PADDING: f32 = 12.0;
 const HUD_PREVIEW_BOTTOM_PADDING: f32 = 12.0;
@@ -636,6 +635,37 @@ fn controls_panel_height() -> f32 {
     (last_row_top + key_height + 1.0 + PANEL_FRAME + CONTROL_BOTTOM_PADDING * scale).ceil()
 }
 
+/// Round the desired height up to fit equal, whole-pixel clear slots.
+fn next_panel_height() -> f32 {
+    // Reserve the header, one pixel per header/separator rule, and the bottom
+    // inner bevel and frame. The remaining height belongs entirely to slots.
+    let fixed_height =
+        HUD_HEADER_DIVIDER_OFFSET * hud_scale() + NEXT_SLOT_COUNT as f32 + PANEL_FRAME + 1.0;
+    let slot_height = (((HUD_NEXT_HEIGHT * hud_scale()).round() - fixed_height)
+        / NEXT_SLOT_COUNT as f32)
+        .ceil();
+
+    fixed_height + slot_height * NEXT_SLOT_COUNT as f32
+}
+
+/// Clear face rectangles, excluding the header/separator rules and inner bevel.
+/// Both preview centres and separator positions come from these slots.
+fn next_slot_rects(rect: Rect) -> [Rect; NEXT_SLOT_COUNT] {
+    let inset = PANEL_FRAME + 1.0;
+    let top = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale() + 1.0;
+    let bottom = rect.y + rect.h - inset;
+    let slot_height = (bottom - top - (NEXT_SLOT_COUNT - 1) as f32) / NEXT_SLOT_COUNT as f32;
+
+    std::array::from_fn(|index| {
+        Rect::new(
+            rect.x + inset,
+            top + index as f32 * (slot_height + 1.0),
+            rect.w - inset * 2.0,
+            slot_height,
+        )
+    })
+}
+
 fn hud_layout() -> HudLayout {
     let scale = hud_scale();
     let well = well_screen_rect();
@@ -661,7 +691,7 @@ fn hud_layout() -> HudLayout {
             right_x,
             top_y,
             panel_width,
-            (HUD_NEXT_HEIGHT * scale).round(),
+            next_panel_height(),
         ),
         controls: Rect::new(left_x, lower_y, panel_width, lower_height),
         stats: Rect::new(right_x, lower_y, panel_width, lower_height),
@@ -669,6 +699,7 @@ fn hud_layout() -> HudLayout {
     }
 }
 
+/// HOLD's padded preview range; NEXT uses the actual clear-slot rectangles.
 fn preview_content_vertical_bounds(rect: Rect) -> (f32, f32) {
     let scale = hud_scale();
     (
@@ -698,12 +729,10 @@ fn hold_piece_anchor(layout: &HudLayout) -> Vec3 {
     )
 }
 
-fn next_piece_anchor(layout: &HudLayout, index: usize) -> Vec3 {
-    debug_assert!(index < 3);
-    let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
-    let slot_height = (content_bottom - content_top) / 3.0;
-    let target_y = content_top + slot_height * (index as f32 + 0.5);
-    preview_anchor_at_screen_y(NEXT_PREVIEW_REFERENCE, target_y.round())
+fn next_piece_anchor(layout: &HudLayout, index: usize, shake: Vec2) -> Vec3 {
+    debug_assert!(index < NEXT_SLOT_COUNT);
+    let slot = next_slot_rects(layout.next)[index];
+    ScreenPlane::new(0.0, shake).world(vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5))
 }
 
 fn header_band_height() -> f32 {
@@ -744,20 +773,23 @@ fn draw_panel_header_at(hud: &Surface, rect: Rect, label: &str, top: f32) {
     hud.hline(origin.x, right, divider_y, COLOR_PANEL_BORDER);
 }
 
-fn draw_next_slot_guides(hud: &Surface, layout: &HudLayout) {
-    let rect = layout.next;
-    let (content_top, content_bottom) = preview_content_vertical_bounds(rect);
-    let slot_height = (content_bottom - content_top) / 3.0;
+fn next_slot_guides(rect: Rect) -> [Rect; NEXT_SLOT_COUNT - 1] {
+    let slots = next_slot_rects(rect);
     let inset = 16.0 * hud_scale();
 
-    for slot in 1..3 {
-        let y = (content_top + slot_height * slot as f32).round();
-        hud.hline(
+    std::array::from_fn(|index| {
+        Rect::new(
             rect.x + inset,
-            rect.x + rect.w - inset,
-            y,
-            color_u8!(69, 65, 54, 120),
-        );
+            slots[index].y + slots[index].h,
+            rect.w - inset * 2.0,
+            1.0,
+        )
+    })
+}
+
+fn draw_next_slot_guides(hud: &Surface, layout: &HudLayout) {
+    for guide in next_slot_guides(layout.next) {
+        hud.fill(guide, color_u8!(69, 65, 54, 120));
     }
 }
 
@@ -1270,13 +1302,14 @@ fn draw_score_announcement(
 /// Draw the next-piece queue into the right side panel.
 fn draw_piece_previews(
     layout: &HudLayout,
-    piece_previews: [Piece; 3],
+    piece_previews: [Piece; NEXT_SLOT_COUNT],
     textures: &SceneTextures,
     lights: SceneLights,
+    shake: Vec2,
 ) {
     for (offset, piece) in piece_previews.iter().enumerate() {
         piece.draw(PiecePreviewArgs {
-            center: next_piece_anchor(layout, offset),
+            center: next_piece_anchor(layout, offset, shake),
             scale: PREVIEW_SCALE,
             textures,
             lights,
@@ -1460,7 +1493,7 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
                 wash: 0.0,
             });
         }
-        draw_piece_previews(&layout, self.get_piece_previews(), textures, lights);
+        draw_piece_previews(&layout, self.get_piece_previews(), textures, lights, frame.shake);
         draw_held_piece(&layout, self.get_held_piece(), textures, lights);
         draw_shrapnel(self.get_shrapnel(), textures);
         let (clear_count, clear_remaining) = self.get_clear_effect();
@@ -1760,7 +1793,7 @@ mod tests {
     use super::*;
     use crate::piece::pieces;
 
-    fn preview_vertical_bounds(piece: Piece, center: Vec3) -> (f32, f32) {
+    fn preview_screen_bounds(piece: Piece, center: Vec3, shake: Vec2) -> Rect {
         let (blocks, _, _) = piece.get_blocks(0);
         let (min_row, max_row, min_col, max_col) = piece.get_trimmed_bounds(0);
         let span_cols = (max_col - min_col) as f32;
@@ -1768,8 +1801,8 @@ mod tests {
         let origin_x = center.x - (span_cols * PREVIEW_SCALE / 2.0) + (PREVIEW_SCALE / 2.0);
         let origin_y = center.y + (span_rows * PREVIEW_SCALE / 2.0) - (PREVIEW_SCALE / 2.0);
         let half_cube = BLOCK_INSET * PREVIEW_SCALE * 0.5;
-        let mut top = f32::INFINITY;
-        let mut bottom = f32::NEG_INFINITY;
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
 
         for row_id in min_row..max_row {
             for col_id in min_col..max_col {
@@ -1783,18 +1816,21 @@ mod tests {
                     center.z,
                 );
 
-                for y_sign in [-1.0, 1.0] {
-                    for z_sign in [-1.0, 1.0] {
-                        let corner = position + Vec3::new(0.0, y_sign, z_sign) * half_cube;
-                        let screen_y = world_to_screen(corner).y;
-                        top = top.min(screen_y);
-                        bottom = bottom.max(screen_y);
+                // Include the depth of every rendered cube, not just cell centres.
+                for x_sign in [-1.0, 1.0] {
+                    for y_sign in [-1.0, 1.0] {
+                        for z_sign in [-1.0, 1.0] {
+                            let corner = position + vec3(x_sign, y_sign, z_sign) * half_cube;
+                            let screen = world_to_screen_with_shake(corner, shake);
+                            min = min.min(screen);
+                            max = max.max(screen);
+                        }
                     }
                 }
             }
         }
 
-        (top, bottom)
+        Rect::new(min.x, min.y, max.x - min.x, max.y - min.y)
     }
 
     #[test]
@@ -2155,7 +2191,49 @@ mod tests {
     }
 
     #[test]
-    fn every_next_piece_fits_inside_each_padded_queue_slot() {
+    fn next_slots_share_equal_clear_space_between_pixel_aligned_rules() {
+        let layout = hud_layout();
+        let panel = layout.next;
+        let slots = next_slot_rects(panel);
+        let guides = next_slot_guides(panel);
+        let header_divider = panel.y + PANEL_FRAME + 1.0 + header_band_height();
+        let bottom_bevel = panel.y + panel.h - PANEL_FRAME - 1.0;
+        let desired_height = (HUD_NEXT_HEIGHT * hud_scale()).round();
+        let centers = slots.map(|slot| vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5));
+
+        assert_eq!(panel.h, 142.0);
+        assert!(panel.h >= desired_height && panel.h < desired_height + NEXT_SLOT_COUNT as f32);
+        assert!(panel.y + panel.h < layout.stats.y);
+        assert_eq!(slots.map(|slot| slot.y - panel.y), [19.0, 58.0, 97.0]);
+        assert_eq!(slots.map(|slot| slot.y + slot.h - panel.y), [57.0, 96.0, 135.0]);
+        assert_eq!(slots.map(|slot| slot.h), [38.0; NEXT_SLOT_COUNT]);
+        assert_eq!(slots[0].y, header_divider + 1.0);
+        assert_eq!(slots[NEXT_SLOT_COUNT - 1].y + slots[NEXT_SLOT_COUNT - 1].h, bottom_bevel);
+        assert_eq!(centers[1] - centers[0], vec2(0.0, 39.0));
+        assert_eq!(centers[2] - centers[1], centers[1] - centers[0]);
+
+        for slot in slots {
+            assert_eq!(slot.x, panel.x + PANEL_FRAME + 1.0);
+            assert_eq!(slot.x + slot.w, panel.x + panel.w - PANEL_FRAME - 1.0);
+        }
+
+        for (index, guide) in guides.into_iter().enumerate() {
+            assert_eq!(guide.y, slots[index].y + slots[index].h);
+            assert_eq!(guide.y + guide.h, slots[index + 1].y);
+            assert_eq!(guide.h, 1.0);
+            assert_eq!(guide.x, panel.x + 16.0 * hud_scale());
+            assert_eq!(guide.x + guide.w, panel.x + panel.w - 16.0 * hud_scale());
+        }
+
+        for bounds in slots.into_iter().chain(guides) {
+            for value in [bounds.x, bounds.y, bounds.w, bounds.h] {
+                assert_eq!(value.fract(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn every_next_piece_stays_centered_inside_each_clear_slot_during_shake() {
         let pieces = [
             pieces::I,
             pieces::J,
@@ -2166,34 +2244,67 @@ mod tests {
             pieces::Z,
         ];
         let layout = hud_layout();
-        let (content_top, content_bottom) = preview_content_vertical_bounds(layout.next);
-        let slot_height = (content_bottom - content_top) / 3.0;
-        let minimum_slot_padding = 2.0;
-        let anchors = [
-            next_piece_anchor(&layout, 0),
-            next_piece_anchor(&layout, 1),
-            next_piece_anchor(&layout, 2),
-        ];
-        let first_gap = world_to_screen(anchors[1]).y - world_to_screen(anchors[0]).y;
-        let second_gap = world_to_screen(anchors[2]).y - world_to_screen(anchors[1]).y;
+        let slots = next_slot_rects(layout.next);
+        let minimum_slot_padding = 5.0;
+        let tolerance = 0.001;
 
-        assert!((first_gap - second_gap).abs() <= 1.0);
+        for piece in pieces {
+            let resting_bounds = preview_screen_bounds(
+                piece,
+                next_piece_anchor(&layout, 0, Vec2::ZERO),
+                Vec2::ZERO,
+            );
+            let expected_clearance = vec2(
+                (slots[0].w - resting_bounds.w) * 0.5,
+                (slots[0].h - resting_bounds.h) * 0.5,
+            );
 
-        for (slot_index, anchor) in anchors.into_iter().enumerate() {
-            let slot_top = content_top + slot_height * slot_index as f32;
-            let slot_bottom = slot_top + slot_height;
-            for piece in pieces {
-                let (top, bottom) = preview_vertical_bounds(piece, anchor);
-                assert!(
-                    top >= slot_top + minimum_slot_padding,
-                    "{} exceeds the padded slot top",
-                    piece.name
-                );
-                assert!(
-                    bottom <= slot_bottom - minimum_slot_padding,
-                    "{} exceeds the padded slot bottom",
-                    piece.name
-                );
+            // Rest, signed axis maxima, and all corners of camera_shake's
+            // component envelope; the two oscillations need not peak together.
+            for shake_x in [-0.25, 0.0, 0.25] {
+                for shake_y in [-0.25, 0.0, 0.25] {
+                    let shake = vec2(shake_x, shake_y);
+
+                    for (slot_index, slot) in slots.into_iter().enumerate() {
+                        let anchor = next_piece_anchor(&layout, slot_index, shake);
+                        assert!(anchor.z.abs() < tolerance);
+
+                        let expected_center = vec2(slot.x + slot.w * 0.5, slot.y + slot.h * 0.5);
+                        let anchor_screen = world_to_screen_with_shake(anchor, shake);
+                        assert!((anchor_screen - expected_center).length() < tolerance);
+
+                        let bounds = preview_screen_bounds(piece, anchor, shake);
+                        let center = vec2(bounds.x + bounds.w * 0.5, bounds.y + bounds.h * 0.5);
+                        assert!(
+                            (center.x - expected_center.x).abs() < tolerance,
+                            "{} x centre in slot {slot_index} under {shake:?}",
+                            piece.name
+                        );
+                        assert!(
+                            (center.y - expected_center.y).abs() < tolerance,
+                            "{} y centre in slot {slot_index} under {shake:?}",
+                            piece.name
+                        );
+
+                        for (edge, clearance, expected) in [
+                            ("left", bounds.x - slot.x, expected_clearance.x),
+                            ("right", slot.x + slot.w - bounds.x - bounds.w, expected_clearance.x),
+                            ("top", bounds.y - slot.y, expected_clearance.y),
+                            ("bottom", slot.y + slot.h - bounds.y - bounds.h, expected_clearance.y),
+                        ] {
+                            assert!(
+                                clearance >= minimum_slot_padding,
+                                "{} {edge} clearance in slot {slot_index} under {shake:?}: {clearance}",
+                                piece.name
+                            );
+                            assert!(
+                                (clearance - expected).abs() < tolerance,
+                                "{} {edge} clearance changes in slot {slot_index} under {shake:?}",
+                                piece.name
+                            );
+                        }
+                    }
+                }
             }
         }
     }
