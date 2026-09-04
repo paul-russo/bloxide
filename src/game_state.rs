@@ -1139,6 +1139,12 @@ impl<'a> GameState<'a> {
         self.end_game();
     }
 
+    /// Seed large HUD counters for screenshot/telemetry layout checks. This is
+    /// not a gameplay transition and does not award points or consume pieces.
+    pub fn set_line_count_for_harness(&mut self, lines: usize) {
+        self.rows_cleared = lines;
+    }
+
     pub fn get_grid_active(&self) -> &Grid {
         &self.grid_active
     }
