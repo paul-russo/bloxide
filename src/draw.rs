@@ -879,7 +879,7 @@ fn draw_indicator_pip(hud: &Surface, x: f32, y: f32, size: f32, lit: bool) {
 }
 
 struct StatsReadoutLayout {
-    level_window: Rect,
+    level_area: Rect,
     lines_header_top: f32,
     lines: Rect,
     lines_size: f32,
@@ -916,7 +916,7 @@ fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
     let lines_header_top = (window_top + window_height + 4.0 * scale).round();
 
     StatsReadoutLayout {
-        level_window: Rect::new(
+        level_area: Rect::new(
             (rect.x + (rect.w - window_width) * 0.5).round(),
             window_top,
             window_width,
@@ -934,16 +934,33 @@ fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
     }
 }
 
+fn level_digit_origin(area: Rect, text: &str) -> Vec2 {
+    vec2(
+        (area.x + (area.w - digit_text_width(text, READOUT_PIXEL)) * 0.5).round(),
+        (area.y + (area.h - DIGIT_HEIGHT as f32 * READOUT_PIXEL) * 0.5).round(),
+    )
+}
+
 /// Centred values beneath matching LEVEL and LINES section headers.
 fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
     let line_text = line_count_text(rows_cleared);
     let positions = stats_readout_layout(layout.stats, &line_text);
+    let level_text = format!("{level:02}");
+    let origin = level_digit_origin(positions.level_area, &level_text);
 
-    draw_readout_window(
-        hud,
-        positions.level_window,
-        &format!("{level:02}"),
-        "00",
+    // Keep the numerals and their subtle bloom, without a separate glass inset.
+    hud.digit_text(
+        &level_text,
+        origin.x + 1.0,
+        origin.y + 1.0,
+        READOUT_PIXEL,
+        shaded(COLOR_TEXT, 0.25),
+    );
+    hud.digit_text(
+        &level_text,
+        origin.x,
+        origin.y,
+        READOUT_PIXEL,
         COLOR_TEXT,
     );
     draw_panel_header_at(hud, layout.stats, "LINES", positions.lines_header_top);
@@ -1875,19 +1892,19 @@ mod tests {
         for lines in [0, 99, 100, 999, 1000, 12_345, 99_999, 100_000, usize::MAX] {
             let text = line_count_text(lines);
             let positions = stats_readout_layout(rect, &text);
-            let window_center = positions.level_window.x + positions.level_window.w * 0.5;
+            let value_center = positions.level_area.x + positions.level_area.w * 0.5;
 
             assert_eq!(
                 positions.lines_size,
                 if lines <= 99_999 { LINE_COUNT_TEXT_SIZE } else { LINE_COUNT_COMPACT_TEXT_SIZE }
             );
-            assert!((window_center - (rect.x + rect.w * 0.5)).abs() <= 0.5);
-            assert!(positions.level_window.x >= rect.x + PANEL_FRAME + 1.0);
+            assert!((value_center - (rect.x + rect.w * 0.5)).abs() <= 0.5);
+            assert!(positions.level_area.x >= rect.x + PANEL_FRAME + 1.0);
             assert!(
-                positions.level_window.y
+                positions.level_area.y
                     > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale()
             );
-            assert!(positions.lines_header_top > positions.level_window.y + positions.level_window.h);
+            assert!(positions.lines_header_top > positions.level_area.y + positions.level_area.h);
             assert!(positions.lines.x >= rect.x + PANEL_FRAME + 1.0, "{text}");
             assert!(
                 positions.lines.x + positions.lines.w + 1.0 <= rect.x + rect.w - PANEL_FRAME,
@@ -1897,16 +1914,34 @@ mod tests {
             assert!(positions.lines.y + positions.lines.h + 1.0 < positions.progress.y);
             assert!(positions.progress.y + positions.progress.h < rect.y + rect.h - PANEL_FRAME);
             assert_eq!(
-                (positions.level_window.x, positions.level_window.y),
-                (original.level_window.x, original.level_window.y)
+                (positions.level_area.x, positions.level_area.y),
+                (original.level_area.x, original.level_area.y)
             );
 
             for level in [1, 9, 10, 20] {
                 assert!(
                     digit_text_width(&format!("{level:02}"), READOUT_PIXEL)
-                        <= positions.level_window.w - READOUT_PADDING * 2.0
+                        <= positions.level_area.w - READOUT_PADDING * 2.0
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plain_level_digits_keep_their_size_and_centering() {
+        let panel = hud_layout().stats;
+        let area = stats_readout_layout(panel, &line_count_text(99_999)).level_area;
+        let height = DIGIT_HEIGHT as f32 * READOUT_PIXEL;
+
+        for level in [1, 9, 10, 20] {
+            let text = format!("{level:02}");
+            let width = digit_text_width(&text, READOUT_PIXEL);
+            let origin = level_digit_origin(area, &text);
+
+            assert_eq!(origin.x + width * 0.5, panel.x + panel.w * 0.5);
+            assert_eq!(origin.y + height * 0.5, area.y + area.h * 0.5);
+            assert!(origin.x >= area.x && origin.x + width + 1.0 <= area.x + area.w);
+            assert!(origin.y >= area.y && origin.y + height + 1.0 <= area.y + area.h);
         }
     }
 
