@@ -271,6 +271,8 @@ const GAME_OVER_WASH: f32 = 0.7;
 
 const LABEL_TEXT_SIZE: f32 = 20.0;
 const STATS_TEXT_SIZE: f32 = 18.0;
+const LINE_COUNT_TEXT_SIZE: f32 = 16.0;
+const CONTROL_TEXT_SIZE: f32 = 16.0;
 const MENU_TITLE_TEXT_SIZE: f32 = 42.0;
 const MENU_ITEM_TEXT_SIZE: f32 = 19.0;
 
@@ -292,7 +294,6 @@ const HUD_TOP_OFFSET: f32 = -6.0;
 const HUD_LOWER_OFFSET: f32 = 320.0;
 const HUD_HOLD_HEIGHT: f32 = 144.0;
 const HUD_NEXT_HEIGHT: f32 = 280.0;
-const HUD_LOWER_HEIGHT: f32 = 164.0;
 const HUD_HEADER_DIVIDER_OFFSET: f32 = 36.0;
 const HUD_PREVIEW_TOP_PADDING: f32 = 12.0;
 const HUD_PREVIEW_BOTTOM_PADDING: f32 = 12.0;
@@ -300,6 +301,19 @@ const HUD_AWARD_GAP: f32 = 16.0;
 const AWARD_TEXT_SIZE: f32 = 16.0;
 const AWARD_FIRST_BASELINE: f32 = 58.0;
 const AWARD_LINE_PITCH: f32 = 20.0;
+const CONTROL_ROW_TOP: f32 = 48.0;
+const CONTROL_ROW_PITCH: f32 = 28.0;
+const CONTROL_KEY_HEIGHT: f32 = 22.0;
+const CONTROL_BOTTOM_PADDING: f32 = 16.0;
+const PROGRESS_PIP_SIZE: f32 = 5.0;
+const PROGRESS_PIP_GAP: f32 = 2.0;
+const CONTROL_ROWS: [(&str, &str, f32); 5] = [
+    ("L/R", "MOVE", 42.0),
+    ("Z/X", "ROTATE", 42.0),
+    ("SPACE", "DROP", 62.0),
+    ("C", "HOLD", 28.0),
+    ("ESC", "PAUSE", 42.0),
+];
 
 /// How the blocks of a grid should be rendered inside the well.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -611,6 +625,16 @@ struct HudLayout {
     score: Rect,
 }
 
+fn controls_panel_height() -> f32 {
+    let scale = hud_scale();
+    let last_row_top =
+        ((CONTROL_ROW_TOP + (CONTROL_ROWS.len() - 1) as f32 * CONTROL_ROW_PITCH) * scale).round();
+    let key_height = (CONTROL_KEY_HEIGHT * scale).round();
+
+    // Include the keycap's one-pixel drop shadow, the frame, and inner padding.
+    (last_row_top + key_height + 1.0 + PANEL_FRAME + CONTROL_BOTTOM_PADDING * scale).ceil()
+}
+
 fn hud_layout() -> HudLayout {
     let scale = hud_scale();
     let well = well_screen_rect();
@@ -622,6 +646,7 @@ fn hud_layout() -> HudLayout {
     let right_x = (well.x + well.w + side_gap).round();
     let award_top = (top_y + (HUD_HOLD_HEIGHT + HUD_AWARD_GAP) * scale).round();
     let award_bottom = (lower_y - HUD_AWARD_GAP * scale).round();
+    let lower_height = controls_panel_height();
 
     HudLayout {
         hold: Rect::new(
@@ -637,18 +662,8 @@ fn hud_layout() -> HudLayout {
             panel_width,
             (HUD_NEXT_HEIGHT * scale).round(),
         ),
-        controls: Rect::new(
-            left_x,
-            lower_y,
-            panel_width,
-            (HUD_LOWER_HEIGHT * scale).round(),
-        ),
-        stats: Rect::new(
-            right_x,
-            lower_y,
-            panel_width,
-            (HUD_LOWER_HEIGHT * scale).round(),
-        ),
+        controls: Rect::new(left_x, lower_y, panel_width, lower_height),
+        stats: Rect::new(right_x, lower_y, panel_width, lower_height),
         score: lintel_screen_rect(),
     }
 }
@@ -690,14 +705,22 @@ fn next_piece_anchor(layout: &HudLayout, index: usize) -> Vec3 {
     preview_anchor_at_screen_y(NEXT_PREVIEW_REFERENCE, target_y.round())
 }
 
-/// Nameplate strip across the top of a panel face, with the label engraved
-/// into it and a rule underneath.
+/// Baseline of an engraved title, centred between the frame and header divider.
+fn panel_header_baseline(rect: Rect) -> f32 {
+    let top = rect.y + PANEL_FRAME + 1.0;
+    let bottom = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+    let text_height = SMALL_GLYPH_HEIGHT * text_pixel(LABEL_TEXT_SIZE);
+
+    // Centre the glyphs and their one-pixel engraving shadow inside the strip.
+    (top + (bottom - top - text_height - 1.0) * 0.5 + text_height).floor()
+}
+
 fn draw_panel_header(hud: &Surface, rect: Rect, label: &str) {
     let scale = hud_scale();
     let inset = PANEL_FRAME + 1.0;
     let left = rect.x + (16.0 * scale);
     let right = rect.x + rect.w - (16.0 * scale);
-    let baseline = rect.y + (24.0 * scale);
+    let baseline = panel_header_baseline(rect);
     let divider_y = rect.y + (HUD_HEADER_DIVIDER_OFFSET * scale);
 
     hud.fill(
@@ -847,72 +870,127 @@ fn draw_indicator_pip(hud: &Surface, x: f32, y: f32, size: f32, lit: bool) {
     }
 }
 
-/// Draw the level and cleared-line counts beneath the next queue, as two bold
-/// readouts over a row of ten indicator lamps counting lines toward the next
-/// level.
-fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
-    let scale = hud_scale();
-    let rect = layout.stats;
-    let mid_x = (rect.x + rect.w * 0.5).round();
-    let label_baseline = rect.y + (58.0 * scale);
-    let window_top = rect.y + (64.0 * scale);
-    let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
+struct StatsReadoutLayout {
+    level_label: Vec2,
+    level_window: Rect,
+    lines: Rect,
+    progress: Rect,
+}
 
-    for (label, value, center_x) in [
-        ("LEVEL", level, rect.x + rect.w * 0.25),
-        ("LINES", rows_cleared, rect.x + rect.w * 0.75),
-    ] {
-        let (label_width, _, _) = pixel_text_metrics(label, STATS_TEXT_SIZE);
-        draw_engraved_text(
-            hud,
-            label,
-            (center_x - label_width * 0.5).round(),
-            label_baseline,
-            STATS_TEXT_SIZE,
-            COLOR_TEXT_MUTED,
-        );
-        draw_readout_window(
-            hud,
-            Rect::new(
-                (center_x - window_width * 0.5).round(),
-                window_top,
-                window_width,
-                readout_height(),
-            ),
-            &format!("{:02}", value),
-            "00",
-            COLOR_TEXT,
-        );
+fn line_count_text(rows_cleared: usize) -> String {
+    if rows_cleared > 99_999 {
+        return String::from("LINES 99999+");
     }
 
-    hud.vline(
-        mid_x,
-        rect.y + (48.0 * scale),
-        window_top + readout_height(),
-        color_u8!(72, 68, 57, 180),
+    format!("LINES {rows_cleared}")
+}
+
+fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
+    let scale = hud_scale();
+    let (label_width, label_height, _) = pixel_text_metrics("LEVEL", STATS_TEXT_SIZE);
+    let (line_width, line_height, _) = pixel_text_metrics(line_text, LINE_COUNT_TEXT_SIZE);
+    let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
+    let window_height = readout_height();
+    let label_gap = (8.0 * scale).round();
+    let group_width = label_width + label_gap + window_width;
+    let group_x = (rect.x + (rect.w - group_width) * 0.5).round();
+    let bar_width = PROGRESS_PIP_SIZE * 10.0 + PROGRESS_PIP_GAP * 9.0;
+    let progress = Rect::new(
+        (rect.x + (rect.w - bar_width) * 0.5).round(),
+        (rect.y + rect.h - PANEL_FRAME - 12.0 * scale - PROGRESS_PIP_SIZE).round(),
+        bar_width,
+        PROGRESS_PIP_SIZE,
     );
 
-    let pip = 5.0;
-    let gap = 2.0;
-    let bar_width = pip * 10.0 + gap * 9.0;
-    let bar_x = (rect.x + (rect.w - bar_width) * 0.5).round();
-    let bar_y = rect.y + rect.h - PANEL_FRAME - (12.0 * scale) - pip;
+    let content_top = rect.y + (HUD_HEADER_DIVIDER_OFFSET + 16.0) * scale;
+    let content_bottom = progress.y - 16.0 * scale;
+    let row_gap = 24.0 * scale;
+    let group_height = window_height + row_gap + line_height + 1.0;
+    let group_y = (content_top + (content_bottom - content_top - group_height) * 0.5).round();
+
+    StatsReadoutLayout {
+        level_label: vec2(
+            group_x,
+            (group_y + (window_height + label_height - 1.0) * 0.5).floor(),
+        ),
+        level_window: Rect::new(
+            group_x + label_width + label_gap,
+            group_y,
+            window_width,
+            window_height,
+        ),
+        lines: Rect::new(
+            (rect.x + (rect.w - line_width) * 0.5).round(),
+            (group_y + window_height + row_gap).round(),
+            line_width,
+            line_height,
+        ),
+        progress,
+    }
+}
+
+/// A centred LEVEL row, a smaller five-digit line count below it, and progress
+/// lamps. The counters no longer compete for half of the same horizontal row.
+fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
+    let line_text = line_count_text(rows_cleared);
+    let positions = stats_readout_layout(layout.stats, &line_text);
+
+    draw_engraved_text(
+        hud,
+        "LEVEL",
+        positions.level_label.x,
+        positions.level_label.y,
+        STATS_TEXT_SIZE,
+        COLOR_TEXT_MUTED,
+    );
+    draw_readout_window(
+        hud,
+        positions.level_window,
+        &format!("{level:02}"),
+        "00",
+        COLOR_TEXT,
+    );
+    draw_engraved_text(
+        hud,
+        &line_text,
+        positions.lines.x,
+        positions.lines.y + positions.lines.h,
+        LINE_COUNT_TEXT_SIZE,
+        COLOR_TEXT,
+    );
+
     let completed = rows_cleared % 10;
+
     for segment in 0..10 {
         draw_indicator_pip(
             hud,
-            bar_x + segment as f32 * (pip + gap),
-            bar_y,
-            pip,
+            positions.progress.x + segment as f32 * (PROGRESS_PIP_SIZE + PROGRESS_PIP_GAP),
+            positions.progress.y,
+            PROGRESS_PIP_SIZE,
             segment < completed,
         );
     }
 }
 
-/// A raised keycap: lit along its top and left, shadowed bottom and right.
-fn draw_keycap(hud: &Surface, label: &str, x: f32, y: f32, width: f32) {
+fn control_keycap_rect(panel: Rect, index: usize, width: f32) -> Rect {
     let scale = hud_scale();
-    let rect = Rect::new(x, y, (width * scale).round(), (22.0 * scale).round());
+
+    Rect::new(
+        (panel.x + 16.0 * scale).round(),
+        (panel.y + (CONTROL_ROW_TOP + index as f32 * CONTROL_ROW_PITCH) * scale).round(),
+        (width * scale).round(),
+        (CONTROL_KEY_HEIGHT * scale).round(),
+    )
+}
+
+fn control_label_baseline(rect: Rect) -> f32 {
+    let text_height = SMALL_GLYPH_HEIGHT * text_pixel(CONTROL_TEXT_SIZE);
+
+    (rect.y + (rect.h + text_height - 1.0) * 0.5).floor()
+}
+
+/// A raised keycap: lit along its top and left, shadowed bottom and right.
+fn draw_keycap(hud: &Surface, label: &str, rect: Rect) {
     hud.fill(
         Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w, rect.h),
         color_u8!(4, 4, 3, 255),
@@ -929,29 +1007,27 @@ fn draw_keycap(hud: &Surface, label: &str, x: f32, y: f32, width: f32) {
         hud,
         label,
         rect.x + rect.w * 0.5,
-        rect.y + (15.5 * scale),
-        16.0,
+        control_label_baseline(rect),
+        CONTROL_TEXT_SIZE,
         COLOR_TEXT,
     );
 }
 
 fn draw_controls(hud: &Surface, layout: &HudLayout) {
-    let scale = hud_scale();
     let rect = layout.controls;
-    let left = rect.x + (16.0 * scale);
-    let right = rect.x + rect.w - (16.0 * scale);
+    let right = rect.x + rect.w - 16.0 * hud_scale();
 
-    let rows = [
-        ("L/R", "MOVE", 42.0),
-        ("Z/X", "ROTATE", 42.0),
-        ("SPACE", "DROP", 62.0),
-        ("C", "HOLD", 28.0),
-    ];
-
-    for (index, (key, action, key_width)) in rows.iter().enumerate() {
-        let y = rect.y + ((48.0 + index as f32 * 28.0) * scale);
-        draw_keycap(hud, key, left, y, *key_width);
-        draw_text_right_at(hud, action, right, y + (15.5 * scale), 16.0, COLOR_TEXT_MUTED);
+    for (index, (key, action, key_width)) in CONTROL_ROWS.iter().enumerate() {
+        let keycap = control_keycap_rect(rect, index, *key_width);
+        draw_keycap(hud, key, keycap);
+        draw_text_right_at(
+            hud,
+            action,
+            right,
+            control_label_baseline(keycap),
+            CONTROL_TEXT_SIZE,
+            COLOR_TEXT_MUTED,
+        );
     }
 }
 
@@ -1067,8 +1143,7 @@ fn draw_held_piece(
     }
 }
 
-fn draw_game_effects(hud: &Surface, layout: &HudLayout, game_state: &GameState<'_>, shake: Vec2) {
-    let scale = hud_scale();
+fn draw_game_effects(hud: &Surface, game_state: &GameState<'_>, shake: Vec2) {
     let impact = game_state.get_impact_effect();
 
     if impact > 0.0 {
@@ -1147,18 +1222,6 @@ fn draw_game_effects(hud: &Surface, layout: &HudLayout, game_state: &GameState<'
             }
         }
     }
-
-    // The pause hint sits under the controls panel, clear of the pit below
-    // the well.
-    let controls = layout.controls;
-    draw_text_centered_at(
-        hud,
-        "ESC  PAUSE",
-        controls.x + controls.w * 0.5,
-        controls.y + controls.h + (22.0 * scale),
-        18.0,
-        color_u8!(156, 136, 93, 210),
-    );
 }
 
 /// Camera shake for the frame: an impact pulse when a piece locks, and a
@@ -1260,7 +1323,7 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
             draw_score_announcement(&hud, &layout, award);
         }
 
-        draw_game_effects(&hud, &layout, self, frame.shake);
+        draw_game_effects(&hud, self, frame.shake);
     }
 }
 
@@ -1603,6 +1666,115 @@ mod tests {
                 assert_eq!(value.fract(), 0.0);
             }
         }
+    }
+
+    #[test]
+    fn every_panel_title_fits_between_the_frame_and_header_divider() {
+        let layout = hud_layout();
+
+        for (rect, label) in [
+            (layout.hold, "HOLD"),
+            (layout.next, "NEXT"),
+            (layout.controls, "CONTROLS"),
+            (layout.stats, "STATUS"),
+            (layout.award, "LINE CLEAR"),
+            (layout.award, "T-SPIN"),
+            (layout.award, "T-SPIN MINI"),
+        ] {
+            let baseline = panel_header_baseline(rect);
+            let (width, height, _) = pixel_text_metrics(label, LABEL_TEXT_SIZE);
+            let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+
+            assert_eq!(baseline.fract(), 0.0);
+            assert!(baseline - height >= rect.y + PANEL_FRAME + 1.0, "{label}");
+            assert!(baseline + 1.0 < divider, "{label} engraving shadow");
+            assert!(
+                rect.x + 16.0 * hud_scale() + width + 1.0 <= rect.x + rect.w - PANEL_FRAME,
+                "{label} width"
+            );
+        }
+    }
+
+    #[test]
+    fn all_five_controls_and_their_shadows_fit_inside_the_frame() {
+        let rect = hud_layout().controls;
+        let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+        let right = rect.x + rect.w - 16.0 * hud_scale();
+
+        assert_eq!(CONTROL_ROWS.last().map(|row| (row.0, row.1)), Some(("ESC", "PAUSE")));
+        assert_eq!(CONTROL_ROWS.iter().filter(|row| row.0 == "ESC").count(), 1);
+
+        for (index, (key, action, width)) in CONTROL_ROWS.iter().enumerate() {
+            let keycap = control_keycap_rect(rect, index, *width);
+            let baseline = control_label_baseline(keycap);
+            let (key_width, key_height, _) = pixel_text_metrics(key, CONTROL_TEXT_SIZE);
+            let (action_width, action_height, _) = pixel_text_metrics(action, CONTROL_TEXT_SIZE);
+
+            assert!(keycap.y > divider, "{key}");
+            assert!(keycap.x >= rect.x + PANEL_FRAME + 1.0, "{key}");
+            assert!(keycap.x + keycap.w + 1.0 < right - action_width, "{key}/{action}");
+            assert!(
+                keycap.y + keycap.h + 1.0 + CONTROL_BOTTOM_PADDING * hud_scale()
+                    <= rect.y + rect.h - PANEL_FRAME,
+                "{key} bottom shadow"
+            );
+            assert!(key_width <= keycap.w - 2.0, "{key} glyph width");
+            assert!(baseline - key_height >= keycap.y + 1.0, "{key} glyph top");
+            assert!(baseline <= keycap.y + keycap.h - 1.0, "{key} glyph bottom");
+            assert!(baseline - action_height > divider, "{action}");
+        }
+    }
+
+    #[test]
+    fn five_digit_line_counts_fit_below_the_centered_level_without_overlapping() {
+        let rect = hud_layout().stats;
+        let original = stats_readout_layout(rect, &line_count_text(0));
+        let (level_label_width, level_label_height, _) = pixel_text_metrics("LEVEL", STATS_TEXT_SIZE);
+
+        for lines in [0, 99, 100, 999, 1000, 12_345, 99_999, 100_000, usize::MAX] {
+            let text = line_count_text(lines);
+            let positions = stats_readout_layout(rect, &text);
+            let group_left = positions.level_label.x;
+            let group_right = positions.level_window.x + positions.level_window.w;
+
+            assert!(((group_left + group_right) * 0.5 - (rect.x + rect.w * 0.5)).abs() <= 0.5);
+            assert!(group_left >= rect.x + PANEL_FRAME + 1.0);
+            assert!(group_right <= rect.x + rect.w - PANEL_FRAME - 1.0);
+            assert!(positions.level_label.x + level_label_width + 1.0 < positions.level_window.x);
+            assert!(
+                positions.level_label.y - level_label_height
+                    > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale()
+            );
+            assert!(positions.lines.x >= rect.x + PANEL_FRAME + 1.0, "{text}");
+            assert!(
+                positions.lines.x + positions.lines.w + 1.0 <= rect.x + rect.w - PANEL_FRAME,
+                "{text}"
+            );
+            assert!(positions.lines.y > positions.level_window.y + positions.level_window.h);
+            assert!(positions.lines.y + positions.lines.h + 1.0 < positions.progress.y);
+            assert!(positions.progress.y + positions.progress.h < rect.y + rect.h - PANEL_FRAME);
+            assert_eq!(
+                (positions.level_window.x, positions.level_window.y),
+                (original.level_window.x, original.level_window.y)
+            );
+
+            for level in [1, 9, 10, 20] {
+                assert!(
+                    digit_text_width(&format!("{level:02}"), READOUT_PIXEL)
+                        <= positions.level_window.w - READOUT_PADDING * 2.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn line_count_formatting_keeps_five_digits_and_bounds_larger_values() {
+        assert_eq!(line_count_text(0), "LINES 0");
+        assert_eq!(line_count_text(100), "LINES 100");
+        assert_eq!(line_count_text(12_345), "LINES 12345");
+        assert_eq!(line_count_text(99_999), "LINES 99999");
+        assert_eq!(line_count_text(100_000), "LINES 99999+");
+        assert_eq!(line_count_text(usize::MAX), "LINES 99999+");
     }
 
     #[test]
