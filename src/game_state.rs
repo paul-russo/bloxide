@@ -1165,6 +1165,12 @@ impl<'a> GameState<'a> {
         self.last_score_award
     }
 
+    /// Remaining presentation lifetime, from one to zero. Using simulation
+    /// ticks rather than wall time freezes award animations while paused.
+    pub fn get_score_announcement_remaining(&self) -> f32 {
+        self.score_announcement_ticks_remaining as f32 / SCORE_ANNOUNCEMENT_TICKS as f32
+    }
+
     pub fn get_rows_cleared(&self) -> usize {
         self.rows_cleared
     }

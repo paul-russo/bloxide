@@ -293,8 +293,14 @@ const HUD_PREVIEW_TOP_PADDING: f32 = 12.0;
 const HUD_PREVIEW_BOTTOM_PADDING: f32 = 12.0;
 const HUD_AWARD_GAP: f32 = 16.0;
 const AWARD_TEXT_SIZE: f32 = 16.0;
-const AWARD_FIRST_BASELINE: f32 = 58.0;
-const AWARD_LINE_PITCH: f32 = 20.0;
+const AWARD_POINTS_TEXT_SIZE: f32 = 28.0;
+const AWARD_CLEAR_BASELINE: f32 = 58.0;
+const AWARD_POINTS_BASELINE: f32 = 94.0;
+const AWARD_B2B_BASELINE: f32 = 112.0;
+const AWARD_COMBO_BASELINE: f32 = 130.0;
+const AWARD_BADGE_PIXELS: f32 = 10.0;
+const AWARD_METER_SEGMENTS: usize = 8;
+const AWARD_METER_HEIGHT: f32 = 2.0;
 const CONTROL_ROW_TOP: f32 = 48.0;
 const CONTROL_ROW_PITCH: f32 = 28.0;
 const CONTROL_KEY_HEIGHT: f32 = 22.0;
@@ -1017,16 +1023,18 @@ fn draw_controls(hud: &Surface, layout: &HudLayout) {
 struct ScoreAnnouncementText {
     headline: &'static str,
     clear: &'static str,
+    medal: &'static str,
     points: String,
     back_to_back: &'static str,
     combo: String,
 }
 
 fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
-    let headline = match award.event.spin {
-        SpinKind::None => "LINE CLEAR",
-        SpinKind::Mini => "T-SPIN MINI",
-        SpinKind::Full => "T-SPIN",
+    let headline = match (award.event.spin, award.event.lines) {
+        (SpinKind::None, 4) => "CARNAGE",
+        (SpinKind::None, _) => "LINE CLEAR",
+        (SpinKind::Mini, _) => "T-SPIN MINI",
+        (SpinKind::Full, _) => "T-SPIN",
     };
     let clear = match award.event.lines {
         0 => "NO LINES",
@@ -1035,6 +1043,14 @@ fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
         3 => "TRIPLE",
         4 => "TETRIS",
         _ => "CLEAR",
+    };
+    let medal = match (award.event.spin, award.event.lines) {
+        (SpinKind::None, 1) => "1",
+        (SpinKind::None, 2) => "2",
+        (SpinKind::None, 3) => "3",
+        (SpinKind::None, 4) => "4",
+        (SpinKind::None, _) => "!",
+        _ => "T",
     };
 
     // Keep even unusually long endless runs inside the small instrument panel.
@@ -1057,38 +1073,172 @@ fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
     ScoreAnnouncementText {
         headline,
         clear,
+        medal,
         points,
         back_to_back: if award.back_to_back_bonus > 0 { "B2B" } else { "" },
         combo,
     }
 }
 
-fn draw_score_announcement(hud: &Surface, layout: &HudLayout, award: ScoreAward) {
+struct ScoreAnnouncementLayout {
+    medal: Rect,
+    clear: Rect,
+    points: Rect,
+    points_size: f32,
+    back_to_back: Rect,
+    combo: Rect,
+    meter: Rect,
+    impact: f32,
+}
+
+fn centered_label_bounds(rect: Rect, text: &str, baseline: f32, size: f32) -> Rect {
+    let (width, height, _) = pixel_text_metrics(text, size);
+
+    Rect::new(
+        (rect.x + (rect.w - width) * 0.5).round(),
+        (baseline - height).round(),
+        width,
+        height,
+    )
+}
+
+fn award_impact(remaining: f32) -> f32 {
+    // A quarter-second impact within the award's two-second lifetime.
+    ((remaining.clamp(0.0, 1.0) - 0.875) / 0.125).clamp(0.0, 1.0)
+}
+
+fn score_announcement_layout(
+    rect: Rect,
+    text: &ScoreAnnouncementText,
+    remaining: f32,
+) -> ScoreAnnouncementLayout {
+    let scale = hud_scale();
+    let pixel = text_pixel(AWARD_TEXT_SIZE);
+    let impact = award_impact(remaining);
+    let medal_size = AWARD_BADGE_PIXELS * pixel;
+    let (clear_width, clear_height, _) = pixel_text_metrics(text.clear, AWARD_TEXT_SIZE);
+    let gap = 4.0 * pixel;
+    let group_x = (rect.x + (rect.w - medal_size - gap - clear_width) * 0.5).round();
+    let clear_baseline = rect.y + AWARD_CLEAR_BASELINE * scale;
+    let available_width = rect.w - 32.0 * scale;
+    let points_size = if pixel_text_metrics(&text.points, AWARD_POINTS_TEXT_SIZE).0 <= available_width {
+        AWARD_POINTS_TEXT_SIZE
+    } else {
+        AWARD_TEXT_SIZE
+    };
+
+    ScoreAnnouncementLayout {
+        medal: Rect::new(
+            group_x,
+            (clear_baseline - (8.0 + impact.round()) * pixel).round(),
+            medal_size,
+            medal_size,
+        ),
+        clear: Rect::new(
+            group_x + medal_size + gap,
+            clear_baseline - clear_height,
+            clear_width,
+            clear_height,
+        ),
+        points: centered_label_bounds(
+            rect, &text.points, rect.y + AWARD_POINTS_BASELINE * scale, points_size,
+        ),
+        points_size,
+        back_to_back: centered_label_bounds(
+            rect, text.back_to_back, rect.y + AWARD_B2B_BASELINE * scale, AWARD_TEXT_SIZE,
+        ),
+        combo: centered_label_bounds(
+            rect, &text.combo, rect.y + AWARD_COMBO_BASELINE * scale, AWARD_TEXT_SIZE,
+        ),
+        meter: Rect::new(
+            rect.x + 16.0 * scale,
+            rect.y + rect.h - PANEL_FRAME - AWARD_METER_HEIGHT,
+            available_width,
+            AWARD_METER_HEIGHT,
+        ),
+        impact,
+    }
+}
+
+fn award_meter_segments(rect: Rect, remaining: f32) -> impl Iterator<Item = (Rect, f32)> {
+    let pitch = (rect.w / AWARD_METER_SEGMENTS as f32).floor();
+    let width = (pitch - 2.0).max(1.0);
+    let total_width = pitch * (AWARD_METER_SEGMENTS - 1) as f32 + width;
+    let left = (rect.x + (rect.w - total_width) * 0.5).round();
+    let units = remaining.clamp(0.0, 1.0) * AWARD_METER_SEGMENTS as f32;
+
+    (0..AWARD_METER_SEGMENTS).map(move |index| {
+        let segment = Rect::new(left + index as f32 * pitch, rect.y, width, rect.h);
+        let filled_width = (width * (units - index as f32).clamp(0.0, 1.0)).floor();
+
+        (segment, filled_width)
+    })
+}
+
+fn draw_score_announcement(
+    hud: &Surface,
+    layout: &HudLayout,
+    award: ScoreAward,
+    remaining: f32,
+) {
     let text = score_announcement_text(award);
     let rect = layout.award;
-    draw_panel_header(hud, rect, text.headline);
+    let positions = score_announcement_layout(rect, &text, remaining);
 
-    for (index, (line, color)) in [
-        (text.clear, COLOR_TEXT),
-        (text.points.as_str(), COLOR_AMBER),
-        (text.back_to_back, COLOR_AMBER),
-        (text.combo.as_str(), COLOR_TEXT_MUTED),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    if positions.impact > 0.0 {
+        let top = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale() + 1.0;
+        hud.fill(
+            Rect::new(
+                rect.x + PANEL_FRAME, top, rect.w - PANEL_FRAME * 2.0,
+                rect.y + rect.h - PANEL_FRAME - top,
+            ),
+            Color::new(COLOR_AMBER.r, COLOR_AMBER.g, COLOR_AMBER.b, positions.impact * 0.16),
+        );
+    }
+
+    draw_panel_header(hud, rect, text.headline);
+    hud.fill(
+        positions.medal,
+        mix_color(color_u8!(74, 44, 18, 255), COLOR_AMBER, 0.2 + positions.impact * 0.35),
+    );
+    draw_bevel(
+        hud,
+        positions.medal,
+        mix_color(COLOR_AMBER, COLOR_TEXT, positions.impact),
+        COLOR_PANEL_DARK,
+        false,
+    );
+    let pixel = text_pixel(AWARD_TEXT_SIZE);
+    draw_text_centered_at(
+        hud,
+        text.medal,
+        positions.medal.x + positions.medal.w * 0.5,
+        (positions.medal.y + (positions.medal.h + SMALL_GLYPH_HEIGHT * pixel - pixel) * 0.5).floor(),
+        AWARD_TEXT_SIZE,
+        COLOR_TEXT,
+    );
+
+    for (line, bounds, size, color) in [
+        (text.clear, positions.clear, AWARD_TEXT_SIZE, COLOR_TEXT),
+        (text.points.as_str(), positions.points, positions.points_size, COLOR_AMBER),
+        (text.back_to_back, positions.back_to_back, AWARD_TEXT_SIZE, COLOR_AMBER),
+        (text.combo.as_str(), positions.combo, AWARD_TEXT_SIZE, COLOR_TEXT_MUTED),
+    ] {
         if line.is_empty() {
             continue;
         }
 
-        draw_text_centered_at(
-            hud,
-            line,
-            rect.x + rect.w * 0.5,
-            rect.y + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale(),
-            AWARD_TEXT_SIZE,
-            color,
-        );
+        draw_pixel_text(hud, line, bounds.x, bounds.y + bounds.h, size, color);
+    }
+
+    for (segment, filled_width) in award_meter_segments(positions.meter, remaining) {
+        hud.fill(segment, color_u8!(44, 39, 25, 255));
+        if filled_width > 0.0 {
+            hud.fill(
+                Rect::new(segment.x, segment.y, filled_width, segment.h),
+                mix_color(COLOR_AMBER, COLOR_TEXT, positions.impact * 0.6),
+            );
+        }
     }
 }
 
@@ -1303,7 +1453,7 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
         draw_controls(&hud, &layout);
         if let Some(award) = announcement {
-            draw_score_announcement(&hud, &layout, award);
+            draw_score_announcement(&hud, &layout, award, self.get_score_announcement_remaining());
         }
 
         draw_game_effects(&hud, self, frame.shake);
@@ -1661,6 +1811,7 @@ mod tests {
             (layout.controls, "CONTROLS"),
             (layout.stats, "LEVEL"),
             (layout.award, "LINE CLEAR"),
+            (layout.award, "CARNAGE"),
             (layout.award, "T-SPIN"),
             (layout.award, "T-SPIN MINI"),
         ] {
@@ -1782,15 +1933,6 @@ mod tests {
         assert!(layout.award.y > layout.hold.y + layout.hold.h);
         assert!(layout.award.y + layout.award.h < layout.controls.y);
         assert!(!layout.award.overlaps(&well));
-
-        for index in 0..4 {
-            let baseline = layout.award.y
-                + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale();
-            let height = SMALL_GLYPH_HEIGHT * text_pixel(AWARD_TEXT_SIZE);
-
-            assert!(baseline - height > layout.award.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale());
-            assert!(baseline < layout.award.y + layout.award.h - PANEL_FRAME);
-        }
     }
 
     #[test]
@@ -1802,8 +1944,9 @@ mod tests {
         let (_, award) = score_lock(event, state);
         let text = score_announcement_text(award);
 
-        assert_eq!(text.headline, "LINE CLEAR");
+        assert_eq!(text.headline, "CARNAGE");
         assert_eq!(text.clear, "TETRIS");
+        assert_eq!(text.medal, "4");
         assert_eq!(text.points, "+1,250");
         assert_eq!(text.back_to_back, "B2B");
         assert_eq!(text.combo, "COMBO 1");
@@ -1820,6 +1963,7 @@ mod tests {
 
             assert_eq!(text.headline, headline);
             assert_eq!(text.clear, "DOUBLE");
+            assert_eq!(text.medal, "T");
             assert_eq!(text.points, points);
             assert!(text.back_to_back.is_empty());
             assert!(text.combo.is_empty());
@@ -1836,12 +1980,16 @@ mod tests {
         let rect = hud_layout().award;
         let available_width = rect.w - 32.0 * hud_scale();
         let mut awards = Vec::new();
+        let (chain, _) = score_lock(
+            LockEvent { spin: SpinKind::None, lines: 4, level: 1 },
+            ScoringState::default(),
+        );
 
         for (spin, max_lines) in [(SpinKind::None, 4), (SpinKind::Mini, 2), (SpinKind::Full, 3)] {
             for lines in 0..=max_lines {
                 let (_, award) = score_lock(
                     LockEvent { spin, lines, level: 20 },
-                    ScoringState::default(),
+                    chain,
                 );
                 awards.push(award);
             }
@@ -1857,18 +2005,96 @@ mod tests {
 
         for award in awards {
             let text = score_announcement_text(award);
+            let positions = score_announcement_layout(rect, &text, 1.0);
 
             for (line, size) in [
                 (text.headline, LABEL_TEXT_SIZE),
                 (text.clear, AWARD_TEXT_SIZE),
-                (text.points.as_str(), AWARD_TEXT_SIZE),
+                (text.medal, AWARD_TEXT_SIZE),
+                (text.points.as_str(), positions.points_size),
                 (text.back_to_back, AWARD_TEXT_SIZE),
                 (text.combo.as_str(), AWARD_TEXT_SIZE),
             ] {
                 assert!(pixel_text_metrics(line, size).0 <= available_width, "{line}");
                 assert!(line.chars().all(|c| c == ' ' || SMALL_GLYPH_CHARS.contains(c)), "{line}");
             }
+
+            for remaining in [1.0, 0.95, 0.875, 0.5, 0.0] {
+                let positions = score_announcement_layout(rect, &text, remaining);
+
+                for bounds in [
+                    positions.medal, positions.clear, positions.points,
+                    positions.back_to_back, positions.combo, positions.meter,
+                ] {
+                    assert!(bounds.x >= rect.x + PANEL_FRAME + 1.0);
+                    assert!(bounds.x + bounds.w <= rect.x + rect.w - PANEL_FRAME - 1.0);
+                    assert!(bounds.y > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale());
+                    assert!(bounds.y + bounds.h <= rect.y + rect.h - PANEL_FRAME);
+
+                    for value in [bounds.x, bounds.y, bounds.w, bounds.h] {
+                        assert_eq!(value.fract(), 0.0);
+                    }
+                }
+
+                assert!(positions.clear.x > positions.medal.x + positions.medal.w);
+                assert!(positions.points.y > positions.medal.y + positions.medal.h);
+                assert!(positions.points.y > positions.clear.y + positions.clear.h);
+                assert!(positions.back_to_back.y > positions.points.y + positions.points.h);
+                assert!(positions.combo.y > positions.back_to_back.y + positions.back_to_back.h);
+                assert!(positions.meter.y > positions.combo.y + positions.combo.h);
+            }
         }
+    }
+
+    #[test]
+    fn common_awards_use_larger_points_and_long_awards_fall_back_without_clipping() {
+        use crate::scoring::{score_lock, LockEvent, ScoringState};
+
+        let rect = hud_layout().award;
+
+        for (event, expected_size) in [
+            (LockEvent { spin: SpinKind::None, lines: 3, level: 1 }, AWARD_POINTS_TEXT_SIZE),
+            (LockEvent { spin: SpinKind::Full, lines: 2, level: 1 }, AWARD_POINTS_TEXT_SIZE),
+            (LockEvent { spin: SpinKind::Full, lines: 3, level: 20 }, AWARD_TEXT_SIZE),
+        ] {
+            let (_, award) = score_lock(event, ScoringState::default());
+            let text = score_announcement_text(award);
+            let positions = score_announcement_layout(rect, &text, 1.0);
+
+            assert_eq!(positions.points_size, expected_size);
+            assert_eq!(text.points.replace(',', ""), format!("+{}", award.total()));
+        }
+    }
+
+    #[test]
+    fn award_flash_and_segmented_meter_follow_the_remaining_lifetime() {
+        let rect = Rect::new(8.0, 67.0, 72.0, AWARD_METER_HEIGHT);
+        let full: f32 = award_meter_segments(rect, 1.0).map(|(_, filled)| filled).sum();
+        let half: f32 = award_meter_segments(rect, 0.5).map(|(_, filled)| filled).sum();
+
+        assert_eq!(award_impact(1.0), 1.0);
+        assert!(award_impact(0.95) > 0.0 && award_impact(0.95) < 1.0);
+        assert_eq!(award_impact(0.875), 0.0);
+        assert_eq!(award_impact(0.0), 0.0);
+        assert_eq!(half, full * 0.5);
+
+        let mut previous = f32::INFINITY;
+
+        for remaining in [1.0, 0.875, 0.5, 0.125, 0.0] {
+            let mut total = 0.0;
+
+            for (segment, filled) in award_meter_segments(rect, remaining) {
+                assert!(segment.x >= rect.x && segment.x + segment.w <= rect.x + rect.w);
+                assert!(filled >= 0.0 && filled <= segment.w);
+                assert_eq!(filled.fract(), 0.0);
+                total += filled;
+            }
+
+            assert!(total <= previous);
+            previous = total;
+        }
+
+        assert_eq!(previous, 0.0);
     }
 
     #[test]
