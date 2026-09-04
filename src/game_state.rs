@@ -10,6 +10,7 @@ use crate::{
         cell_center, floor_gap_contains, LavaSplash, ShrapnelVoxel, FLOOR_Y, LAVA_Y,
         MAX_LAVA_SPLASHES, MAX_SHRAPNEL_VOXELS, SPLASH_SECONDS,
     },
+    scoring::{score_lock, LockEvent, ScoreAward, ScoringState, SpinKind},
 };
 use macroquad::prelude::{Color, Vec3};
 use rand::Rng;
@@ -29,6 +30,7 @@ const LINE_CLEAR_EFFECT_TICKS: usize = 40 * EFFECT_TICK_INTERVAL;
 const MAX_IMPACT_CONTACTS: usize = 4;
 const HARD_DROP_TRAIL_TICKS: usize = 9 * EFFECT_TICK_INTERVAL;
 const LEVEL_FLARE_TICKS: usize = 45 * EFFECT_TICK_INTERVAL;
+const SCORE_ANNOUNCEMENT_TICKS: usize = 2 * TICKS_PER_SECOND as usize;
 
 /// The path a hard-dropped piece just travelled, so the renderer can streak
 /// it. Rows are grid rows of the piece's canvas origin, before and after the
@@ -121,6 +123,13 @@ enum RotationDirection {
     Counterclockwise,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RotationRecord {
+    from_orientation: usize,
+    to_orientation: usize,
+    kick_index: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ShiftDirection {
     Left,
@@ -136,6 +145,8 @@ pub struct GameState<'a> {
     bag_manager: BagManager,
     active_piece: Piece,
     score: usize,
+    scoring_state: ScoringState,
+    last_rotation: Option<RotationRecord>,
     tick: usize,
     last_update: Instant,
     // Nanoseconds scaled by the tick rate; one tick costs NANOS_PER_SECOND.
@@ -186,6 +197,8 @@ pub struct GameState<'a> {
     hard_drop_trail: Option<HardDropTrail>,
     hard_drop_trail_ticks_remaining: usize,
     level_flare_ticks_remaining: usize,
+    last_score_award: Option<ScoreAward>,
+    score_announcement_ticks_remaining: usize,
 }
 
 impl<'a> GameState<'a> {
@@ -212,6 +225,8 @@ impl<'a> GameState<'a> {
             bag_manager,
             active_piece,
             score,
+            scoring_state: ScoringState::default(),
+            last_rotation: None,
             tick,
             last_update: Instant::now(),
             tick_accumulator: 0,
@@ -251,6 +266,8 @@ impl<'a> GameState<'a> {
             hard_drop_trail: None,
             hard_drop_trail_ticks_remaining: 0,
             level_flare_ticks_remaining: 0,
+            last_score_award: None,
+            score_announcement_ticks_remaining: 0,
         }
     }
 
@@ -259,6 +276,7 @@ impl<'a> GameState<'a> {
         self.active_piece_col = self.active_piece.get_initial_col();
         self.active_piece_row = self.active_piece.get_initial_row();
         self.fall_progress = 0.0;
+        self.last_rotation = None;
         self.last_piece_swapped = false;
         self.ticks_to_lock = LOCK_DELAY_TICKS;
         self.lock_reset_moves_remaining = RESET_MOVES;
@@ -410,9 +428,45 @@ impl<'a> GameState<'a> {
 
         self.impact_ticks_remaining = self.impact_ticks_remaining.max(LOCK_IMPACT_TICKS);
 
-        self.clear_filled_rows_and_update_score();
+        // Corners belong to the locked position, before any rows collapse.
+        let spin = self.classify_t_spin();
+        self.resolve_lock_score(spin);
 
         self.next_piece();
+    }
+
+    fn classify_t_spin(&self) -> SpinKind {
+        if self.active_piece.name != "T" {
+            return SpinKind::None;
+        }
+
+        let Some(rotation) = self.last_rotation else {
+            return SpinKind::None;
+        };
+        let turn = (rotation.to_orientation + 4 - rotation.from_orientation) % 4;
+        if rotation.to_orientation != self.active_piece_orientation || !matches!(turn, 1 | 3) {
+            return SpinKind::None;
+        }
+
+        // NW, NE, SE, SW around the T's untrimmed (1, 1) rotation centre.
+        let row = self.active_piece_row;
+        let col = self.active_piece_col;
+        let corners = [
+            self.grid_locked.occupied_or_outside(row, col),
+            self.grid_locked.occupied_or_outside(row, col + 2),
+            self.grid_locked.occupied_or_outside(row + 2, col + 2),
+            self.grid_locked.occupied_or_outside(row + 2, col),
+        ];
+        if corners.iter().filter(|&&occupied| occupied).count() < 3 {
+            return SpinKind::None;
+        }
+
+        let front = self.active_piece_orientation;
+        if (corners[front] && corners[(front + 1) % 4]) || rotation.kick_index == 4 {
+            SpinKind::Full
+        } else {
+            SpinKind::Mini
+        }
     }
 
     fn hard_drop(&mut self) {
@@ -427,6 +481,7 @@ impl<'a> GameState<'a> {
         let lines_dropped = (landing_row - self.active_piece_row).max(0);
 
         if lines_dropped > 0 {
+            self.last_rotation = None;
             self.hard_drop_trail = Some(HardDropTrail {
                 start_row: self.active_piece_row,
                 landing_row,
@@ -507,6 +562,11 @@ impl<'a> GameState<'a> {
             );
 
             if !has_collision {
+                self.last_rotation = Some(RotationRecord {
+                    from_orientation: self.active_piece_orientation,
+                    to_orientation: next_orientation,
+                    kick_index: index,
+                });
                 self.active_piece_orientation = next_orientation;
                 self.active_piece_row = next_active_piece_row;
                 self.active_piece_col = next_active_piece_col;
@@ -587,6 +647,7 @@ impl<'a> GameState<'a> {
 
             if !has_collision {
                 self.active_piece_col = next_active_piece_col;
+                self.last_rotation = None;
                 self.piece_dirty = true;
                 self.try_reset_lock_delay_for_move();
             }
@@ -619,6 +680,9 @@ impl<'a> GameState<'a> {
             }
 
             self.active_piece_row = next_active_piece_row;
+            // This profile requires rotation to remain the last successful
+            // movement. Blocked falls and zero-distance hard drops preserve it.
+            self.last_rotation = None;
             self.piece_dirty = true;
         }
     }
@@ -721,6 +785,8 @@ impl<'a> GameState<'a> {
         self.hard_drop_trail_ticks_remaining =
             self.hard_drop_trail_ticks_remaining.saturating_sub(1);
         self.level_flare_ticks_remaining = self.level_flare_ticks_remaining.saturating_sub(1);
+        self.score_announcement_ticks_remaining =
+            self.score_announcement_ticks_remaining.saturating_sub(1);
 
         // Keep the debris integrator and its per-step drag at the original
         // 60 Hz. A slow render frame still runs every owed physics step.
@@ -1020,10 +1086,9 @@ impl<'a> GameState<'a> {
         }
     }
 
-    fn clear_filled_rows_and_update_score(&mut self) {
+    fn clear_filled_rows(&mut self) -> usize {
         let (rows_cleared, cleared_blocks, cleared_count) =
             self.grid_locked.clear_all_filled_rows_detailed();
-        let level = self.get_level();
 
         if rows_cleared > 0 {
             self.last_clear_count = rows_cleared;
@@ -1035,15 +1100,24 @@ impl<'a> GameState<'a> {
             self.spawn_shrapnel_for_cleared_blocks(&cleared_blocks, cleared_count, rows_cleared);
         }
 
-        match rows_cleared {
-            1 => self.score += 100 * level,
-            2 => self.score += 300 * level,
-            3 => self.score += 500 * level,
-            4 => self.score += 800 * level,
-            _ => (),
-        };
+        rows_cleared
+    }
 
-        self.increase_rows_cleared(rows_cleared);
+    fn resolve_lock_score(&mut self, spin: SpinKind) {
+        let level = self.get_level();
+        let lines = self.clear_filled_rows();
+        let event = LockEvent { spin, lines, level };
+        let (state, award) = score_lock(event, self.scoring_state);
+        self.scoring_state = state;
+        let points = award.total();
+        self.score += points;
+
+        if points > 0 {
+            self.last_score_award = Some(award);
+            self.score_announcement_ticks_remaining = SCORE_ANNOUNCEMENT_TICKS;
+        }
+
+        self.increase_rows_cleared(lines);
     }
 
     pub fn get_grid_locked(&self) -> &Grid {
@@ -1054,8 +1128,10 @@ impl<'a> GameState<'a> {
         &mut self.grid_locked
     }
 
+    /// Synthetic non-spin lock for rendering fixtures. Never borrow rotation
+    /// provenance from the unrelated active piece.
     pub fn trigger_line_clear(&mut self) {
-        self.clear_filled_rows_and_update_score();
+        self.resolve_lock_score(SpinKind::None);
     }
 
     /// End the run immediately, for the screenshot harness.
@@ -1073,6 +1149,14 @@ impl<'a> GameState<'a> {
 
     pub fn get_score(&self) -> usize {
         self.score
+    }
+
+    pub fn get_score_announcement(&self) -> Option<ScoreAward> {
+        if self.score_announcement_ticks_remaining == 0 {
+            return None;
+        }
+
+        self.last_score_award
     }
 
     pub fn get_rows_cleared(&self) -> usize {
@@ -1199,6 +1283,10 @@ mod rules_tests;
 mod rotation_tests;
 
 #[cfg(test)]
+#[path = "game_state_scoring_tests.rs"]
+mod scoring_tests;
+
+#[cfg(test)]
 mod tests {
     use super::impact_contact_origins;
     use crate::{
@@ -1263,7 +1351,7 @@ mod tests {
                 .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
         }
 
-        game_state.clear_filled_rows_and_update_score();
+        game_state.trigger_line_clear();
 
         let active_count = game_state
             .get_shrapnel()
@@ -1292,7 +1380,7 @@ mod tests {
                 .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
         }
 
-        game_state.clear_filled_rows_and_update_score();
+        game_state.trigger_line_clear();
         assert!(game_state.get_lava_splashes().iter().all(|splash| !splash.active));
 
         // Run the burst for a second at 60 Hz: by then everything has fallen
@@ -1334,7 +1422,7 @@ mod tests {
             }
         }
 
-        game_state.clear_filled_rows_and_update_score();
+        game_state.trigger_line_clear();
 
         let active_count = game_state
             .get_shrapnel()
@@ -1367,7 +1455,7 @@ mod tests {
         }
 
         assert_eq!(game_state.get_clear_row_mask(), 0);
-        game_state.clear_filled_rows_and_update_score();
+        game_state.trigger_line_clear();
 
         let expected_mask = visible_rows.iter().fold(0, |mask, &row| mask | (1 << row));
         assert_eq!(game_state.get_clear_row_mask(), expected_mask);

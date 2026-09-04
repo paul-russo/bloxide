@@ -259,6 +259,16 @@ fn assert_matching_motion(actual: &GameState<'_>, expected: &GameState<'_>) {
     assert_eq!(actual.has_touched_ground, expected.has_touched_ground);
     assert_eq!(actual.lowest_piece_row, expected.lowest_piece_row);
     assert_eq!(actual.score, expected.score);
+    assert_eq!(actual.scoring_state, expected.scoring_state);
+    assert_eq!(actual.last_rotation, expected.last_rotation);
+    assert_eq!(
+        actual.get_score_announcement(),
+        expected.get_score_announcement()
+    );
+    assert_eq!(
+        actual.score_announcement_ticks_remaining,
+        expected.score_announcement_ticks_remaining
+    );
     assert_eq!(actual.cached_ghost_row, expected.cached_ghost_row);
 }
 
@@ -672,7 +682,7 @@ fn tenth_line_levels_up_and_preserves_pre_clear_scoring() {
             .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
     }
 
-    state.clear_filled_rows_and_update_score();
+    state.trigger_line_clear();
 
     assert_eq!(state.get_rows_cleared(), 10);
     assert_eq!(state.get_level(), 2);
@@ -685,11 +695,12 @@ fn tenth_line_levels_up_and_preserves_pre_clear_scoring() {
             .set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
     }
 
-    state.clear_filled_rows_and_update_score();
+    state.trigger_line_clear();
 
     assert_eq!(state.get_rows_cleared(), 11);
     assert_eq!(state.get_level(), 2);
-    assert_eq!(state.get_score(), 300);
+    // First clear: 100 at level 1. Second: 200 base + 100 combo at level 2.
+    assert_eq!(state.get_score(), 400);
 }
 
 #[test]

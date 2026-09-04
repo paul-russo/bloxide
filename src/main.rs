@@ -12,6 +12,7 @@ mod piece;
 mod pixel_font;
 mod postfx;
 mod render3d;
+mod scoring;
 mod telemetry;
 mod textures;
 

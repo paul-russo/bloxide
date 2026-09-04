@@ -17,6 +17,7 @@ use crate::render3d::{
     lintel_front_bounds, set_depth_test, well_camera, world_to_screen, world_to_screen_with_shake,
     ScreenPlane, BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
 };
+use crate::scoring::{ScoreAward, SpinKind};
 use crate::textures::{Material, SceneTextures, BLOCK_TEXTURE_SIZE, STONE_TEXTURE_SIZE};
 use macroquad::prelude::*;
 use macroquad::texture::{render_target_ex, RenderTargetParams};
@@ -295,6 +296,10 @@ const HUD_LOWER_HEIGHT: f32 = 164.0;
 const HUD_HEADER_DIVIDER_OFFSET: f32 = 36.0;
 const HUD_PREVIEW_TOP_PADDING: f32 = 12.0;
 const HUD_PREVIEW_BOTTOM_PADDING: f32 = 12.0;
+const HUD_AWARD_GAP: f32 = 16.0;
+const AWARD_TEXT_SIZE: f32 = 16.0;
+const AWARD_FIRST_BASELINE: f32 = 58.0;
+const AWARD_LINE_PITCH: f32 = 20.0;
 
 /// How the blocks of a grid should be rendered inside the well.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -599,6 +604,7 @@ fn lintel_screen_rect() -> Rect {
 #[derive(Copy, Clone)]
 struct HudLayout {
     hold: Rect,
+    award: Rect,
     next: Rect,
     controls: Rect,
     stats: Rect,
@@ -614,6 +620,8 @@ fn hud_layout() -> HudLayout {
     let lower_y = (well.y + HUD_LOWER_OFFSET * scale).round();
     let left_x = (well.x - side_gap - panel_width).round();
     let right_x = (well.x + well.w + side_gap).round();
+    let award_top = (top_y + (HUD_HOLD_HEIGHT + HUD_AWARD_GAP) * scale).round();
+    let award_bottom = (lower_y - HUD_AWARD_GAP * scale).round();
 
     HudLayout {
         hold: Rect::new(
@@ -622,6 +630,7 @@ fn hud_layout() -> HudLayout {
             panel_width,
             (HUD_HOLD_HEIGHT * scale).round(),
         ),
+        award: Rect::new(left_x, award_top, panel_width, award_bottom - award_top),
         next: Rect::new(
             right_x,
             top_y,
@@ -946,6 +955,84 @@ fn draw_controls(hud: &Surface, layout: &HudLayout) {
     }
 }
 
+struct ScoreAnnouncementText {
+    headline: &'static str,
+    clear: &'static str,
+    points: String,
+    back_to_back: &'static str,
+    combo: String,
+}
+
+fn score_announcement_text(award: ScoreAward) -> ScoreAnnouncementText {
+    let headline = match award.event.spin {
+        SpinKind::None => "LINE CLEAR",
+        SpinKind::Mini => "T-SPIN MINI",
+        SpinKind::Full => "T-SPIN",
+    };
+    let clear = match award.event.lines {
+        0 => "NO LINES",
+        1 => "SINGLE",
+        2 => "DOUBLE",
+        3 => "TRIPLE",
+        4 => "TETRIS",
+        _ => "CLEAR",
+    };
+
+    // Keep even unusually long endless runs inside the small instrument panel.
+    // The full score is still retained by gameplay; only this transient label
+    // abbreviates billion-plus awards and very large combo counts.
+    let total = award.total() as u64;
+    let points = if total < 1_000_000_000 {
+        format!("+{}", total.to_formatted_string(&Locale::en))
+    } else if total < 1_000_000_000_000 {
+        format!("+{:.1}B", total as f64 / 1_000_000_000.0)
+    } else {
+        format!("+{:.1}T", total as f64 / 1_000_000_000_000.0)
+    };
+    let combo = match award.combo {
+        Some(count) if count > 99_999 => String::from("COMBO 99999+"),
+        Some(count) if count > 0 => format!("COMBO {count}"),
+        _ => String::new(),
+    };
+
+    ScoreAnnouncementText {
+        headline,
+        clear,
+        points,
+        back_to_back: if award.back_to_back_bonus > 0 { "B2B" } else { "" },
+        combo,
+    }
+}
+
+fn draw_score_announcement(hud: &Surface, layout: &HudLayout, award: ScoreAward) {
+    let text = score_announcement_text(award);
+    let rect = layout.award;
+    draw_panel_header(hud, rect, text.headline);
+
+    for (index, (line, color)) in [
+        (text.clear, COLOR_TEXT),
+        (text.points.as_str(), COLOR_AMBER),
+        (text.back_to_back, COLOR_AMBER),
+        (text.combo.as_str(), COLOR_TEXT_MUTED),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if line.is_empty() {
+            continue;
+        }
+
+        draw_text_centered_at(
+            hud,
+            line,
+            rect.x + rect.w * 0.5,
+            rect.y + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale(),
+            AWARD_TEXT_SIZE,
+            color,
+        );
+    }
+}
+
 /// Draw the next-piece queue into the right side panel.
 fn draw_piece_previews(
     layout: &HudLayout,
@@ -1109,10 +1196,15 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         let is_game_over = self.get_is_game_over();
         let lights = SceneLights::new(time, self.get_danger(), self.get_level_flare());
         let layout = hud_layout();
+        let announcement = self.get_score_announcement();
 
         let backdrop = frame.backdrop();
         draw_background(&backdrop, &lights);
         draw_game_chrome(&backdrop, &layout, &lights);
+
+        if announcement.is_some() {
+            draw_instrument_panel(&backdrop, layout.award, &lights);
+        }
 
         // Opaque scene first, effects that live behind the stack next, then
         // the stack, and finally everything translucent that sits in front.
@@ -1164,6 +1256,10 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         draw_panel_labels(&hud, &layout);
         draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
         draw_controls(&hud, &layout);
+        if let Some(award) = announcement {
+            draw_score_announcement(&hud, &layout, award);
+        }
+
         draw_game_effects(&hud, &layout, self, frame.shake);
     }
 }
@@ -1497,6 +1593,7 @@ mod tests {
 
         for rect in [
             layout.hold,
+            layout.award,
             layout.next,
             layout.controls,
             layout.stats,
@@ -1504,6 +1601,105 @@ mod tests {
         ] {
             for value in [rect.x, rect.y, rect.w, rect.h] {
                 assert_eq!(value.fract(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn score_award_panel_fits_between_hold_and_controls_outside_the_well() {
+        let layout = hud_layout();
+        let well = well_screen_rect();
+
+        assert_eq!(layout.award.x, layout.hold.x);
+        assert_eq!(layout.award.w, layout.hold.w);
+        assert!(layout.award.y > layout.hold.y + layout.hold.h);
+        assert!(layout.award.y + layout.award.h < layout.controls.y);
+        assert!(!layout.award.overlaps(&well));
+
+        for index in 0..4 {
+            let baseline = layout.award.y
+                + (AWARD_FIRST_BASELINE + index as f32 * AWARD_LINE_PITCH) * hud_scale();
+            let height = SMALL_GLYPH_HEIGHT * text_pixel(AWARD_TEXT_SIZE);
+
+            assert!(baseline - height > layout.award.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale());
+            assert!(baseline < layout.award.y + layout.award.h - PANEL_FRAME);
+        }
+    }
+
+    #[test]
+    fn score_announcements_show_clear_type_and_separate_chain_badges() {
+        use crate::scoring::{score_lock, LockEvent, ScoringState};
+
+        let event = LockEvent { spin: SpinKind::None, lines: 4, level: 1 };
+        let (state, _) = score_lock(event, ScoringState::default());
+        let (_, award) = score_lock(event, state);
+        let text = score_announcement_text(award);
+
+        assert_eq!(text.headline, "LINE CLEAR");
+        assert_eq!(text.clear, "TETRIS");
+        assert_eq!(text.points, "+1,250");
+        assert_eq!(text.back_to_back, "B2B");
+        assert_eq!(text.combo, "COMBO 1");
+
+        for (spin, headline, points) in [
+            (SpinKind::Mini, "T-SPIN MINI", "+400"),
+            (SpinKind::Full, "T-SPIN", "+1,200"),
+        ] {
+            let (_, award) = score_lock(
+                LockEvent { spin, lines: 2, level: 1 },
+                ScoringState::default(),
+            );
+            let text = score_announcement_text(award);
+
+            assert_eq!(text.headline, headline);
+            assert_eq!(text.clear, "DOUBLE");
+            assert_eq!(text.points, points);
+            assert!(text.back_to_back.is_empty());
+            assert!(text.combo.is_empty());
+        }
+    }
+
+    #[test]
+    fn award_text_and_large_values_fit_the_panel_and_have_bitmap_glyphs() {
+        use crate::{
+            pixel_font::SMALL_GLYPH_CHARS,
+            scoring::{score_lock, LockEvent, ScoringState},
+        };
+
+        let rect = hud_layout().award;
+        let available_width = rect.w - 32.0 * hud_scale();
+        let mut awards = Vec::new();
+
+        for (spin, max_lines) in [(SpinKind::None, 4), (SpinKind::Mini, 2), (SpinKind::Full, 3)] {
+            for lines in 0..=max_lines {
+                let (_, award) = score_lock(
+                    LockEvent { spin, lines, level: 20 },
+                    ScoringState::default(),
+                );
+                awards.push(award);
+            }
+        }
+
+        awards.push(ScoreAward {
+            event: LockEvent { spin: SpinKind::Mini, lines: 2, level: 20 },
+            base: usize::MAX,
+            back_to_back_bonus: 0,
+            combo_bonus: 0,
+            combo: Some(usize::MAX),
+        });
+
+        for award in awards {
+            let text = score_announcement_text(award);
+
+            for (line, size) in [
+                (text.headline, LABEL_TEXT_SIZE),
+                (text.clear, AWARD_TEXT_SIZE),
+                (text.points.as_str(), AWARD_TEXT_SIZE),
+                (text.back_to_back, AWARD_TEXT_SIZE),
+                (text.combo.as_str(), AWARD_TEXT_SIZE),
+            ] {
+                assert!(pixel_text_metrics(line, size).0 <= available_width, "{line}");
+                assert!(line.chars().all(|c| c == ' ' || SMALL_GLYPH_CHARS.contains(c)), "{line}");
             }
         }
     }

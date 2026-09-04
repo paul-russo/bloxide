@@ -178,6 +178,17 @@ impl Grid {
         self.rows[row_id][col_id].is_some()
     }
 
+    /// Spin corners treat the outer storage boundary as occupied. Hidden rows
+    /// inside that boundary are normal cells, not a wall at the visible skyline.
+    pub fn occupied_or_outside(&self, row: isize, col: isize) -> bool {
+        if row < 0 || col < 0 || row >= GRID_COUNT_ROWS as isize || col >= GRID_COUNT_COLS as isize
+        {
+            return true;
+        }
+
+        self.has_block_at_cell(row as usize, col as usize)
+    }
+
     pub fn clear_row(&mut self, row_id: usize) -> &mut Self {
         if row_id >= GRID_COUNT_ROWS {
             return self;
@@ -265,6 +276,33 @@ impl Grid {
 mod tests {
     use super::*;
     use macroquad::prelude::RED;
+
+    #[test]
+    fn spin_occupancy_counts_storage_boundaries_but_not_the_visible_skyline() {
+        let mut grid = Grid::new();
+
+        for (row, col) in [
+            (-1, 4),
+            (GRID_COUNT_ROWS as isize, 4),
+            (FIRST_VISIBLE_ROW_ID as isize, -1),
+            (FIRST_VISIBLE_ROW_ID as isize, GRID_COUNT_COLS as isize),
+        ] {
+            assert!(grid.occupied_or_outside(row, col));
+        }
+
+        for row in [
+            0,
+            FIRST_VISIBLE_ROW_ID - 1,
+            FIRST_VISIBLE_ROW_ID,
+            GRID_COUNT_ROWS - 1,
+        ] {
+            assert!(!grid.occupied_or_outside(row as isize, 4));
+        }
+
+        grid.set_cell(FIRST_VISIBLE_ROW_ID - 1, 4, Some(Block::new(RED)));
+
+        assert!(grid.occupied_or_outside(FIRST_VISIBLE_ROW_ID as isize - 1, 4));
+    }
 
     #[test]
     fn clear_all_filled_rows_detailed_reports_cleared_cells() {
