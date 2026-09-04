@@ -265,7 +265,6 @@ const PREVIEW_SCALE: f32 = 0.74;
 const GAME_OVER_WASH: f32 = 0.7;
 
 const LABEL_TEXT_SIZE: f32 = 20.0;
-const STATS_TEXT_SIZE: f32 = 18.0;
 const LINE_COUNT_TEXT_SIZE: f32 = 16.0;
 const CONTROL_TEXT_SIZE: f32 = 16.0;
 const MENU_TITLE_TEXT_SIZE: f32 = 42.0;
@@ -299,7 +298,7 @@ const AWARD_LINE_PITCH: f32 = 20.0;
 const CONTROL_ROW_TOP: f32 = 48.0;
 const CONTROL_ROW_PITCH: f32 = 28.0;
 const CONTROL_KEY_HEIGHT: f32 = 22.0;
-const CONTROL_BOTTOM_PADDING: f32 = 16.0;
+const CONTROL_BOTTOM_PADDING: f32 = 8.0;
 const PROGRESS_PIP_SIZE: f32 = 5.0;
 const PROGRESS_PIP_GAP: f32 = 2.0;
 const CONTROL_ROWS: [(&str, &str, f32); 5] = [
@@ -700,35 +699,42 @@ fn next_piece_anchor(layout: &HudLayout, index: usize) -> Vec3 {
     preview_anchor_at_screen_y(NEXT_PREVIEW_REFERENCE, target_y.round())
 }
 
-/// Baseline of an engraved title, centred between the frame and header divider.
-fn panel_header_baseline(rect: Rect) -> f32 {
-    let top = rect.y + PANEL_FRAME + 1.0;
-    let bottom = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
+fn header_band_height() -> f32 {
+    HUD_HEADER_DIVIDER_OFFSET * hud_scale() - PANEL_FRAME - 1.0
+}
+
+/// Both outer titles and inner section headers use identical typography,
+/// colour, horizontal inset, and positioning within their header strip.
+fn panel_header_text_origin(rect: Rect, top: f32) -> Vec2 {
     let text_height = SMALL_GLYPH_HEIGHT * text_pixel(LABEL_TEXT_SIZE);
 
-    // Centre the glyphs and their one-pixel engraving shadow inside the strip.
-    (top + (bottom - top - text_height - 1.0) * 0.5 + text_height).floor()
+    vec2(
+        rect.x + 16.0 * hud_scale(),
+        (top + (header_band_height() - text_height - 1.0) * 0.5 + text_height).floor(),
+    )
 }
 
 fn draw_panel_header(hud: &Surface, rect: Rect, label: &str) {
-    let scale = hud_scale();
+    draw_panel_header_at(hud, rect, label, rect.y + PANEL_FRAME + 1.0);
+}
+
+fn draw_panel_header_at(hud: &Surface, rect: Rect, label: &str, top: f32) {
     let inset = PANEL_FRAME + 1.0;
-    let left = rect.x + (16.0 * scale);
-    let right = rect.x + rect.w - (16.0 * scale);
-    let baseline = panel_header_baseline(rect);
-    let divider_y = rect.y + (HUD_HEADER_DIVIDER_OFFSET * scale);
+    let origin = panel_header_text_origin(rect, top);
+    let right = rect.x + rect.w - 16.0 * hud_scale();
+    let divider_y = top + header_band_height();
 
     hud.fill(
         Rect::new(
             rect.x + inset,
-            rect.y + inset,
+            top,
             rect.w - inset * 2.0,
-            divider_y - rect.y - inset,
+            header_band_height(),
         ),
         COLOR_PANEL_HEADER,
     );
-    draw_engraved_text(hud, label, left, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
-    hud.hline(left, right, divider_y, COLOR_PANEL_BORDER);
+    draw_engraved_text(hud, label, origin.x, origin.y, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
+    hud.hline(origin.x, right, divider_y, COLOR_PANEL_BORDER);
 }
 
 fn draw_next_slot_guides(hud: &Surface, layout: &HudLayout) {
@@ -844,7 +850,7 @@ fn draw_panel_labels(hud: &Surface, layout: &HudLayout) {
     draw_panel_header(hud, layout.hold, "HOLD");
     draw_panel_header(hud, layout.next, "NEXT");
     draw_panel_header(hud, layout.controls, "CONTROLS");
-    draw_panel_header(hud, layout.stats, "STATUS");
+    draw_panel_header(hud, layout.stats, "LEVEL");
     draw_next_slot_guides(hud, layout);
 }
 
@@ -866,29 +872,26 @@ fn draw_indicator_pip(hud: &Surface, x: f32, y: f32, size: f32, lit: bool) {
 }
 
 struct StatsReadoutLayout {
-    level_label: Vec2,
     level_window: Rect,
+    lines_header_top: f32,
     lines: Rect,
     progress: Rect,
 }
 
 fn line_count_text(rows_cleared: usize) -> String {
     if rows_cleared > 99_999 {
-        return String::from("LINES 99999+");
+        return String::from("99,999+");
     }
 
-    format!("LINES {rows_cleared}")
+    rows_cleared.to_formatted_string(&Locale::en)
 }
 
 fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
     let scale = hud_scale();
-    let (label_width, label_height, _) = pixel_text_metrics("LEVEL", STATS_TEXT_SIZE);
     let (line_width, line_height, _) = pixel_text_metrics(line_text, LINE_COUNT_TEXT_SIZE);
     let window_width = digit_text_width("00", READOUT_PIXEL) + READOUT_PADDING * 2.0;
     let window_height = readout_height();
-    let label_gap = (8.0 * scale).round();
-    let group_width = label_width + label_gap + window_width;
-    let group_x = (rect.x + (rect.w - group_width) * 0.5).round();
+    let window_top = (rect.y + (HUD_HEADER_DIVIDER_OFFSET + 8.0) * scale).round();
     let bar_width = PROGRESS_PIP_SIZE * 10.0 + PROGRESS_PIP_GAP * 9.0;
     let progress = Rect::new(
         (rect.x + (rect.w - bar_width) * 0.5).round(),
@@ -897,26 +900,19 @@ fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
         PROGRESS_PIP_SIZE,
     );
 
-    let content_top = rect.y + (HUD_HEADER_DIVIDER_OFFSET + 16.0) * scale;
-    let content_bottom = progress.y - 16.0 * scale;
-    let row_gap = 24.0 * scale;
-    let group_height = window_height + row_gap + line_height + 1.0;
-    let group_y = (content_top + (content_bottom - content_top - group_height) * 0.5).round();
+    let lines_header_top = (window_top + window_height + 4.0 * scale).round();
 
     StatsReadoutLayout {
-        level_label: vec2(
-            group_x,
-            (group_y + (window_height + label_height - 1.0) * 0.5).floor(),
-        ),
         level_window: Rect::new(
-            group_x + label_width + label_gap,
-            group_y,
+            (rect.x + (rect.w - window_width) * 0.5).round(),
+            window_top,
             window_width,
             window_height,
         ),
+        lines_header_top,
         lines: Rect::new(
             (rect.x + (rect.w - line_width) * 0.5).round(),
-            (group_y + window_height + row_gap).round(),
+            (lines_header_top + header_band_height() + 10.0 * scale).round(),
             line_width,
             line_height,
         ),
@@ -924,20 +920,11 @@ fn stats_readout_layout(rect: Rect, line_text: &str) -> StatsReadoutLayout {
     }
 }
 
-/// A centred LEVEL row, a smaller five-digit line count below it, and progress
-/// lamps. The counters no longer compete for half of the same horizontal row.
+/// Centred values beneath matching LEVEL and LINES section headers.
 fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, rows_cleared: usize) {
     let line_text = line_count_text(rows_cleared);
     let positions = stats_readout_layout(layout.stats, &line_text);
 
-    draw_engraved_text(
-        hud,
-        "LEVEL",
-        positions.level_label.x,
-        positions.level_label.y,
-        STATS_TEXT_SIZE,
-        COLOR_TEXT_MUTED,
-    );
     draw_readout_window(
         hud,
         positions.level_window,
@@ -945,6 +932,7 @@ fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, 
         "00",
         COLOR_TEXT,
     );
+    draw_panel_header_at(hud, layout.stats, "LINES", positions.lines_header_top);
     draw_engraved_text(
         hud,
         &line_text,
@@ -1671,12 +1659,12 @@ mod tests {
             (layout.hold, "HOLD"),
             (layout.next, "NEXT"),
             (layout.controls, "CONTROLS"),
-            (layout.stats, "STATUS"),
+            (layout.stats, "LEVEL"),
             (layout.award, "LINE CLEAR"),
             (layout.award, "T-SPIN"),
             (layout.award, "T-SPIN MINI"),
         ] {
-            let baseline = panel_header_baseline(rect);
+            let baseline = panel_header_text_origin(rect, rect.y + PANEL_FRAME + 1.0).y;
             let (width, height, _) = pixel_text_metrics(label, LABEL_TEXT_SIZE);
             let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
 
@@ -1724,28 +1712,25 @@ mod tests {
     fn five_digit_line_counts_fit_below_the_centered_level_without_overlapping() {
         let rect = hud_layout().stats;
         let original = stats_readout_layout(rect, &line_count_text(0));
-        let (level_label_width, level_label_height, _) = pixel_text_metrics("LEVEL", STATS_TEXT_SIZE);
 
         for lines in [0, 99, 100, 999, 1000, 12_345, 99_999, 100_000, usize::MAX] {
             let text = line_count_text(lines);
             let positions = stats_readout_layout(rect, &text);
-            let group_left = positions.level_label.x;
-            let group_right = positions.level_window.x + positions.level_window.w;
+            let window_center = positions.level_window.x + positions.level_window.w * 0.5;
 
-            assert!(((group_left + group_right) * 0.5 - (rect.x + rect.w * 0.5)).abs() <= 0.5);
-            assert!(group_left >= rect.x + PANEL_FRAME + 1.0);
-            assert!(group_right <= rect.x + rect.w - PANEL_FRAME - 1.0);
-            assert!(positions.level_label.x + level_label_width + 1.0 < positions.level_window.x);
+            assert!((window_center - (rect.x + rect.w * 0.5)).abs() <= 0.5);
+            assert!(positions.level_window.x >= rect.x + PANEL_FRAME + 1.0);
             assert!(
-                positions.level_label.y - level_label_height
+                positions.level_window.y
                     > rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale()
             );
+            assert!(positions.lines_header_top > positions.level_window.y + positions.level_window.h);
             assert!(positions.lines.x >= rect.x + PANEL_FRAME + 1.0, "{text}");
             assert!(
                 positions.lines.x + positions.lines.w + 1.0 <= rect.x + rect.w - PANEL_FRAME,
                 "{text}"
             );
-            assert!(positions.lines.y > positions.level_window.y + positions.level_window.h);
+            assert!(positions.lines.y > positions.lines_header_top + header_band_height());
             assert!(positions.lines.y + positions.lines.h + 1.0 < positions.progress.y);
             assert!(positions.progress.y + positions.progress.h < rect.y + rect.h - PANEL_FRAME);
             assert_eq!(
@@ -1764,12 +1749,27 @@ mod tests {
 
     #[test]
     fn line_count_formatting_keeps_five_digits_and_bounds_larger_values() {
-        assert_eq!(line_count_text(0), "LINES 0");
-        assert_eq!(line_count_text(100), "LINES 100");
-        assert_eq!(line_count_text(12_345), "LINES 12345");
-        assert_eq!(line_count_text(99_999), "LINES 99999");
-        assert_eq!(line_count_text(100_000), "LINES 99999+");
-        assert_eq!(line_count_text(usize::MAX), "LINES 99999+");
+        assert_eq!(line_count_text(0), "0");
+        assert_eq!(line_count_text(100), "100");
+        assert_eq!(line_count_text(12_345), "12,345");
+        assert_eq!(line_count_text(99_999), "99,999");
+        assert_eq!(line_count_text(100_000), "99,999+");
+        assert_eq!(line_count_text(usize::MAX), "99,999+");
+    }
+
+    #[test]
+    fn level_and_lines_headers_share_insets_and_vertical_text_metrics() {
+        let rect = hud_layout().stats;
+        let layout = stats_readout_layout(rect, &line_count_text(99_999));
+        let level_top = rect.y + PANEL_FRAME + 1.0;
+        let level = panel_header_text_origin(rect, level_top);
+        let lines = panel_header_text_origin(rect, layout.lines_header_top);
+
+        assert_eq!(level.x, lines.x);
+        assert_eq!(level.y - level_top, lines.y - layout.lines_header_top);
+        assert!(lines.y < layout.lines.y);
+        assert_eq!(level.x, rect.x + 16.0 * hud_scale());
+        assert_eq!(layout.lines_header_top.fract(), 0.0);
     }
 
     #[test]
