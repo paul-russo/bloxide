@@ -449,7 +449,8 @@ fn successful_horizontal_gravity_and_soft_drop_movements_clear_rotation_provenan
     assert_eq!(soft.active_piece_row, ROW + 1);
     assert_eq!(soft.score, 1);
 
-    for state in [horizontal, gravity, soft] {
+    // Borrow the large states so array iteration stays within the test-thread stack.
+    for state in [&horizontal, &gravity, &soft] {
         assert!(state.last_rotation.is_none());
     }
 }
