@@ -189,11 +189,6 @@ impl Surface<'_> {
         self.fill(Rect::new(x1, y, x2 - x1, 1.0), color);
     }
 
-    /// One-pixel vertical rule down column `x`, from `y1` to `y2`.
-    fn vline(&self, x: f32, y1: f32, y2: f32, color: Color) {
-        self.fill(Rect::new(x, y1, 1.0, y2 - y1), color);
-    }
-
     /// A material tile over `rect`, showing the material from its top-left
     /// texel to `uv_max`, with a colour at each corner.
     fn tile(&self, rect: Rect, material: Material, uv_max: Vec2, colors: [Color; 4]) {
