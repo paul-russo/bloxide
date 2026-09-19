@@ -11,7 +11,7 @@
 use macroquad::prelude::*;
 
 use crate::render3d::{
-    BEZEL_FRONT_Z, BEZEL_PILLAR_CENTER_X, LAVA_Y, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
+    cell_center, BEZEL_FRONT_Z, BEZEL_PILLAR_CENTER_X, LAVA_Y, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
 };
 
 /// Lightstyle 1 ("FLICKER, first variety"). `a` is dark, `m` is normal, `z`
@@ -63,6 +63,8 @@ pub struct SceneLights {
     lamp_color: Vec3,
     lamp_intensity: f32,
     furnace_intensity: f32,
+    heated_rows: u32,
+    clear_heat: f32,
 }
 
 impl SceneLights {
@@ -80,12 +82,21 @@ impl SceneLights {
             lamp_color: LAMP_COLOR.lerp(LAMP_ALERT_COLOR, danger),
             lamp_intensity: LAMP_INTENSITY * lamp_flicker * alert_pulse + flare * 0.9,
             furnace_intensity: FURNACE_INTENSITY * furnace_flicker,
+            heated_rows: 0,
+            clear_heat: 0.0,
         }
     }
 
     /// Lamps flickering at their normal colour, for menus and tests.
     pub fn idle(time: f64) -> Self {
         Self::new(time, 0.0, 0.0)
+    }
+
+    /// Incandescent rows cast a local orange reflection onto the cabinet.
+    pub fn with_clear_heat(mut self, rows: u32, heat: f32) -> Self {
+        self.clear_heat = heat.clamp(0.0, 1.0);
+        self.heated_rows = if self.clear_heat > 0.0 { rows } else { 0 };
+        self
     }
 
     pub fn lamp_positions() -> [Vec3; 2] {
@@ -126,6 +137,18 @@ impl SceneLights {
         let furnace_falloff =
             1.0 / (1.0 + furnace_delta.length_squared() / (FURNACE_RADIUS * FURNACE_RADIUS));
         light += FURNACE_COLOR * (self.furnace_intensity * furnace_falloff);
+
+        let mut rows = self.heated_rows;
+        let mut clear_falloff: f32 = 0.0;
+        while rows != 0 {
+            let row = rows.trailing_zeros() as usize;
+            rows &= rows - 1;
+            let nearest = Vec3::new(nearest_x, cell_center(row, 0).y, 0.5);
+            let falloff = (1.0 - (point - nearest).length() / 2.4).clamp(0.0, 1.0);
+            clear_falloff = clear_falloff.max(falloff * falloff);
+        }
+        light += Vec3::new(1.0, 0.26, 0.025)
+            * (3.4 * self.clear_heat.powi(2) * clear_falloff);
 
         light
     }

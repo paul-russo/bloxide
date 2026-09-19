@@ -1,3 +1,4 @@
+mod agent;
 mod bag_manager;
 mod block;
 mod draw;
@@ -185,6 +186,68 @@ fn seed_screenshot_state<'a>(
     game_state
 }
 
+/// A fresh run. In agent mode gravity and the lock delay are off so the
+/// caller sets the pace; every new game in that process, including ones
+/// started from the menus, gets the same rules.
+fn new_game(high_score_manager: &HighScoreManager, agent_mode: bool) -> GameState<'_> {
+    let mut game_state = GameState::new(high_score_manager);
+    if agent_mode {
+        game_state.freeze_gravity();
+        // The active and ghost grids are only filled by an update; run one
+        // empty sample so the first printed board already shows the piece.
+        game_state.update(GameInput::default());
+    }
+
+    game_state
+}
+
+/// Run one line of piped commands against the current game and print the
+/// resulting board. A line that fails to parse is reported and skipped whole,
+/// so a typo never leaves a batch half-applied.
+fn apply_agent_line<'a>(
+    line: &str,
+    game_state: &mut GameState<'a>,
+    high_score_manager: &'a HighScoreManager,
+) {
+    let commands = match agent::parse_line(line) {
+        Ok(commands) => commands,
+        Err(message) => {
+            println!("ERR {message}");
+            return;
+        }
+    };
+    if commands.is_empty() {
+        return;
+    }
+
+    for command in commands {
+        match command {
+            agent::Command::NewGame => *game_state = new_game(high_score_manager, true),
+            agent::Command::TogglePause => game_state.toggle_pause(),
+            agent::Command::ShowState => {}
+            agent::Command::Quit => quit(),
+            _ => {
+                let input = command
+                    .piece_input()
+                    .expect("piece commands always have an input sample");
+
+                // Each press is followed by a release sample. Shifts are
+                // edge-triggered with DAS, so back-to-back `shift_left`
+                // samples would read as one key held down and move once.
+                for _ in 0..command.repeat_count() {
+                    game_state.update(input);
+                    game_state.update(GameInput::default());
+                }
+            }
+        }
+    }
+
+    print!("{}", agent::render_state(game_state));
+    if game_state.get_is_game_over() {
+        println!("GAME OVER score={}", game_state.get_score());
+    }
+}
+
 /// Alpha-blended overlays leave partial alpha in the framebuffer, which image
 /// viewers then composite against their own backdrop. Force the export opaque
 /// so the PNG shows exactly what was on screen.
@@ -205,6 +268,7 @@ async fn main() {
     let mut maybe_game_state: Option<GameState> = None;
     let harness_scene = harness_scene_from_args();
     let is_screenshot = is_screenshot_run();
+    let capture_sequence = is_screenshot && std::env::args().any(|arg| arg == "--sequence");
     let screenshot_capture_frame = screenshot_frame_from_args();
     let mut screenshot_frame: usize = 0;
     let mut telemetry = Telemetry::from_args(harness_scene.map_or("play", HarnessScene::label));
@@ -222,6 +286,30 @@ async fn main() {
             maybe_game_state = Some(game_state);
         }
     }
+
+    // Agent runs skip the main menu and start a frozen-gravity game at once,
+    // so the first thing on stdout is a board the caller can act on.
+    let agent_input = agent::command_input_from_args();
+    let agent_mode = agent_input.is_some();
+    let mut agent_commands = match agent_input {
+        Some(input) => {
+            let commands = match agent::CommandSource::spawn(input.clone()) {
+                Ok(commands) => commands,
+                Err(error) => {
+                    eprintln!("AGENT cannot read commands from {input:?}: {error}");
+                    quit();
+                    return;
+                }
+            };
+            let game_state = new_game(&high_score_manager, true);
+            println!("{}", agent::USAGE);
+            print!("{}", agent::render_state(&game_state));
+            current_screen = CurrentScreen::Game;
+            maybe_game_state = Some(game_state);
+            Some(commands)
+        }
+        None => None,
+    };
 
     let mut menu_main = Menu::new(
         "bloxide",
@@ -295,9 +383,25 @@ async fn main() {
             select: is_key_pressed(KeyCode::Enter),
         };
 
+        if let (Some(commands), Some(game_state)) =
+            (agent_commands.as_mut(), maybe_game_state.as_mut())
+        {
+            // Piped commands run before the keyboard sample, which then
+            // overwrites the held-key state so a piped shift never repeats
+            // under DAS on later ticks.
+            for line in commands.pending_lines() {
+                apply_agent_line(&line, game_state, &high_score_manager);
+            }
+
+            if commands.is_closed() {
+                println!("AGENT command source closed; keyboard control only");
+                agent_commands = None;
+            }
+        }
+
         if current_screen == CurrentScreen::Game && maybe_game_state.is_some() {
             let game_state = maybe_game_state.as_mut().unwrap();
-            game_state.update(GameInput {
+            let input = GameInput {
                 soft_drop: is_key_down(KeyCode::Down),
                 shift_left: is_key_down(KeyCode::Left),
                 shift_right: is_key_down(KeyCode::Right),
@@ -306,13 +410,23 @@ async fn main() {
                 hard_drop: is_key_pressed(KeyCode::Space),
                 hold_piece: is_key_pressed(KeyCode::C),
                 toggle_pause: is_key_pressed(KeyCode::Escape),
-            });
+            };
+            if is_screenshot {
+                let elapsed = if screenshot_frame == 0 {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs_f64(SCREENSHOT_FRAME_SECONDS)
+                };
+                game_state.update_with_elapsed(elapsed, input);
+            } else {
+                game_state.update(input);
+            }
 
             menu_game_over.is_visible = game_state.get_is_game_over();
             menu_paused.is_visible = game_state.get_is_paused();
 
             match menu_game_over.update(menu_input) {
-                Some("new_game") => *game_state = GameState::new(&high_score_manager),
+                Some("new_game") => *game_state = new_game(&high_score_manager, agent_mode),
                 Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
@@ -328,7 +442,7 @@ async fn main() {
             match menu_main.update(menu_input) {
                 Some("new_game") => {
                     current_screen = CurrentScreen::Game;
-                    maybe_game_state = Some(GameState::new(&high_score_manager));
+                    maybe_game_state = Some(new_game(&high_score_manager, agent_mode));
                 }
                 Some("quit") => quit(),
                 _ => (),
@@ -373,6 +487,12 @@ async fn main() {
 
         if is_screenshot {
             screenshot_frame += 1;
+            if capture_sequence {
+                export_opaque_png(
+                    get_screen_data(),
+                    &format!("screenshot-{screenshot_frame:04}.png"),
+                );
+            }
             if screenshot_frame >= screenshot_capture_frame {
                 export_opaque_png(get_screen_data(), "screenshot.png");
                 export_opaque_png(

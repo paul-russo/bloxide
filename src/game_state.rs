@@ -27,6 +27,7 @@ const RESET_MOVES: isize = 15; // Successful post-contact moves per lowest row b
 const EFFECT_TICK_INTERVAL: usize = TICKS_PER_SECOND as usize / 60;
 const LOCK_IMPACT_TICKS: usize = 10 * EFFECT_TICK_INTERVAL;
 const LINE_CLEAR_EFFECT_TICKS: usize = 40 * EFFECT_TICK_INTERVAL;
+const LINE_CLEAR_HEAT_TICKS: usize = TICKS_PER_SECOND as usize * 150 / 1000;
 const MAX_IMPACT_CONTACTS: usize = 4;
 const HARD_DROP_TRAIL_TICKS: usize = 9 * EFFECT_TICK_INTERVAL;
 const LEVEL_FLARE_TICKS: usize = 45 * EFFECT_TICK_INTERVAL;
@@ -44,6 +45,18 @@ pub struct HardDropTrail {
     pub bounds_height: usize,
     pub bounds_width: usize,
     pub color: Color,
+}
+
+/// The board just before compaction, held briefly while completed rows heat.
+/// Rules and scoring resolve immediately; this snapshot only stages the visual
+/// break-up, so quick successive drops and agent commands never wait on an effect.
+#[derive(Copy, Clone)]
+struct ClearCharge {
+    grid: Grid,
+    blocks: [Option<ClearedBlock>; MAX_CLEARED_CELLS],
+    block_count: usize,
+    line_count: usize,
+    ticks_remaining: usize,
 }
 
 /// Find every downward contact made by the active piece. Coordinates are in
@@ -172,6 +185,10 @@ pub struct GameState<'a> {
     rows_cleared: usize,
     is_game_over: bool,
     is_paused: bool,
+    /// Agent-driven runs turn natural gravity and the lock-delay countdown
+    /// off, so the active piece waits in place until it is hard-dropped (or
+    /// exhausts its post-contact move allowance). Soft drop still works.
+    gravity_frozen: bool,
     high_score_manager: &'a HighScoreManager,
     // Cached block canvas to avoid repeated allocations
     cached_blocks: BlockCanvas,
@@ -185,6 +202,7 @@ pub struct GameState<'a> {
     // the game state makes effects deterministic and ensures pause freezes them.
     impact_ticks_remaining: usize,
     clear_effect_ticks_remaining: usize,
+    clear_charge: Option<ClearCharge>,
     last_clear_count: usize,
     /// Bit `n` is set when visible row `n` was part of the last line clear.
     last_clear_row_mask: u32,
@@ -247,6 +265,7 @@ impl<'a> GameState<'a> {
             rows_cleared: 0,
             is_game_over: false,
             is_paused: false,
+            gravity_frozen: false,
             high_score_manager,
             cached_blocks,
             cached_bounds_height,
@@ -255,6 +274,7 @@ impl<'a> GameState<'a> {
             cached_ghost_row: 0,
             impact_ticks_remaining: 0,
             clear_effect_ticks_remaining: 0,
+            clear_charge: None,
             last_clear_count: 0,
             last_clear_row_mask: 0,
             impact_origins: [(0.0, 0.0); MAX_IMPACT_CONTACTS],
@@ -333,11 +353,18 @@ impl<'a> GameState<'a> {
     }
 
     fn end_game(&mut self) {
+        self.finish_clear_charge();
         self.is_game_over = true;
         self.grid_active.clear();
         self.grid_ghost.clear();
 
         self.high_score_manager.add_score(self.score);
+    }
+
+    /// Stop the active piece from falling or locking on its own for the rest
+    /// of this run. Hard drops, soft drops and scoring are unaffected.
+    pub fn freeze_gravity(&mut self) {
+        self.gravity_frozen = true;
     }
 
     pub fn toggle_pause(&mut self) {
@@ -655,6 +682,10 @@ impl<'a> GameState<'a> {
     }
 
     fn try_gravity_drop(&mut self, is_soft_drop: bool) {
+        if self.gravity_frozen && !is_soft_drop {
+            return;
+        }
+
         let natural_rows_per_second = self.get_gravity() * ROWS_PER_SECOND_PER_G;
         let rows_per_second = if is_soft_drop {
             natural_rows_per_second.max(SOFT_DROP_ROWS_PER_SECOND)
@@ -698,7 +729,7 @@ impl<'a> GameState<'a> {
     /// Elapsed time precedes this input sample. Catch up using the previous
     /// held keys, then apply new presses once, even when no tick is due.
     /// This deterministic entry point never reads the wall clock.
-    fn update_with_elapsed(&mut self, elapsed: Duration, input: GameInput) {
+    pub(crate) fn update_with_elapsed(&mut self, elapsed: Duration, input: GameInput) {
         if self.is_game_over {
             return;
         }
@@ -775,7 +806,7 @@ impl<'a> GameState<'a> {
     fn step_tick(&mut self) {
         // Charge the interval that began in contact, before movement can reset
         // it. A piece landing later in this tick receives the full 120 ticks.
-        if self.update_lock_contact() {
+        if self.update_lock_contact() && !self.gravity_frozen {
             self.ticks_to_lock -= 1;
         }
 
@@ -788,6 +819,13 @@ impl<'a> GameState<'a> {
         self.score_announcement_ticks_remaining =
             self.score_announcement_ticks_remaining.saturating_sub(1);
 
+        if let Some(charge) = self.clear_charge.as_mut() {
+            charge.ticks_remaining = charge.ticks_remaining.saturating_sub(1);
+            if charge.ticks_remaining == 0 {
+                self.finish_clear_charge();
+            }
+        }
+
         // Keep the debris integrator and its per-step drag at the original
         // 60 Hz. A slow render frame still runs every owed physics step.
         if self.tick.is_multiple_of(EFFECT_TICK_INTERVAL) {
@@ -798,9 +836,11 @@ impl<'a> GameState<'a> {
         self.try_move_horizontal(input.shift_left, input.shift_right, 1);
         self.try_gravity_drop(input.soft_drop);
         self.lock_if_due();
+        self.finish_charge_if_piece_overlaps();
     }
 
     fn refresh_piece_grids(&mut self) {
+        self.finish_charge_if_piece_overlaps();
         if !self.piece_dirty {
             return;
         }
@@ -959,8 +999,6 @@ impl<'a> GameState<'a> {
         cleared_count: usize,
         clear_count: usize,
     ) {
-        let is_carnage = clear_count >= 4;
-
         let voxels_per_block = match clear_count {
             1 => 4,
             2 => 6,
@@ -969,24 +1007,21 @@ impl<'a> GameState<'a> {
         };
 
         let (min_size, max_size) = match clear_count {
-            1 => (0.32, 0.38),
-            2 => (0.34, 0.40),
-            3 => (0.36, 0.44),
-            _ => (0.38, 0.46),
+            1 => (0.16, 0.23),
+            2 | 3 => (0.18, 0.25),
+            _ => (0.20, 0.28),
         };
 
         let (min_vel_y, max_vel_y) = match clear_count {
-            1 => (2.2, 5.2),
-            2 => (2.8, 6.2),
-            3 => (3.4, 7.2),
-            _ => (4.0, 8.5),
+            1 => (0.8, 2.4),
+            2 | 3 => (1.0, 3.0),
+            _ => (1.2, 3.6),
         };
 
         let (min_vel_z, max_vel_z) = match clear_count {
-            1 => (1.2, 3.0),
-            2 => (1.8, 4.5),
-            3 => (2.6, 6.0),
-            _ => (3.5, 8.0),
+            1 => (0.5, 1.4),
+            2 | 3 => (0.6, 1.8),
+            _ => (0.8, 2.2),
         };
 
         let spin_speed = match clear_count {
@@ -1049,9 +1084,9 @@ impl<'a> GameState<'a> {
 
                 let local_dir = Vec3::new(ox, oy, oz).normalize_or_zero();
                 let norm_x = (cleared.col as f32 - 4.5) / 4.5;
-                let vel_x = norm_x * rng.gen_range(2.0..4.5)
-                    + local_dir.x * rng.gen_range(1.0..2.5)
-                    + rng.gen_range(-1.2..1.2);
+                let vel_x = norm_x * rng.gen_range(1.0..2.2)
+                    + local_dir.x * rng.gen_range(0.6..1.4)
+                    + rng.gen_range(-0.6..0.6);
                 let vel_y =
                     rng.gen_range(min_vel_y..max_vel_y) + local_dir.y * rng.gen_range(0.5..1.8);
                 let vel_z =
@@ -1064,6 +1099,10 @@ impl<'a> GameState<'a> {
                 );
 
                 let size = rng.gen_range(min_size..max_size);
+                let base_luma = cleared.color.r * 0.2126
+                    + cleared.color.g * 0.7152
+                    + cleared.color.b * 0.0722;
+                let gray = rng.gen_range(0.44..0.58) + base_luma * 0.12;
 
                 self.shrapnel_voxels[target_index] = ShrapnelVoxel {
                     position: pos,
@@ -1074,12 +1113,11 @@ impl<'a> GameState<'a> {
                         rng.gen_range(0.0..std::f32::consts::TAU),
                     ),
                     angular_velocity: rot_vel,
-                    color: cleared.color,
+                    color: Color::new(gray, gray, gray, 1.0),
                     size,
                     age: 0.0,
                     submersion: 0.0,
                     bounce_count: 0,
-                    is_carnage,
                     active: true,
                 };
             }
@@ -1087,6 +1125,10 @@ impl<'a> GameState<'a> {
     }
 
     fn clear_filled_rows(&mut self) -> usize {
+        // A new lock supersedes the old visual snapshot. Release its scrap
+        // first, including when this lock itself clears no rows.
+        self.finish_clear_charge();
+        let grid_before_clear = self.grid_locked;
         let (rows_cleared, cleared_blocks, cleared_count) =
             self.grid_locked.clear_all_filled_rows_detailed();
 
@@ -1096,11 +1138,46 @@ impl<'a> GameState<'a> {
                 .iter()
                 .flatten()
                 .fold(0, |mask, block| mask | (1 << block.visible_row));
-            self.clear_effect_ticks_remaining = LINE_CLEAR_EFFECT_TICKS;
-            self.spawn_shrapnel_for_cleared_blocks(&cleared_blocks, cleared_count, rows_cleared);
+            self.clear_effect_ticks_remaining = 0;
+            self.clear_charge = Some(ClearCharge {
+                grid: grid_before_clear,
+                blocks: cleared_blocks,
+                block_count: cleared_count,
+                line_count: rows_cleared,
+                ticks_remaining: LINE_CLEAR_HEAT_TICKS,
+            });
         }
 
         rows_cleared
+    }
+
+    fn finish_clear_charge(&mut self) {
+        let Some(charge) = self.clear_charge.take() else {
+            return;
+        };
+        self.spawn_shrapnel_for_cleared_blocks(
+            &charge.blocks,
+            charge.block_count,
+            charge.line_count,
+        );
+        self.clear_effect_ticks_remaining = LINE_CLEAR_EFFECT_TICKS;
+    }
+
+    /// At high gravity or after a fast drop, never draw the successor inside
+    /// the old stack. Shorten the visual charge instead of delaying any input.
+    fn finish_charge_if_piece_overlaps(&mut self) {
+        let overlaps = self.clear_charge.as_ref().is_some_and(|charge| {
+            charge.grid.collision_check(
+                self.active_piece_row,
+                self.active_piece_col,
+                &self.cached_blocks,
+                self.cached_bounds_height,
+                self.cached_bounds_width,
+            )
+        });
+        if overlaps {
+            self.finish_clear_charge();
+        }
     }
 
     fn resolve_lock_score(&mut self, spin: SpinKind) {
@@ -1122,6 +1199,19 @@ impl<'a> GameState<'a> {
 
     pub fn get_grid_locked(&self) -> &Grid {
         &self.grid_locked
+    }
+
+    pub fn get_grid_for_render(&self) -> &Grid {
+        self.clear_charge
+            .as_ref()
+            .map_or(&self.grid_locked, |charge| &charge.grid)
+    }
+
+    /// Heat rises from zero to one while the completed rows stay in place.
+    pub fn get_clear_heat(&self) -> Option<f32> {
+        self.clear_charge.as_ref().map(|charge| {
+            1.0 - charge.ticks_remaining as f32 / LINE_CLEAR_HEAT_TICKS as f32
+        })
     }
 
     pub fn get_grid_locked_mut(&mut self) -> &mut Grid {
@@ -1202,6 +1292,20 @@ impl<'a> GameState<'a> {
         self.held_piece
     }
 
+    pub fn get_active_piece(&self) -> Piece {
+        self.active_piece
+    }
+
+    /// Canvas origin (row, col) and SRS orientation of the active piece, in
+    /// grid coordinates that include the hidden buffer rows.
+    pub fn get_active_piece_pose(&self) -> (isize, isize, usize) {
+        (
+            self.active_piece_row,
+            self.active_piece_col,
+            self.active_piece_orientation,
+        )
+    }
+
     pub fn get_is_game_over(&self) -> bool {
         self.is_game_over
     }
@@ -1225,7 +1329,7 @@ impl<'a> GameState<'a> {
     /// Visible rows involved in the most recent line clear, as a bitmask, for
     /// as long as the clear effect is running.
     pub fn get_clear_row_mask(&self) -> u32 {
-        if self.clear_effect_ticks_remaining == 0 {
+        if self.clear_effect_ticks_remaining == 0 && self.clear_charge.is_none() {
             0
         } else {
             self.last_clear_row_mask
@@ -1352,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn line_clears_spawn_active_shrapnel_voxels() {
+    fn line_clears_heat_before_spawning_small_gray_shrapnel() {
         let high_score_manager = crate::high_score_manager::HighScoreManager::new();
         let mut game_state = super::GameState::new(&high_score_manager);
 
@@ -1364,13 +1468,24 @@ mod tests {
         }
 
         game_state.trigger_line_clear();
+        assert_eq!(game_state.get_clear_heat(), Some(0.0));
+        assert!(game_state.get_grid_for_render().is_row_filled(GRID_COUNT_ROWS - 1));
+        assert!(!game_state.get_grid_locked().is_row_filled(GRID_COUNT_ROWS - 1));
+        assert!(game_state.get_shrapnel().iter().all(|v| !v.active));
+
+        for _ in 0..super::LINE_CLEAR_HEAT_TICKS - 1 {
+            game_state.step_tick();
+        }
+        assert!(game_state.get_clear_heat().unwrap() > 0.95);
+        assert!(game_state.get_shrapnel().iter().all(|v| !v.active));
+        game_state.step_tick();
+        assert_eq!(game_state.get_clear_heat(), None);
 
         let active_count = game_state
             .get_shrapnel()
             .iter()
             .filter(|v| v.active)
             .count();
-        // 10 blocks * 4 voxels per block = 40 voxels
         assert_eq!(active_count, 40);
 
         // Advance physics by several ticks
@@ -1378,6 +1493,9 @@ mod tests {
 
         for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
             assert!(voxel.age > 0.0);
+            assert_eq!(voxel.color.r, voxel.color.g);
+            assert_eq!(voxel.color.g, voxel.color.b);
+            assert!(voxel.size < 0.25);
         }
     }
 
@@ -1393,14 +1511,19 @@ mod tests {
         }
 
         game_state.trigger_line_clear();
+        for _ in 0..super::LINE_CLEAR_HEAT_TICKS {
+            game_state.step_tick();
+        }
         assert!(game_state.get_lava_splashes().iter().all(|splash| !splash.active));
 
         // Run the burst for a second at 60 Hz: by then everything has fallen
         // through the grate, and some of it has reached the melt.
         let mut saw_below_floor = false;
         let mut saw_sinking = false;
+        let mut saw_splash = false;
         for _ in 0..60 {
             game_state.update_shrapnel(1.0 / 60.0);
+            saw_splash |= game_state.get_lava_splashes().iter().any(|splash| splash.active);
             for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
                 saw_below_floor |= voxel.position.y < super::FLOOR_Y - 0.5;
                 saw_sinking |= voxel.is_sinking();
@@ -1412,7 +1535,7 @@ mod tests {
         }
         assert!(saw_below_floor, "debris should drop through the open floor");
         assert!(saw_sinking, "debris should land in the melt");
-        assert!(game_state.get_lava_splashes().iter().any(|splash| splash.active));
+        assert!(saw_splash);
 
         // Given a few more seconds, every piece has sunk and been retired.
         for _ in 0..300 {
@@ -1423,7 +1546,7 @@ mod tests {
 
 
     #[test]
-    fn carnage_line_clears_spawn_maximum_shrapnel_voxels() {
+    fn four_line_clears_also_release_small_neutral_scrap() {
         let high_score_manager = crate::high_score_manager::HighScoreManager::new();
         let mut game_state = super::GameState::new(&high_score_manager);
 
@@ -1435,21 +1558,22 @@ mod tests {
         }
 
         game_state.trigger_line_clear();
+        for _ in 0..super::LINE_CLEAR_HEAT_TICKS {
+            game_state.step_tick();
+        }
 
         let active_count = game_state
             .get_shrapnel()
             .iter()
             .filter(|v| v.active)
             .count();
-        // 40 blocks * 8 sub-voxels = 320 voxels (100% spawn rate)
         assert_eq!(active_count, 320);
-
-        let carnage_count = game_state
-            .get_shrapnel()
-            .iter()
-            .filter(|v| v.active && v.is_carnage)
-            .count();
-        assert_eq!(carnage_count, 320);
+        for voxel in game_state.get_shrapnel().iter().filter(|v| v.active) {
+            assert_eq!(voxel.color.r, voxel.color.g);
+            assert_eq!(voxel.color.g, voxel.color.b);
+            assert!(voxel.size < 0.29);
+            assert!(!voxel.is_sinking());
+        }
     }
 
     #[test]
@@ -1471,6 +1595,87 @@ mod tests {
 
         let expected_mask = visible_rows.iter().fold(0, |mask, &row| mask | (1 << row));
         assert_eq!(game_state.get_clear_row_mask(), expected_mask);
+    }
+
+    #[test]
+    fn separated_rows_hold_the_original_stack_and_pause_freezes_the_heat() {
+        use std::time::Duration;
+        let high_scores = crate::high_score_manager::HighScoreManager::new();
+        let mut state = super::GameState::new(&high_scores);
+        for row in [GRID_COUNT_ROWS - 3, GRID_COUNT_ROWS - 1] {
+            for col in 0..GRID_COUNT_COLS {
+                state.grid_locked.set_cell(row, col, Some(Block::new(WHITE)));
+            }
+        }
+        state.grid_locked.set_cell(GRID_COUNT_ROWS - 4, 0, Some(Block::new(WHITE)));
+        state.trigger_line_clear();
+        let score = state.score;
+        assert!(state.get_grid_for_render().has_block_at_cell(GRID_COUNT_ROWS - 4, 0));
+        assert!(state.get_grid_locked().has_block_at_cell(GRID_COUNT_ROWS - 2, 0));
+
+        state.update_with_elapsed(Duration::from_millis(75), Default::default());
+        assert_eq!(state.get_clear_heat(), Some(0.5));
+        state.toggle_pause();
+        state.update_with_elapsed(Duration::from_secs(30), Default::default());
+        assert_eq!(state.get_clear_heat(), Some(0.5));
+        assert!(state.get_shrapnel().iter().all(|v| !v.active));
+        state.toggle_pause();
+        state.update_with_elapsed(Duration::from_millis(75), Default::default());
+        assert_eq!(state.get_clear_heat(), None);
+        assert!(!state.get_grid_for_render().has_block_at_cell(GRID_COUNT_ROWS - 4, 0));
+        assert!(state.get_grid_for_render().has_block_at_cell(GRID_COUNT_ROWS - 2, 0));
+        assert_eq!(state.get_shrapnel().iter().filter(|v| v.active).count(), 120);
+        assert_eq!(state.score, score, "rupture must not score a second time");
+        state.update_with_elapsed(Duration::from_millis(20), Default::default());
+        assert_eq!(state.get_shrapnel().iter().filter(|v| v.active).count(), 120);
+    }
+
+    #[test]
+    fn an_immediate_successor_drop_releases_pending_scrap_without_losing_input() {
+        let high_scores = crate::high_score_manager::HighScoreManager::new();
+        let mut state = super::GameState::new(&high_scores);
+        state.freeze_gravity();
+        for col in 0..GRID_COUNT_COLS {
+            state.grid_locked.set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
+        }
+        state.trigger_line_clear();
+        state.update_with_elapsed(
+            std::time::Duration::ZERO,
+            super::GameInput {
+                hard_drop: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.get_clear_heat(), None);
+        assert_eq!(state.get_shrapnel().iter().filter(|v| v.active).count(), 40);
+        let occupied = (0..GRID_COUNT_ROWS)
+            .flat_map(|row| (0..GRID_COUNT_COLS).map(move |col| (row, col)))
+            .filter(|&(row, col)| state.grid_locked.has_block_at_cell(row, col))
+            .count();
+        assert_eq!(occupied, 4, "the next piece must lock even without elapsed time");
+        assert_eq!(state.rows_cleared, 1);
+    }
+
+    #[test]
+    fn a_fast_falling_successor_never_overlaps_the_old_visual_stack() {
+        let high_scores = crate::high_score_manager::HighScoreManager::new();
+        let mut state = super::GameState::new(&high_scores);
+        for col in 0..GRID_COUNT_COLS {
+            state.grid_locked.set_cell(GRID_COUNT_ROWS - 1, col, Some(Block::new(WHITE)));
+        }
+        state.trigger_line_clear();
+        state.active_piece_row = state.grid_locked.find_landing_row(
+            state.active_piece_row,
+            state.active_piece_col,
+            &state.cached_blocks,
+            state.cached_bounds_height,
+            state.cached_bounds_width,
+        );
+        state.piece_dirty = true;
+        state.update_with_elapsed(std::time::Duration::ZERO, Default::default());
+        assert_eq!(state.get_clear_heat(), None);
+        assert!(state.get_shrapnel().iter().any(|v| v.active));
+        assert_eq!(state.rows_cleared, 1);
     }
 
     #[test]

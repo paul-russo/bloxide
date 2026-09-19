@@ -5,8 +5,8 @@
 //! and one texel lands on one pixel. Drawing a larger hand-painted source
 //! through a point sampler at this size turns its detail into shimmer; at
 //! native size the bevels, rivets and vent slots stay crisp and read as
-//! deliberate pixel art. All materials are neutral grey so they can be tinted
-//! by the piece palette and scene lighting at draw time.
+//! deliberate pixel art. Base materials are neutral grey for palette tinting;
+//! incandescent variants contain their own emitted heat colors.
 //!
 //! Everything is packed into one atlas texture: the materials, a plain white
 //! swatch for untextured geometry, and the glyphs of both bitmap fonts.
@@ -27,9 +27,11 @@ pub const BLOCK_TEXTURE_SIZE: usize = 16;
 /// Edge length of the seamless stone tile used behind the cabinet.
 pub const STONE_TEXTURE_SIZE: usize = 32;
 
-/// Edge length of the atlas, in texels. Plenty for the four materials, the
-/// white swatch and about sixty small glyphs.
-const ATLAS_SIZE: usize = 128;
+/// Includes the materials, glyphs and the incandescent variants of each block.
+const ATLAS_SIZE: usize = 256;
+const HEAT_STEPS: usize = 16;
+const HEAT_VARIANTS: usize = 4;
+type HeatedRegions = [UvRect; HEAT_STEPS * HEAT_VARIANTS];
 
 /// Empty texels between packed regions. Nearest sampling inside a region never
 /// reaches its edge, but the gutter keeps rounding at the very edge from ever
@@ -396,6 +398,61 @@ pub fn vent_panel() -> Canvas {
     canvas
 }
 
+/// An artistic iron-heating ramp: dark oxide, dull red, orange, then a small
+/// yellow-hot core. These colors are emission, not a paint tint.
+pub fn iron_heat_color(temperature: f32) -> Color {
+    const RAMP: [Color; 6] = [
+        color_u8!(35, 29, 28, 255),
+        color_u8!(92, 12, 6, 255),
+        color_u8!(184, 28, 5, 255),
+        color_u8!(250, 82, 9, 255),
+        color_u8!(255, 162, 34, 255),
+        color_u8!(255, 232, 121, 255),
+    ];
+    let position = temperature.clamp(0.0, 1.0) * (RAMP.len() - 1) as f32;
+    let index = (position.floor() as usize).min(RAMP.len() - 2);
+    let t = position - index as f32;
+    let a = RAMP[index];
+    let b = RAMP[index + 1];
+    Color::new(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.0)
+}
+
+fn heated_texel(material: &Canvas, x: usize, y: usize, heat: f32, variant: usize) -> [u8; 4] {
+    let (hot_x, hot_y) = [(6.0, 8.5), (9.5, 6.0), (5.0, 5.5), (9.0, 10.0)][variant];
+    let u = (x as f32 - hot_x) / 8.0;
+    let v = (y as f32 - hot_y) / 8.0;
+    let core = (1.0 - (u * u * 0.72 + v * v)).clamp(0.0, 1.0);
+    let grain = hash01(x / 2, y / 2, 83 + variant as u32 * 13);
+    let surface = material.get(x, y);
+    let mut temperature = heat * (0.48 + 0.64 * core + 0.10 * grain);
+    // Cooler oxide scale and recesses remain embedded in the glowing metal.
+    if grain > 0.85 {
+        temperature *= 0.65;
+    }
+    if surface < 0.35 {
+        temperature *= 0.76;
+    }
+    let color = iron_heat_color(temperature);
+    let relief = 0.83 + 0.17 * surface;
+    [
+        (color.r * relief * 255.0).round() as u8,
+        (color.g * relief * 255.0).round() as u8,
+        (color.b * relief * 255.0).round() as u8,
+        255,
+    ]
+}
+
+fn pack_heated_material(builder: &mut AtlasBuilder, material: &Canvas) -> HeatedRegions {
+    std::array::from_fn(|index| {
+        let step = index / HEAT_VARIANTS;
+        let variant = index % HEAT_VARIANTS;
+        let heat = step as f32 / (HEAT_STEPS - 1) as f32;
+        builder.add(BLOCK_TEXTURE_SIZE, BLOCK_TEXTURE_SIZE, |x, y| {
+            heated_texel(material, x, y, heat, variant)
+        })
+    })
+}
+
 /// Seamless worn gunmetal for the cabinet fascia and HUD housings.
 pub fn gunmetal() -> Canvas {
     let mut canvas = Canvas::new(BLOCK_TEXTURE_SIZE, 0.60);
@@ -471,6 +528,8 @@ pub struct SceneTextures {
     atlas: Texture2D,
     armor: UvRect,
     vent: UvRect,
+    heated_armor: HeatedRegions,
+    heated_vent: HeatedRegions,
     gunmetal: UvRect,
     stone: UvRect,
     white: UvRect,
@@ -486,6 +545,8 @@ impl SceneTextures {
         let vent = builder.add_canvas(&vent_panel());
         let gunmetal = builder.add_canvas(&gunmetal());
         let white = builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true);
+        let heated_armor = pack_heated_material(&mut builder, &armor_plate());
+        let heated_vent = pack_heated_material(&mut builder, &vent_panel());
 
         let mut small_glyphs: GlyphRegions = [None; 128];
         for character in SMALL_GLYPH_CHARS.chars() {
@@ -511,6 +572,8 @@ impl SceneTextures {
             atlas: builder.into_texture(),
             armor,
             vent,
+            heated_armor,
+            heated_vent,
             gunmetal,
             stone,
             white,
@@ -529,16 +592,26 @@ impl SceneTextures {
     /// Choose a stable block material from the piece colour. Position-based
     /// variation would make an active piece visibly swap textures as it moves.
     pub fn for_color(&self, color: Color) -> Material<'_> {
-        let r = (color.r * 255.0).round() as u32;
-        let g = (color.g * 255.0).round() as u32;
-        let b = (color.b * 255.0).round() as u32;
-        let signature = r * 3 + g * 5 + b * 7;
-
-        if signature % 5 >= 3 {
+        if uses_vent(color) {
             self.material(self.vent)
         } else {
             self.material(self.armor)
         }
+    }
+
+    pub fn heated_for_color(&self, color: Color, heat: f32, position: Vec3) -> Material<'_> {
+        let step = (heat.clamp(0.0, 1.0) * (HEAT_STEPS - 1) as f32).round() as usize;
+        let variant = (hash01(
+            (position.x + 128.0).floor() as usize,
+            (position.y + 128.0).floor() as usize,
+            97,
+        ) * HEAT_VARIANTS as f32) as usize;
+        let regions = if uses_vent(color) {
+            &self.heated_vent
+        } else {
+            &self.heated_armor
+        };
+        self.material(regions[step * HEAT_VARIANTS + variant])
     }
 
     pub fn gunmetal(&self) -> Material<'_> {
@@ -566,6 +639,13 @@ impl SceneTextures {
         let index = glyph_index(character)?;
         self.digit_glyphs[index].map(|region| self.material(region))
     }
+}
+
+fn uses_vent(color: Color) -> bool {
+    let r = (color.r * 255.0).round() as u32;
+    let g = (color.g * 255.0).round() as u32;
+    let b = (color.b * 255.0).round() as u32;
+    (r * 3 + g * 5 + b * 7) % 5 >= 3
 }
 
 #[cfg(test)]
@@ -624,6 +704,8 @@ mod tests {
             builder.add_canvas(&gunmetal()),
             builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true),
         ];
+        regions.extend(pack_heated_material(&mut builder, &armor_plate()));
+        regions.extend(pack_heated_material(&mut builder, &vent_panel()));
         for _ in SMALL_GLYPH_CHARS.chars() {
             regions.push(builder.add_bitmap(5, 7, |_, _| true));
         }

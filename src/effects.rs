@@ -1,6 +1,6 @@
 //! In-well presentation effects drawn during the 3D pass: embers drifting up
-//! from the furnace, the streak left behind by a hard drop, and the flash of
-//! rows being cleared.
+//! from the furnace, the streak left behind by a hard drop, and the pressure
+//! glow of completed rows before they fracture.
 //!
 //! Embers are stateless: each one's position is a pure function of time and
 //! its index, so they need no update step, cost nothing while paused, and are
@@ -9,9 +9,11 @@
 use macroquad::prelude::*;
 
 use crate::game_state::HardDropTrail;
-use crate::grid::{FIRST_VISIBLE_ROW_ID, VISIBLE_GRID_COUNT_ROWS};
+use crate::grid::{FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::SceneLights;
-use crate::render3d::{cell_center, draw_quad, BLOCK_INSET, LAVA_Y, WELL_HEIGHT, WELL_WIDTH};
+use crate::render3d::{
+    cell_center, draw_glow_disc, draw_quad, BLOCK_INSET, LAVA_Y, WELL_HEIGHT, WELL_WIDTH,
+};
 use crate::textures::SceneTextures;
 
 const EMBER_COUNT: usize = 26;
@@ -25,8 +27,8 @@ const EMBER_Z: f32 = -0.42;
 /// fell through.
 const TRAIL_Z: f32 = 0.0;
 
-/// The clear flash sits just ahead of the block faces.
-const FLASH_Z: f32 = BLOCK_INSET * 0.5 + 0.03;
+/// Heat blooms just ahead of the block faces.
+const HEAT_Z: f32 = BLOCK_INSET * 0.5 + 0.03;
 
 fn hash01(index: usize, salt: u32) -> f32 {
     let mut h = (index as u32).wrapping_mul(0x9E37_79B1) ^ salt.wrapping_mul(0x85EB_CA77);
@@ -130,44 +132,31 @@ pub fn draw_hard_drop_trail(trail: &HardDropTrail, strength: f32, textures: &Sce
     }
 }
 
-/// A hot flash across each cleared row during the first part of the clear
-/// effect: white-hot at the instant of the clear, cooling through amber as it
-/// fades. Larger clears flash harder.
-pub fn draw_clear_flash(
-    row_mask: u32,
-    clear_remaining: f32,
-    clear_count: usize,
-    textures: &SceneTextures,
-) {
-    const FLASH_PORTION: f32 = 0.3;
-    let progress = ((clear_remaining - (1.0 - FLASH_PORTION)) / FLASH_PORTION).clamp(0.0, 1.0);
-    if row_mask == 0 || progress <= 0.0 {
+/// A small orange halo around incandescent blocks. The material itself owns
+/// the hot spots and cool scale; a uniform face wash would flatten that range.
+pub fn draw_clear_heat(row_mask: u32, heat: f32, textures: &SceneTextures) {
+    if row_mask == 0 || heat <= 0.0 {
         return;
     }
 
-    let heat = progress.powf(1.5);
-    let intensity = (0.45 + 0.15 * clear_count as f32).min(1.0);
-    let color = Color::new(
-        1.0,
-        0.55 + 0.45 * heat,
-        0.15 + 0.75 * heat,
-        heat * intensity,
-    );
-    let half_w = WELL_WIDTH * 0.5;
+    let strength = heat.powi(2);
+    let color = Color::new(1.0, 0.28 + 0.14 * strength, 0.025, 1.0);
 
     for visible_row in 0..VISIBLE_GRID_COUNT_ROWS {
         if row_mask & (1 << visible_row) == 0 {
             continue;
         }
 
-        let top_y = cell_center(visible_row, 0).y + 0.5;
-        draw_quad(
-            Vec3::new(-half_w, top_y, FLASH_Z),
-            Vec3::X * WELL_WIDTH,
-            Vec3::NEG_Y,
-            textures.white(),
-            [color; 4],
-        );
+        for col in 0..GRID_COUNT_COLS {
+            let center = cell_center(visible_row, col);
+            draw_glow_disc(
+                Vec3::new(center.x, center.y, HEAT_Z),
+                0.95,
+                color,
+                strength * 0.10,
+                textures,
+            );
+        }
     }
 }
 

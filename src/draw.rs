@@ -1,5 +1,5 @@
 use crate::block::Block;
-use crate::effects::{draw_clear_flash, draw_embers, draw_hard_drop_trail};
+use crate::effects::{draw_clear_heat, draw_embers, draw_hard_drop_trail};
 use crate::game_state::GameState;
 use crate::grid::{Grid, FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, GRID_COUNT_ROWS};
 use crate::high_score_manager::HighScoreManager;
@@ -12,7 +12,7 @@ use crate::pixel_font::{
 };
 use crate::postfx::PostProcess;
 use crate::render3d::{
-    cell_center, draw_block_cube, draw_block_cube_scaled, draw_ghost_cell, draw_lamp_glow,
+    cell_center, draw_block_cube_heated, draw_block_cube_scaled, draw_ghost_cell, draw_lamp_glow,
     draw_quad_corners, draw_quad_corners_uv, draw_shrapnel, draw_tumbling_cube, draw_well,
     lintel_front_bounds, set_depth_test, well_camera, world_to_screen, world_to_screen_with_shake,
     ScreenPlane, BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
@@ -250,10 +250,6 @@ const COLOR_SCREW: Color = color_u8!(150, 152, 148, 255);
 const COLOR_AMBER: Color = color_u8!(231, 148, 49, 255);
 const COLOR_TEXT: Color = color_u8!(242, 229, 193, 255);
 const COLOR_TEXT_MUTED: Color = color_u8!(169, 157, 121, 255);
-
-/// Horizontal/depth reference for HOLD. Its world-space `y` is derived from
-/// the card's padded screen-space content area.
-const HOLD_PREVIEW_REFERENCE: Vec3 = Vec3::new(-10.2, 0.0, 0.0);
 
 /// Edge length of a preview block. Pieces outside the well are drawn smaller
 /// than playfield blocks so a 4-wide I piece fits the side panel.
@@ -708,25 +704,12 @@ fn preview_content_vertical_bounds(rect: Rect) -> (f32, f32) {
     )
 }
 
-fn preview_anchor_at_screen_y(reference: Vec3, target_y: f32) -> Vec3 {
-    let reference_y = world_to_screen(reference).y;
-    let one_world_unit_down = world_to_screen(reference - Vec3::Y).y;
-    let pixels_per_world_unit = one_world_unit_down - reference_y;
-    debug_assert!(pixels_per_world_unit > 0.0);
-
-    Vec3::new(
-        reference.x,
-        reference.y - ((target_y - reference_y) / pixels_per_world_unit),
-        reference.z,
-    )
-}
-
-fn hold_piece_anchor(layout: &HudLayout) -> Vec3 {
+fn hold_piece_anchor(layout: &HudLayout, shake: Vec2) -> Vec3 {
     let (content_top, content_bottom) = preview_content_vertical_bounds(layout.hold);
-    preview_anchor_at_screen_y(
-        HOLD_PREVIEW_REFERENCE,
+    ScreenPlane::new(0.0, shake).world(vec2(
+        layout.hold.x + layout.hold.w * 0.5,
         ((content_top + content_bottom) * 0.5).round(),
-    )
+    ))
 }
 
 fn next_piece_anchor(layout: &HudLayout, index: usize, shake: Vec2) -> Vec3 {
@@ -1323,10 +1306,11 @@ fn draw_held_piece(
     held_piece: Option<Piece>,
     textures: &SceneTextures,
     lights: SceneLights,
+    shake: Vec2,
 ) {
     if let Some(piece) = held_piece {
         piece.draw(PiecePreviewArgs {
-            center: hold_piece_anchor(layout),
+            center: hold_piece_anchor(layout, shake),
             scale: PREVIEW_SCALE,
             textures,
             lights,
@@ -1423,7 +1407,7 @@ pub fn camera_shake(game_state: &GameState<'_>, time: f64) -> Vec2 {
     let clear_shake = if clear_remaining > 0.0 {
         clear_remaining.powi(2) * 0.05 * (clear_count as f32)
     } else {
-        0.0
+        game_state.get_clear_heat().unwrap_or(0.0).powi(2) * 0.025
     };
     let shake_amount = (impact_shake + clear_shake).min(0.25);
 
@@ -1448,7 +1432,9 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         let time = frame.time;
         let textures = frame.textures;
         let is_game_over = self.get_is_game_over();
-        let lights = SceneLights::new(time, self.get_danger(), self.get_level_flare());
+        let clear_heat = self.get_clear_heat();
+        let lights = SceneLights::new(time, self.get_danger(), self.get_level_flare())
+            .with_clear_heat(self.get_clear_row_mask(), clear_heat.unwrap_or(0.0));
         let layout = hud_layout();
         let announcement = self.get_score_announcement();
 
@@ -1470,12 +1456,18 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         }
 
         let wash = if is_game_over { GAME_OVER_WASH } else { 0.0 };
-        self.get_grid_locked().draw(GridDrawArgs {
+        self.get_grid_for_render().draw(GridDrawArgs {
             style: BlockStyle::Solid,
             textures,
             lights,
             time,
             wash,
+            heated_rows: if clear_heat.is_some() {
+                self.get_clear_row_mask()
+            } else {
+                0
+            },
+            heat: clear_heat.unwrap_or(0.0),
         });
         self.get_grid_active().draw(GridDrawArgs {
             style: BlockStyle::Solid,
@@ -1483,26 +1475,26 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
             lights,
             time,
             wash,
+            heated_rows: 0,
+            heat: 0.0,
         });
-        if !is_game_over {
+        if !is_game_over && clear_heat.is_none() {
             self.get_grid_ghost().draw(GridDrawArgs {
                 style: BlockStyle::Ghost,
                 textures,
                 lights,
                 time,
                 wash: 0.0,
+                heated_rows: 0,
+                heat: 0.0,
             });
         }
         draw_piece_previews(&layout, self.get_piece_previews(), textures, lights, frame.shake);
-        draw_held_piece(&layout, self.get_held_piece(), textures, lights);
+        draw_held_piece(&layout, self.get_held_piece(), textures, lights, frame.shake);
         draw_shrapnel(self.get_shrapnel(), textures);
-        let (clear_count, clear_remaining) = self.get_clear_effect();
-        draw_clear_flash(
-            self.get_clear_row_mask(),
-            clear_remaining,
-            clear_count,
-            textures,
-        );
+        if let Some(heat) = clear_heat {
+            draw_clear_heat(self.get_clear_row_mask(), heat, textures);
+        }
         draw_lamp_glow(&lights, textures);
 
         let hud = frame.hud();
@@ -1526,6 +1518,8 @@ pub struct GridDrawArgs<'a> {
     /// How far block colours are washed toward dead grey (0.0 = none). Used
     /// to drain the stack of life once the game is over.
     wash: f32,
+    heated_rows: u32,
+    heat: f32,
 }
 
 impl Drawable<GridDrawArgs<'_>> for Grid {
@@ -1543,6 +1537,11 @@ impl Drawable<GridDrawArgs<'_>> for Grid {
                         textures: args.textures,
                         lights: args.lights,
                         wash: args.wash,
+                        heat: if args.heated_rows & (1 << (row_id - FIRST_VISIBLE_ROW_ID)) != 0 {
+                            args.heat
+                        } else {
+                            0.0
+                        },
                     }),
                     BlockStyle::Ghost => {
                         // An edge is on the silhouette when no ghost cell lies
@@ -1623,6 +1622,7 @@ pub struct BlockArgs<'a> {
     textures: &'a SceneTextures,
     lights: SceneLights,
     wash: f32,
+    heat: f32,
 }
 
 /// Dead, unlit steel that game-over blocks fade toward.
@@ -1635,10 +1635,11 @@ impl Drawable<BlockArgs<'_>> for Block {
             textures,
             lights,
             wash,
+            heat,
         } = args;
         let color = mix_color(self.color, COLOR_DEAD_BLOCK, wash);
 
-        draw_block_cube(center, color, textures, &lights);
+        draw_block_cube_heated(center, color, 1.0, heat, textures, &lights);
     }
 }
 
@@ -2181,13 +2182,41 @@ mod tests {
     }
 
     #[test]
-    fn hold_preview_is_vertically_centered_below_its_header() {
+    fn every_held_piece_stays_centered_below_its_header_during_shake() {
         let layout = hud_layout();
         let (content_top, content_bottom) = preview_content_vertical_bounds(layout.hold);
-        let anchor_y = world_to_screen(hold_piece_anchor(&layout)).y;
-        let expected_center = (content_top + content_bottom) * 0.5;
-
-        assert!((anchor_y - expected_center).abs() <= 0.5);
+        let expected_center = vec2(
+            layout.hold.x + layout.hold.w * 0.5,
+            (content_top + content_bottom) * 0.5,
+        );
+        for piece in [pieces::I, pieces::J, pieces::L, pieces::O, pieces::S, pieces::T, pieces::Z] {
+            let resting_bounds = preview_screen_bounds(
+                piece,
+                hold_piece_anchor(&layout, Vec2::ZERO),
+                Vec2::ZERO,
+            );
+            for shake_x in [-0.25, 0.0, 0.25] {
+                for shake_y in [-0.25, 0.0, 0.25] {
+                    let shake = vec2(shake_x, shake_y);
+                    let bounds = preview_screen_bounds(piece, hold_piece_anchor(&layout, shake), shake);
+                    let center = vec2(bounds.x + bounds.w * 0.5, bounds.y + bounds.h * 0.5);
+                    assert!((center.x - expected_center.x).abs() < 0.001);
+                    assert!((center.y - expected_center.y).abs() <= 0.501);
+                    for (actual, resting) in [
+                        (bounds.x, resting_bounds.x),
+                        (bounds.y, resting_bounds.y),
+                        (bounds.w, resting_bounds.w),
+                        (bounds.h, resting_bounds.h),
+                    ] {
+                        assert!(
+                            (actual - resting).abs() < 0.001,
+                            "held {} moves under {shake:?}",
+                            piece.name,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ use macroquad::window::get_internal_gl;
 
 use crate::grid::{GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::{lit, SceneLights};
-use crate::textures::{Material, SceneTextures};
+use crate::textures::{iron_heat_color, Material, SceneTextures};
 
 /// Geometry one macroquad batch can hold. A frame with a full stack, a
 /// four-row carnage burst and the HUD comes to about 35k vertices, so a batch
@@ -833,6 +833,22 @@ pub fn draw_block_cube_scaled(
     textures: &SceneTextures,
     lights: &SceneLights,
 ) {
+    draw_block_cube_heated(center, color, scale, 0.0, textures, lights);
+}
+
+/// Completed rows heat unevenly like forged iron: yellow-orange cores, red
+/// edges and cooler oxide scale. The thermal material emits its own light.
+pub fn draw_block_cube_heated(
+    center: Vec3,
+    color: Color,
+    scale: f32,
+    heat: f32,
+    textures: &SceneTextures,
+    lights: &SceneLights,
+) {
+    let heat = heat.clamp(0.0, 1.0).powf(0.85);
+    let hot_color = iron_heat_color(heat * 0.62);
+    let heat_opacity = (heat * 3.0).min(1.0);
     let size = BLOCK_INSET * scale;
     let min = center - Vec3::splat(size * 0.5);
     let edge_x = Vec3::new(size, 0.0, 0.0);
@@ -840,6 +856,7 @@ pub fn draw_block_cube_scaled(
     let edge_z = Vec3::new(0.0, 0.0, size);
     let visible = visible_block_faces();
     let texture = textures.for_color(color);
+    let heated_texture = textures.heated_for_color(color, heat, center);
 
     // Material selection keys off the palette colour; only the drawn colour
     // picks up the room's light.
@@ -876,6 +893,28 @@ pub fn draw_block_cube_scaled(
             material,
             [origin_color, origin_color, far_color, far_color],
         );
+
+        if heat > 0.0 && index == FACE_FRONT {
+            draw_quad(
+                origin + Vec3::Z * 0.004,
+                e1,
+                e2,
+                heated_texture,
+                [Color::new(1.0, 1.0, 1.0, heat_opacity); 4],
+            );
+        } else if heat > 0.0 && index == FACE_TOP {
+            let rear = iron_heat_color(heat * 0.43);
+            let front = iron_heat_color(heat * 0.74);
+            let rear = Color::new(rear.r, rear.g, rear.b, heat_opacity);
+            let front = Color::new(front.r, front.g, front.b, heat_opacity);
+            draw_quad(
+                origin + Vec3::Y * 0.004,
+                e1,
+                e2,
+                textures.white(),
+                [rear, rear, front, front],
+            );
+        }
     }
 
     let corners = [
@@ -900,7 +939,7 @@ pub fn draw_block_cube_scaled(
             draw_line_quad(
                 corners[start],
                 corners[end],
-                shaded(color, 0.27, 1.0),
+                mix_color(shaded(color, 0.27, 1.0), hot_color, heat * 0.82),
                 textures,
             );
         }
@@ -909,10 +948,6 @@ pub fn draw_block_cube_scaled(
 
 /// Maximum simultaneous active shrapnel voxels across all clearing rows.
 pub const MAX_SHRAPNEL_VOXELS: usize = 320;
-
-/// How long a carnage voxel's in-flight incandescence lasts before it cools
-/// back to its base material.
-pub const CARNAGE_GLOW_SECONDS: f32 = 1.4;
 
 /// A 3D tumbling sub-voxel spawned when rows are cleared. It flies, drops
 /// through the floor grate, and ends its life sinking into the melt.
@@ -931,7 +966,6 @@ pub struct ShrapnelVoxel {
     /// retired.
     pub submersion: f32,
     pub bounce_count: u8,
-    pub is_carnage: bool,
     pub active: bool,
 }
 
@@ -984,8 +1018,7 @@ pub fn draw_lava_splashes(splashes: &[LavaSplash], textures: &SceneTextures) {
 }
 
 /// Draw a single tumbling shrapnel voxel with dynamic directional shading,
-/// point-sampled texture, and hot-metal incandescence: briefly in flight for
-/// four-line clears, and always once it hits the melt.
+/// point-sampled texture, and hot-metal incandescence once it hits the melt.
 pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
     if !voxel.active {
         return;
@@ -1006,16 +1039,9 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
         return;
     }
 
-    // Four-line clears superheat shrapnel into molten incandescence in flight,
-    // slowly cooling back to the block's base material; anything that reaches
-    // the melt heats up again as it soaks and goes under white-hot.
-    let flight_heat = if voxel.is_carnage {
-        (1.0 - voxel.age / CARNAGE_GLOW_SECONDS).clamp(0.0, 1.0).powf(1.35)
-    } else {
-        0.0
-    };
-    let sink_heat = (voxel.submersion / HEAT_SOAK).clamp(0.0, 1.0);
-    let heat = flight_heat.max(sink_heat);
+    // The fracture exposes gray scrap. Only the lava reheats it, making the
+    // falling debris visually distinct from the colored playable stack.
+    let heat = (voxel.submersion / HEAT_SOAK).clamp(0.0, 1.0);
     let is_hot = heat > 0.0;
     let fade = remaining;
 
@@ -1055,15 +1081,8 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
     };
 
     if is_hot && heat > 0.15 {
-        // Debris on the melt throws a bigger, brighter halo than debris
-        // glowing in flight: it is the thing that is burning up.
-        let (reach, strength) = if voxel.is_sinking() {
-            (2.2, 0.65)
-        } else {
-            (1.3, 0.4)
-        };
-        let halo_radius = voxel.size * (reach + 0.9 * heat);
-        let halo_alpha = (heat * strength * fade.max(0.3)).clamp(0.0, 0.7);
+        let halo_radius = voxel.size * (2.2 + 0.9 * heat);
+        let halo_alpha = (heat * 0.65 * fade.max(0.3)).clamp(0.0, 0.7);
 
         draw_glow_disc(
             position,
@@ -1171,11 +1190,6 @@ pub fn draw_shrapnel(voxels: &[ShrapnelVoxel], textures: &SceneTextures) {
             draw_shrapnel_voxel(voxel, textures);
         }
     }
-}
-
-/// Draw a single playfield block as an inset shaded cube centred on `center`.
-pub fn draw_block_cube(center: Vec3, color: Color, textures: &SceneTextures, lights: &SceneLights) {
-    draw_block_cube_scaled(center, color, 1.0, textures, lights);
 }
 
 /// Which edges of a ghost cell lie on the piece's silhouette, in the order
