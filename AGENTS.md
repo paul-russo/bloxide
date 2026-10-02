@@ -84,7 +84,7 @@ works, so a person can watch or take over.
 - **Clippy warnings**: the codebase currently emits ~15 clippy warnings
   (needless range loops, a `clamp`-like pattern, an `unwrap` after `is_some`).
   These are pre-existing, not regressions.
-- **Tests**: `cargo test` runs the unit suite (currently 51 tests) and needs no
+- **Tests**: `cargo test` runs the unit suite (currently 169 tests) and needs no
   display.
 - **High scores**: the game writes a `.highscore` file in the working
   directory. It is gitignored.
