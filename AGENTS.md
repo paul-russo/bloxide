@@ -44,9 +44,41 @@ without a human at the keyboard — the best way to check the environment works:
 - Add `--sequence --frame=N` to a screenshot run to export every frame as
   `screenshot-0001.png`, etc. Screenshot simulation advances at a fixed 60 Hz
   so the heat-up, fracture, and lava landing can be reviewed in motion.
-- Scene flags: `--still`, `--gameover`, `--menu` (default is the mid-line-clear
-  "carnage" scene).
+- Scene flags: `--still`, `--gameover`, `--paused`, `--menu` (default is the
+  mid-line-clear "carnage" scene).
 - Performance telemetry over N frames: `DISPLAY=:1 ./target/debug/bloxide --telemetry --frames=N`.
+- `--portrait` renders the iPhone layout (302x656 framebuffer, HUD under the
+ cabinet) on desktop; it combines with any of the above. `--layout=1`..`4`
+ picks the portrait HUD arrangement (`PortraitLayout` in `src/draw.rs`: row,
+ flank, queue strip, compact; compact is the default). Portrait leaves the
+ controls legend off the game screen and shows it under the pause menu instead.
+
+## iOS (iPhone, portrait only)
+
+`ios/build.sh sim run` builds `aarch64-apple-ios-sim`, assembles
+`target/ios/sim/Bloxide.app` from `ios/Info.plist`, and installs and launches
+it on the simulator named by `BLOXIDE_SIMULATOR` (default `iPhone 17 Pro`).
+Extra arguments are passed to the app: `ios/build.sh sim run --layout=3`.
+`ios/build.sh device` needs `BLOXIDE_SIGN_IDENTITY` and `BLOXIDE_PROFILE`.
+Screenshot the simulator with `xcrun simctl io "iPhone 17 Pro" screenshot out.png`.
+
+- Controls are gestures (`src/touch.rs`): drag sideways to move, tap to rotate
+ (right half clockwise, left half counter-clockwise), drag down to soft-drop,
+ flick down to hard-drop, swipe up to hold. Multi-finger touches are ignored.
+ The pause button beside the score lintel (`pause_button_rect` in
+ `src/draw.rs`) toggles pause; a tap on it never rotates. Menus are tapped.
+ Menus have no Quit item.
+- The high score lives in the app's `Documents/.highscore`.
+- Returning from the background pauses a running game.
+- iOS renders through Metal (`render3d::USES_METAL`); everything else uses
+ OpenGL. The postfx pass has an MSL twin of its GLSL shader, and the camera
+ uses a shifted near plane so depth lands in Metal's 0..1 clip range.
+- miniquad is vendored in `vendor/miniquad` (via `[patch.crates-io]`) because
+ its Metal backend cannot draw into render targets as shipped. Each fix is
+ marked `bloxide patch`. Run with `SIMCTL_CHILD_MTL_DEBUG_LAYER=1 xcrun simctl
+ launch --console-pty <device> dev.bloxide.game` to surface Metal validation
+ errors, which otherwise just drop draws silently.
+- `cargo clippy --target aarch64-apple-ios-sim` should stay warning-free too.
 
 ## Agent mode (text-driven play)
 
@@ -81,10 +113,8 @@ works, so a person can watch or take over.
   `DISPLAY=:1`. Building and testing do **not** need a display.
 - **Toolchain**: build on `stable`, not the base image's pinned default (see
   above).
-- **Clippy warnings**: the codebase currently emits ~15 clippy warnings
-  (needless range loops, a `clamp`-like pattern, an `unwrap` after `is_some`).
-  These are pre-existing, not regressions.
-- **Tests**: `cargo test` runs the unit suite (currently 169 tests) and needs no
+- **Clippy**: `cargo clippy --all-targets` is warning-free; keep it that way.
+- **Tests**: `cargo test` runs the unit suite (currently 179 tests) and needs no
   display.
 - **High scores**: the game writes a `.highscore` file in the working
   directory. It is gitignored.

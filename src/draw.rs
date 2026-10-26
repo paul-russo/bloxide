@@ -14,14 +14,16 @@ use crate::postfx::PostProcess;
 use crate::render3d::{
     cell_center, draw_block_cube_heated, draw_block_cube_scaled, draw_ghost_cell, draw_lamp_glow,
     draw_quad_corners, draw_quad_corners_uv, draw_shrapnel, draw_tumbling_cube, draw_well,
-    lintel_front_bounds, set_depth_test, well_camera, world_to_screen, world_to_screen_with_shake,
-    ScreenPlane, BLOCK_INSET, RENDER_HEIGHT, RENDER_WIDTH, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
+    lintel_front_bounds, orientation, plinth_foot_bounds, render_height, render_width,
+    set_depth_test, well_camera, world_to_screen, world_to_screen_with_shake, Orientation,
+    ScreenPlane, BLOCK_INSET, WELL_DEPTH, WELL_HEIGHT, WELL_WIDTH,
 };
 use crate::scoring::{ScoreAward, SpinKind};
 use crate::textures::{Material, SceneTextures, BLOCK_TEXTURE_SIZE, STONE_TEXTURE_SIZE};
 use macroquad::prelude::*;
 use macroquad::texture::{render_target_ex, RenderTargetParams};
 use num_format::{Locale, ToFormattedString};
+use std::cell::Cell;
 
 /// The window is sized for the 3D scene rather than for a pixel-exact 2D grid:
 /// it has to fit the well plus a side panel on each side, with the well framed
@@ -46,18 +48,19 @@ impl RenderSurface {
         // order and lower grid rows paint over upper ones. The explicit depth
         // target makes the cube stack independent of traversal order.
         let target = render_target_ex(
-            RENDER_WIDTH,
-            RENDER_HEIGHT,
+            render_width(),
+            render_height(),
             RenderTargetParams {
                 depth: true,
                 ..Default::default()
             },
         );
         target.texture.set_filter(FilterMode::Nearest);
+
         Self {
             target,
             textures: SceneTextures::new(),
-            post_process: PostProcess::new(RENDER_WIDTH, RENDER_HEIGHT),
+            post_process: PostProcess::new(render_width(), render_height()),
         }
     }
 
@@ -86,21 +89,41 @@ impl RenderSurface {
         set_default_camera();
         clear_background(color_u8!(2, 2, 2, 255));
 
-        let integer_scale = (screen_width() / RENDER_WIDTH as f32)
-            .floor()
-            .min((screen_height() / RENDER_HEIGHT as f32).floor())
-            .max(1.0);
-        let size = vec2(
-            RENDER_WIDTH as f32 * integer_scale,
-            RENDER_HEIGHT as f32 * integer_scale,
-        );
-        let origin = vec2(
-            ((screen_width() - size.x) * 0.5).floor(),
-            ((screen_height() - size.y) * 0.5).floor(),
-        );
-
-        self.post_process.blit(&self.target.texture, origin, size);
+        let rect = presentation_rect();
+        self.post_process
+            .blit(&self.target.texture, rect.point(), rect.size());
     }
+}
+
+/// Where the framebuffer lands on screen, in screen pixels. Desktop windows
+/// scale it by whole pixels so the pixel art stays crisp; a phone screen is
+/// too small to leave margins on, so iOS fills it and accepts uneven pixels.
+pub fn presentation_rect() -> Rect {
+    let fit = (screen_width() / frame_width()).min(screen_height() / frame_height());
+    let scale = if cfg!(target_os = "ios") {
+        fit
+    } else {
+        fit.floor().max(1.0)
+    };
+    let size = vec2(frame_width() * scale, frame_height() * scale);
+
+    Rect::new(
+        ((screen_width() - size.x) * 0.5).floor(),
+        ((screen_height() - size.y) * 0.5).floor(),
+        size.x,
+        size.y,
+    )
+}
+
+/// Map a screen-pixel point (a mouse or touch position) into framebuffer
+/// coordinates, or `None` when it falls in the letterbox margins.
+pub fn screen_to_frame(point: Vec2) -> Option<Vec2> {
+    let rect = presentation_rect();
+    if !rect.contains(point) {
+        return None;
+    }
+
+    Some((point - rect.point()) * (frame_width() / rect.w))
 }
 
 /// The drawing context for one frame: the materials, the moment the frame
@@ -310,6 +333,29 @@ const CONTROL_ROWS: [(&str, &str, f32); 5] = [
     ("C", "HOLD", 28.0),
     ("ESC", "PAUSE", 42.0),
 ];
+const TOUCH_CONTROL_ROWS: [(&str, &str, f32); 5] = [
+    ("DRAG", "MOVE", 50.0),
+    ("TAP", "ROTATE", 42.0),
+    ("FLICK", "DROP", 62.0),
+    ("UP", "HOLD", 34.0),
+    ("II", "PAUSE", 34.0),
+];
+
+fn control_rows() -> &'static [(&'static str, &'static str, f32); 5] {
+    if cfg!(target_os = "ios") {
+        &TOUCH_CONTROL_ROWS
+    } else {
+        &CONTROL_ROWS
+    }
+}
+
+fn menu_hint() -> &'static str {
+    if cfg!(target_os = "ios") {
+        "TAP TO SELECT"
+    } else {
+        "UP/DOWN MOVE  ENTER SELECT"
+    }
+}
 
 /// How the blocks of a grid should be rendered inside the well.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -329,15 +375,15 @@ pub enum BlockStyle {
 /// each one is scaled by this to reach its intended on-screen size instead of
 /// rendering at half the size on such displays.
 fn hud_scale() -> f32 {
-    RENDER_HEIGHT as f32 / WINDOW_HEIGHT
+    Orientation::Landscape.render_size().1 as f32 / WINDOW_HEIGHT
 }
 
 fn frame_width() -> f32 {
-    RENDER_WIDTH as f32
+    render_width() as f32
 }
 
 fn frame_height() -> f32 {
-    RENDER_HEIGHT as f32
+    render_height() as f32
 }
 
 fn mix_color(a: Color, b: Color, t: f32) -> Color {
@@ -616,8 +662,19 @@ struct HudLayout {
     hold: Rect,
     award: Rect,
     next: Rect,
-    controls: Rect,
+
+    /// The control legend, when it has room on the game screen. Without it,
+    /// the legend is shown on the pause screen instead.
+    controls: Option<Rect>,
+
     stats: Rect,
+
+    /// Level and lines on one line instead of the stacked readout panel.
+    stats_bar: bool,
+
+    /// The award pops up over the scene rather than in a wall-mounted bay.
+    award_overlay: bool,
+
     score: Rect,
 }
 
@@ -646,10 +703,29 @@ fn next_panel_height() -> f32 {
 
 /// Clear face rectangles, excluding the header/separator rules and inner bevel.
 /// Both preview centres and separator positions come from these slots.
+///
+/// A panel wider than it is tall lays its slots out in a row, reading left to
+/// right, instead of a column.
 fn next_slot_rects(rect: Rect) -> [Rect; NEXT_SLOT_COUNT] {
     let inset = PANEL_FRAME + 1.0;
     let top = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale() + 1.0;
     let bottom = rect.y + rect.h - inset;
+
+    if next_slots_in_a_row(rect) {
+        let left = rect.x + inset;
+        let gaps = (NEXT_SLOT_COUNT - 1) as f32;
+        let slot_width = ((rect.w - inset * 2.0 - gaps) / NEXT_SLOT_COUNT as f32).floor();
+
+        return std::array::from_fn(|index| {
+            Rect::new(
+                left + index as f32 * (slot_width + 1.0),
+                top,
+                slot_width,
+                bottom - top,
+            )
+        });
+    }
+
     let slot_height = (bottom - top - (NEXT_SLOT_COUNT - 1) as f32) / NEXT_SLOT_COUNT as f32;
 
     std::array::from_fn(|index| {
@@ -663,6 +739,153 @@ fn next_slot_rects(rect: Rect) -> [Rect; NEXT_SLOT_COUNT] {
 }
 
 fn hud_layout() -> HudLayout {
+    match orientation() {
+        Orientation::Landscape => landscape_hud_layout(),
+        Orientation::Portrait => portrait_hud_layout(),
+    }
+}
+
+/// The framebuffer rows kept clear at the foot of a portrait screen. The HUD
+/// only displays, so it may sit near the home indicator, just not under it.
+/// The camera cutout at the top is cleared by the camera framing instead.
+const PORTRAIT_SAFE_BOTTOM: f32 = 12.0;
+
+/// Gap between the cabinet's foot, the portrait HUD panels, and each other.
+const PORTRAIT_PANEL_GAP: f32 = 6.0;
+
+/// Height of a NEXT queue laid out as a row: the header plus one preview slot.
+const NEXT_STRIP_HEIGHT: f32 = 60.0;
+
+/// Height of the one-line LEVEL / LINES bar.
+const STATS_BAR_HEIGHT: f32 = 36.0;
+
+/// Arrangements of the portrait HUD under the cabinet. On a phone the
+/// controls panel moves to the pause screen.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PortraitLayout {
+    /// HOLD, NEXT, LEVEL in a row; NEXT sits under the well.
+    Row,
+    /// HOLD on the left and NEXT on the right as on desktop, LEVEL between.
+    Flank,
+    /// NEXT as a full-width queue under the cabinet; HOLD and LEVEL below.
+    QueueStrip,
+    /// HOLD beside a NEXT queue row, with a one-line LEVEL / LINES bar under
+    /// both. The award pops up over the top of the well.
+    Compact,
+}
+
+impl PortraitLayout {
+    pub const ALL: [PortraitLayout; 4] = [
+        PortraitLayout::Row,
+        PortraitLayout::Flank,
+        PortraitLayout::QueueStrip,
+        PortraitLayout::Compact,
+    ];
+}
+
+thread_local! {
+    /// Per thread for the same reason as the orientation: each unit test
+    /// lays out on its own thread.
+    static PORTRAIT_LAYOUT: Cell<PortraitLayout> = const { Cell::new(PortraitLayout::Compact) };
+}
+
+pub fn set_portrait_layout(layout: PortraitLayout) {
+    PORTRAIT_LAYOUT.with(|cell| cell.set(layout));
+}
+
+fn portrait_layout() -> PortraitLayout {
+    PORTRAIT_LAYOUT.with(Cell::get)
+}
+
+/// Screen y of the cabinet's lowest edge, the foot of its plinth.
+fn cabinet_foot_y() -> f32 {
+    world_to_screen(plinth_foot_bounds().0).y.round()
+}
+
+/// The portrait HUD is a block of panels centred between the cabinet's foot
+/// and the bottom of the screen, on a three-column grid.
+fn portrait_hud_layout() -> HudLayout {
+    let scale = hud_scale();
+    let width = (HUD_PANEL_WIDTH * scale).round();
+    let gap = PORTRAIT_PANEL_GAP;
+    let hold_height = (HUD_HOLD_HEIGHT * scale).round();
+    let award_height =
+        ((HUD_LOWER_OFFSET - HUD_TOP_OFFSET - HUD_HOLD_HEIGHT - 2.0 * HUD_AWARD_GAP) * scale)
+            .round();
+    let stats_height = controls_panel_height();
+
+    let margin = ((frame_width() - 3.0 * width) / 4.0).floor();
+    let columns = [
+        margin,
+        ((frame_width() - width) / 2.0).round(),
+        frame_width() - margin - width,
+    ];
+    let full_width = frame_width() - margin * 2.0;
+
+    let block_height = match portrait_layout() {
+        PortraitLayout::Row | PortraitLayout::Flank => {
+            (hold_height + gap + award_height).max(next_panel_height())
+        }
+        PortraitLayout::QueueStrip => NEXT_STRIP_HEIGHT + gap + stats_height.max(award_height),
+        PortraitLayout::Compact => hold_height + gap + STATS_BAR_HEIGHT,
+    };
+    let foot = cabinet_foot_y();
+    let space = frame_height() - PORTRAIT_SAFE_BOTTOM - foot;
+    let top = (foot + (space - block_height) / 2.0).round();
+    let below_hold = top + hold_height + gap;
+
+    let column = |index: usize, y: f32, height: f32| Rect::new(columns[index], y, width, height);
+    let (hold, award, next, stats) = match portrait_layout() {
+        PortraitLayout::Row => (
+            column(0, top, hold_height),
+            column(0, below_hold, award_height),
+            column(1, top, next_panel_height()),
+            column(2, top, stats_height),
+        ),
+        PortraitLayout::Flank => (
+            column(0, top, hold_height),
+            column(0, below_hold, award_height),
+            column(2, top, next_panel_height()),
+            column(1, top, stats_height),
+        ),
+        PortraitLayout::QueueStrip => {
+            let row = top + NEXT_STRIP_HEIGHT + gap;
+            (
+                column(0, row, hold_height),
+                column(1, row, award_height),
+                Rect::new(margin, top, full_width, NEXT_STRIP_HEIGHT),
+                column(2, row, stats_height),
+            )
+        }
+        PortraitLayout::Compact => {
+            let well = well_screen_rect();
+            (
+                column(0, top, hold_height),
+                Rect::new(columns[1], (well.y + 24.0).round(), width, award_height),
+                Rect::new(
+                    margin + width + gap,
+                    top,
+                    full_width - width - gap,
+                    hold_height,
+                ),
+                Rect::new(margin, below_hold, full_width, STATS_BAR_HEIGHT),
+            )
+        }
+    };
+
+    HudLayout {
+        hold,
+        award,
+        next,
+        controls: None,
+        stats,
+        stats_bar: portrait_layout() == PortraitLayout::Compact,
+        award_overlay: portrait_layout() == PortraitLayout::Compact,
+        score: lintel_screen_rect(),
+    }
+}
+
+fn landscape_hud_layout() -> HudLayout {
     let scale = hud_scale();
     let well = well_screen_rect();
     let panel_width = (HUD_PANEL_WIDTH * scale).round();
@@ -689,8 +912,10 @@ fn hud_layout() -> HudLayout {
             panel_width,
             next_panel_height(),
         ),
-        controls: Rect::new(left_x, lower_y, panel_width, lower_height),
+        controls: Some(Rect::new(left_x, lower_y, panel_width, lower_height)),
         stats: Rect::new(right_x, lower_y, panel_width, lower_height),
+        stats_bar: false,
+        award_overlay: false,
         score: lintel_screen_rect(),
     }
 }
@@ -756,9 +981,20 @@ fn draw_panel_header_at(hud: &Surface, rect: Rect, label: &str, top: f32) {
     hud.hline(origin.x, right, divider_y, COLOR_PANEL_BORDER);
 }
 
+fn next_slots_in_a_row(rect: Rect) -> bool {
+    rect.w > rect.h
+}
+
 fn next_slot_guides(rect: Rect) -> [Rect; NEXT_SLOT_COUNT - 1] {
     let slots = next_slot_rects(rect);
     let inset = 16.0 * hud_scale();
+
+    if next_slots_in_a_row(rect) {
+        return std::array::from_fn(|index| {
+            let slot = slots[index];
+            Rect::new(slot.x + slot.w, slot.y + inset, 1.0, slot.h - inset * 2.0)
+        });
+    }
 
     std::array::from_fn(|index| {
         Rect::new(
@@ -781,7 +1017,9 @@ fn draw_game_chrome(backdrop: &Surface, layout: &HudLayout, lights: &SceneLights
     draw_instrument_panel(backdrop, layout.hold, lights);
     draw_instrument_panel(backdrop, layout.next, lights);
     draw_instrument_panel(backdrop, layout.stats, lights);
-    draw_instrument_panel(backdrop, layout.controls, lights);
+    if let Some(controls) = layout.controls {
+        draw_instrument_panel(backdrop, controls, lights);
+    }
 }
 
 /// Render the empty well on its own, as a backdrop for the main menu screen.
@@ -871,8 +1109,12 @@ fn draw_score(hud: &Surface, layout: &HudLayout, score: usize) {
 fn draw_panel_labels(hud: &Surface, layout: &HudLayout) {
     draw_panel_header(hud, layout.hold, "HOLD");
     draw_panel_header(hud, layout.next, "NEXT");
-    draw_panel_header(hud, layout.controls, "CONTROLS");
-    draw_panel_header(hud, layout.stats, "LEVEL");
+    if let Some(controls) = layout.controls {
+        draw_panel_header(hud, controls, "CONTROLS");
+    }
+    if !layout.stats_bar {
+        draw_panel_header(hud, layout.stats, "LEVEL");
+    }
     draw_next_slot_guides(hud, layout);
 }
 
@@ -1001,6 +1243,147 @@ fn draw_level_and_rows_cleared(hud: &Surface, layout: &HudLayout, level: usize, 
     }
 }
 
+/// Level and lines on one line: each value after its engraved label, with
+/// the level-progress lamps at the right end.
+fn draw_stats_bar(hud: &Surface, rect: Rect, level: usize, rows_cleared: usize) {
+    let scale = hud_scale();
+    let center_y = rect.y + rect.h * 0.5;
+    let level_text = format!("{level:02}");
+    let line_text = line_count_text(rows_cleared);
+    let (level_label_width, label_height, _) = pixel_text_metrics("LEVEL", LABEL_TEXT_SIZE);
+    let (lines_label_width, _, _) = pixel_text_metrics("LINES", LABEL_TEXT_SIZE);
+    let baseline = (center_y + label_height * 0.5).round();
+    let digits_top = (center_y - DIGIT_HEIGHT as f32 * READOUT_PIXEL * 0.5).round();
+
+    let mut x = rect.x + 16.0 * scale;
+    draw_engraved_text(hud, "LEVEL", x, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
+    x += level_label_width + 6.0;
+    hud.digit_text(
+        &level_text,
+        x + 1.0,
+        digits_top + 1.0,
+        READOUT_PIXEL,
+        shaded(COLOR_TEXT, 0.25),
+    );
+    hud.digit_text(&level_text, x, digits_top, READOUT_PIXEL, COLOR_TEXT);
+    x += digit_text_width(&level_text, READOUT_PIXEL) + 14.0;
+    draw_engraved_text(hud, "LINES", x, baseline, LABEL_TEXT_SIZE, COLOR_TEXT_MUTED);
+    x += lines_label_width + 6.0;
+    draw_engraved_text(hud, &line_text, x, baseline, LABEL_TEXT_SIZE, COLOR_TEXT);
+
+    let bar_width = PROGRESS_PIP_SIZE * 10.0 + PROGRESS_PIP_GAP * 9.0;
+    let pips_x = (rect.x + rect.w - 16.0 * scale - bar_width).round();
+    let pips_y = (center_y - PROGRESS_PIP_SIZE * 0.5).round();
+    for segment in 0..10 {
+        draw_indicator_pip(
+            hud,
+            pips_x + segment as f32 * (PROGRESS_PIP_SIZE + PROGRESS_PIP_GAP),
+            pips_y,
+            PROGRESS_PIP_SIZE,
+            segment < rows_cleared % 10,
+        );
+    }
+}
+
+/// Where the control legend goes on the pause screen when the game screen
+/// has no room for it: centred under the pause menu's panel.
+fn pause_controls_rect(item_count: usize) -> Rect {
+    let width = (HUD_PANEL_WIDTH * hud_scale()).round();
+    let panel = menu_panel_rect(item_count);
+
+    Rect::new(
+        ((frame_width() - width) / 2.0).round(),
+        panel.y + panel.h + PORTRAIT_PANEL_GAP,
+        width,
+        controls_panel_height(),
+    )
+}
+
+/// Show the control legend under the pause menu, for layouts whose game
+/// screen leaves it out.
+pub fn draw_pause_controls(frame: &Frame<'_>, menu: &Menu<'_>) {
+    if !menu.is_visible || hud_layout().controls.is_some() {
+        return;
+    }
+
+    let hud = frame.hud();
+    let rect = pause_controls_rect(menu.items.len());
+    draw_instrument_panel(&hud, rect, &SceneLights::idle(frame.time));
+    draw_panel_header(&hud, rect, "CONTROLS");
+    draw_controls(&hud, rect);
+}
+
+/// Edge of the portrait pause button, in framebuffer pixels.
+const PAUSE_BUTTON_SIZE: f32 = 28.0;
+
+/// How far outside the pause button a tap still presses it, so the target
+/// stays thumb-sized while the button stays small.
+const PAUSE_BUTTON_SLOP: f32 = 8.0;
+
+/// The portrait pause button, beside the right end of the score lintel. The
+/// strip between the cabinet and the screen edge there is clear of both the
+/// phone's top safe area and its rounded corner.
+fn pause_button_rect() -> Option<Rect> {
+    if orientation() != Orientation::Portrait {
+        return None;
+    }
+
+    let lintel = lintel_screen_rect();
+    let gap_left = lintel.x + lintel.w;
+
+    Some(Rect::new(
+        ((gap_left + frame_width() - PAUSE_BUTTON_SIZE) / 2.0).round(),
+        (lintel.y + (lintel.h - PAUSE_BUTTON_SIZE) / 2.0).round(),
+        PAUSE_BUTTON_SIZE,
+        PAUSE_BUTTON_SIZE,
+    ))
+}
+
+/// Whether a tap at `point` (framebuffer pixels) presses the pause button.
+pub fn pause_button_at(point: Vec2) -> bool {
+    let Some(rect) = pause_button_rect() else {
+        return false;
+    };
+
+    let slop = PAUSE_BUTTON_SLOP;
+    let target = Rect::new(rect.x - slop, rect.y - slop, rect.w + slop * 2.0, rect.h + slop * 2.0);
+    target.contains(point)
+}
+
+/// A small gunmetal plate with a recessed face carrying two pause bars.
+fn draw_pause_button(hud: &Surface, rect: Rect, lights: &SceneLights) {
+    let inner = Rect::new(rect.x + 4.0, rect.y + 4.0, rect.w - 8.0, rect.h - 8.0);
+    let bar_width = 4.0;
+    let bar_gap = 4.0;
+    let bar_height = inner.h - 8.0;
+    let bars_left = (inner.x + (inner.w - bar_width * 2.0 - bar_gap) / 2.0).round();
+    let bars_top = (inner.y + (inner.h - bar_height) / 2.0).round();
+
+    hud.fill(
+        Rect::new(rect.x + 2.0, rect.y + 2.0, rect.w, rect.h),
+        color_u8!(3, 3, 2, 200),
+    );
+    draw_tiled_rect(
+        hud,
+        rect,
+        hud.textures.gunmetal(),
+        BLOCK_TEXTURE_SIZE as f32,
+        COLOR_PANEL_FRAME,
+        lights,
+    );
+    draw_bevel(hud, rect, COLOR_PANEL_LIGHT, COLOR_PANEL_DARK, false);
+    hud.fill(inner, COLOR_PANEL);
+    draw_bevel(hud, inner, COLOR_PANEL_INNER_LIGHT, COLOR_PANEL_DARK, true);
+
+    for x in [bars_left, bars_left + bar_width + bar_gap] {
+        hud.fill(
+            Rect::new(x + 1.0, bars_top + 1.0, bar_width, bar_height),
+            shaded(COLOR_TEXT, 0.25),
+        );
+        hud.fill(Rect::new(x, bars_top, bar_width, bar_height), COLOR_TEXT);
+    }
+}
+
 fn control_keycap_rect(panel: Rect, index: usize, width: f32) -> Rect {
     let scale = hud_scale();
 
@@ -1042,11 +1425,10 @@ fn draw_keycap(hud: &Surface, label: &str, rect: Rect) {
     );
 }
 
-fn draw_controls(hud: &Surface, layout: &HudLayout) {
-    let rect = layout.controls;
+fn draw_controls(hud: &Surface, rect: Rect) {
     let right = rect.x + rect.w - 16.0 * hud_scale();
 
-    for (index, (key, action, key_width)) in CONTROL_ROWS.iter().enumerate() {
+    for (index, (key, action, key_width)) in control_rows().iter().enumerate() {
         let keycap = control_keycap_rect(rect, index, *key_width);
         draw_keycap(hud, key, keycap);
         draw_text_right_at(
@@ -1442,7 +1824,7 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         draw_background(&backdrop, &lights);
         draw_game_chrome(&backdrop, &layout, &lights);
 
-        if announcement.is_some() {
+        if announcement.is_some() && !layout.award_overlay {
             draw_instrument_panel(&backdrop, layout.award, &lights);
         }
 
@@ -1500,10 +1882,22 @@ impl Drawable<&Frame<'_>> for GameState<'_> {
         let hud = frame.hud();
         draw_score(&hud, &layout, self.get_score());
         draw_panel_labels(&hud, &layout);
-        draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
-        draw_controls(&hud, &layout);
+        if layout.stats_bar {
+            draw_stats_bar(&hud, layout.stats, self.get_level(), self.get_rows_cleared());
+        } else {
+            draw_level_and_rows_cleared(&hud, &layout, self.get_level(), self.get_rows_cleared());
+        }
+        if let Some(controls) = layout.controls {
+            draw_controls(&hud, controls);
+        }
         if let Some(award) = announcement {
+            if layout.award_overlay {
+                draw_instrument_panel(&hud, layout.award, &lights);
+            }
             draw_score_announcement(&hud, &layout, award, self.get_score_announcement_remaining());
+        }
+        if let Some(button) = pause_button_rect().filter(|_| !is_game_over) {
+            draw_pause_button(&hud, button, &lights);
         }
 
         draw_game_effects(&hud, self, frame.shake);
@@ -1600,12 +1994,12 @@ impl Drawable<PiecePreviewArgs<'_>> for Piece {
         let origin_x = center.x - (span_cols * scale / 2.0) + (scale / 2.0);
         let origin_y = center.y + (span_rows * scale / 2.0) - (scale / 2.0);
 
-        for row_id in min_row..max_row {
-            for col_id in min_col..max_col {
-                if let Some(block) = blocks[row_id][col_id] {
+        for (row_offset, row) in blocks[min_row..max_row].iter().enumerate() {
+            for (col_offset, cell) in row[min_col..max_col].iter().enumerate() {
+                if let Some(block) = cell {
                     let position = Vec3::new(
-                        origin_x + ((col_id - min_col) as f32 * scale),
-                        origin_y - ((row_id - min_row) as f32 * scale),
+                        origin_x + (col_offset as f32 * scale),
+                        origin_y - (row_offset as f32 * scale),
                         center.z,
                     );
 
@@ -1661,6 +2055,50 @@ fn draw_menu_cursor(frame: &Frame, screen_center: Vec2) {
     draw_tumbling_cube(center, rotation, MENU_CURSOR_SIZE, COLOR_AMBER, frame.textures);
 }
 
+fn menu_panel_rect(item_count: usize) -> Rect {
+    let scale = hud_scale();
+    let well = well_screen_rect();
+    let width = well.w * MENU_WIDTH_SCALE;
+    let height =
+        (MENU_PADDING_Y * 2.0 + 84.0) * scale + (MENU_ITEM_HEIGHT * scale * item_count as f32);
+
+    snap_rect(Rect::new(
+        well.x + ((well.w - width) / 2.0),
+        well.y + ((well.h - height) / 2.0),
+        width,
+        height,
+    ))
+}
+
+fn menu_row_rect(panel: Rect, index: usize) -> Rect {
+    let scale = hud_scale();
+    let item_height = MENU_ITEM_HEIGHT * scale;
+    let items_top = panel.y + ((MENU_PADDING_Y + MENU_TITLE_TEXT_SIZE + 32.0) * scale);
+
+    snap_rect(Rect::new(
+        panel.x + (24.0 * scale),
+        items_top + (index as f32 * item_height),
+        panel.w - (48.0 * scale),
+        item_height - (7.0 * scale),
+    ))
+}
+
+/// The menu item under a framebuffer point, if any. Hit rows span the gap to
+/// the next row so a tap between two items still lands on one.
+pub fn menu_item_at(menu: &Menu<'_>, point: Vec2) -> Option<usize> {
+    if !menu.is_visible {
+        return None;
+    }
+
+    let panel = menu_panel_rect(menu.items.len());
+    let pitch = MENU_ITEM_HEIGHT * hud_scale();
+
+    (0..menu.items.len()).find(|&index| {
+        let row = menu_row_rect(panel, index);
+        Rect::new(row.x, row.y, row.w, pitch).contains(point)
+    })
+}
+
 impl Drawable<&Frame<'_>> for Menu<'_> {
     fn draw(&self, frame: &Frame<'_>) {
         if !self.is_visible {
@@ -1669,9 +2107,7 @@ impl Drawable<&Frame<'_>> for Menu<'_> {
 
         let hud = frame.hud();
         let scale = hud_scale();
-        let well = well_screen_rect();
         let lights = SceneLights::idle(frame.time);
-        let item_height = MENU_ITEM_HEIGHT * scale;
         let is_main = self.title.eq_ignore_ascii_case("bloxide");
         let title = self.title.to_ascii_uppercase();
 
@@ -1680,15 +2116,7 @@ impl Drawable<&Frame<'_>> for Menu<'_> {
             color_u8!(6, 5, 4, if is_main { 96 } else { 180 }),
         );
 
-        let panel_width = well.w * MENU_WIDTH_SCALE;
-        let panel_height =
-            (MENU_PADDING_Y * 2.0 + 84.0) * scale + (item_height * self.items.len() as f32);
-        let panel = snap_rect(Rect::new(
-            well.x + ((well.w - panel_width) / 2.0),
-            well.y + ((well.h - panel_height) / 2.0),
-            panel_width,
-            panel_height,
-        ));
+        let panel = menu_panel_rect(self.items.len());
         let panel_x = panel.x;
         let panel_y = panel.y;
         let panel_width = panel.w;
@@ -1727,15 +2155,9 @@ impl Drawable<&Frame<'_>> for Menu<'_> {
             COLOR_PANEL_BORDER,
         );
 
-        let items_top = title_baseline + (32.0 * scale);
         let mut cursor_center = None;
         for (index, item) in self.items.iter().enumerate() {
-            let row = snap_rect(Rect::new(
-                panel_x + (24.0 * scale),
-                items_top + (index as f32 * item_height),
-                panel_width - (48.0 * scale),
-                item_height - (7.0 * scale),
-            ));
+            let row = menu_row_rect(panel, index);
             let active = self.active_index == index;
             let baseline = row.y + (28.0 * scale);
 
@@ -1756,7 +2178,7 @@ impl Drawable<&Frame<'_>> for Menu<'_> {
 
         draw_text_centered_at(
             &hud,
-            "UP/DOWN MOVE  ENTER SELECT",
+            menu_hint(),
             center_x,
             panel_y + panel_height - (16.0 * scale),
             18.0,
@@ -1769,13 +2191,30 @@ impl Drawable<&Frame<'_>> for Menu<'_> {
     }
 }
 
+/// Top-right corner in landscape. A portrait phone's top corners sit under
+/// the camera cutout and the rounded display edge, so there it hangs below
+/// the cabinet where the game HUD goes.
+fn personal_best_rect() -> Rect {
+    const SIZE: Vec2 = vec2(102.0, 34.0);
+
+    match orientation() {
+        Orientation::Landscape => Rect::new(frame_width() - 112.0, 8.0, SIZE.x, SIZE.y),
+        Orientation::Portrait => Rect::new(
+            (frame_width() - SIZE.x) / 2.0,
+            cabinet_foot_y() + 24.0,
+            SIZE.x,
+            SIZE.y,
+        ),
+    }
+}
+
 impl Drawable<&Frame<'_>> for HighScoreManager {
     fn draw(&self, frame: &Frame<'_>) {
         let hud = frame.hud();
         let label = "PERSONAL BEST";
         let score = self.get_high_score().to_formatted_string(&Locale::en);
         let lights = SceneLights::idle(frame.time);
-        let rect = snap_rect(Rect::new(frame_width() - 112.0, 8.0, 102.0, 34.0));
+        let rect = snap_rect(personal_best_rect());
         draw_instrument_panel(&hud, rect, &lights);
         draw_engraved_text(&hud, label, rect.x + 8.0, rect.y + 14.0, 16.0, COLOR_TEXT_MUTED);
         draw_text_right_at(
@@ -1793,6 +2232,7 @@ impl Drawable<&Frame<'_>> for HighScoreManager {
 mod tests {
     use super::*;
     use crate::piece::pieces;
+    use crate::render3d::set_orientation;
 
     fn preview_screen_bounds(piece: Piece, center: Vec3, shake: Vec2) -> Rect {
         let (blocks, _, _) = piece.get_blocks(0);
@@ -1805,15 +2245,15 @@ mod tests {
         let mut min = Vec2::splat(f32::INFINITY);
         let mut max = Vec2::splat(f32::NEG_INFINITY);
 
-        for row_id in min_row..max_row {
-            for col_id in min_col..max_col {
-                if blocks[row_id][col_id].is_none() {
+        for (row_offset, row) in blocks[min_row..max_row].iter().enumerate() {
+            for (col_offset, cell) in row[min_col..max_col].iter().enumerate() {
+                if cell.is_none() {
                     continue;
                 }
 
                 let position = Vec3::new(
-                    origin_x + ((col_id - min_col) as f32 * PREVIEW_SCALE),
-                    origin_y - ((row_id - min_row) as f32 * PREVIEW_SCALE),
+                    origin_x + (col_offset as f32 * PREVIEW_SCALE),
+                    origin_y - (row_offset as f32 * PREVIEW_SCALE),
                     center.z,
                 );
 
@@ -1839,11 +2279,12 @@ mod tests {
         let layout = hud_layout();
         let well = well_screen_rect();
 
-        assert_eq!(layout.hold.x, layout.controls.x);
+        let controls = layout.controls.unwrap();
+        assert_eq!(layout.hold.x, controls.x);
         assert_eq!(layout.next.x, layout.stats.x);
         assert_eq!(layout.hold.y, layout.next.y);
-        assert_eq!(layout.controls.y, layout.stats.y);
-        assert_eq!(layout.controls.h, layout.stats.h);
+        assert_eq!(controls.y, layout.stats.y);
+        assert_eq!(controls.h, layout.stats.h);
 
         let left_gap = well.x - (layout.hold.x + layout.hold.w);
         let right_gap = layout.next.x - (well.x + well.w);
@@ -1853,7 +2294,7 @@ mod tests {
             layout.hold,
             layout.award,
             layout.next,
-            layout.controls,
+            controls,
             layout.stats,
             layout.score,
         ] {
@@ -1864,13 +2305,130 @@ mod tests {
     }
 
     #[test]
+    fn every_portrait_layout_hangs_under_the_cabinet_inside_the_phone_safe_area() {
+        set_orientation(Orientation::Portrait);
+
+        for portrait_layout in PortraitLayout::ALL {
+            set_portrait_layout(portrait_layout);
+            let layout = hud_layout();
+            assert!(layout.controls.is_none(), "{portrait_layout:?}");
+
+            let mut panels = vec![layout.hold, layout.next, layout.stats];
+            if !layout.award_overlay {
+                panels.push(layout.award);
+            }
+
+            let left = panels.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
+            let right = panels
+                .iter()
+                .map(|rect| rect.x + rect.w)
+                .fold(0.0, f32::max);
+            assert!(left > 0.0, "{portrait_layout:?}");
+            assert!(
+                (left - (frame_width() - right)).abs() <= 1.0,
+                "{portrait_layout:?}"
+            );
+
+            for (index, rect) in panels.iter().enumerate() {
+                assert!(
+                    rect.y > cabinet_foot_y(),
+                    "{portrait_layout:?} panel {index} overlaps the cabinet"
+                );
+                assert!(
+                    rect.y + rect.h <= frame_height() - PORTRAIT_SAFE_BOTTOM,
+                    "{portrait_layout:?} panel {index}"
+                );
+                for value in [rect.x, rect.y, rect.w, rect.h] {
+                    assert_eq!(value.fract(), 0.0, "{portrait_layout:?} panel {index}");
+                }
+                for other in &panels[index + 1..] {
+                    assert!(
+                        rect.intersect(*other).is_none(),
+                        "{portrait_layout:?} panel {index} overlaps another"
+                    );
+                }
+            }
+
+            if layout.award_overlay {
+                let well = well_screen_rect();
+                assert!(layout.award.x >= well.x && layout.award.right() <= well.right());
+                assert!(layout.award.y > layout.score.y + layout.score.h);
+            }
+
+            assert!(layout.score.y > 0.0);
+        }
+
+        set_portrait_layout(PortraitLayout::Row);
+        assert!(personal_best_rect().y > cabinet_foot_y());
+    }
+
+    #[test]
+    fn portrait_pause_button_sits_beside_the_lintel_inside_the_screen() {
+        assert!(pause_button_rect().is_none());
+
+        set_orientation(Orientation::Portrait);
+        let lintel = lintel_screen_rect();
+        let button = pause_button_rect().unwrap();
+        let slop = PAUSE_BUTTON_SLOP;
+
+        assert!(button.x - slop >= lintel.right());
+        assert!(button.right() + slop <= frame_width());
+        assert!(button.y >= lintel.y && button.bottom() <= lintel.bottom());
+        for value in [button.x, button.y, button.w, button.h] {
+            assert_eq!(value.fract(), 0.0);
+        }
+
+        assert!(pause_button_at(button.center()));
+        assert!(pause_button_at(vec2(button.x - slop + 1.0, button.y)));
+        assert!(!pause_button_at(lintel.center()));
+    }
+
+    #[test]
+    fn compact_stats_bar_readouts_clear_the_progress_pips() {
+        set_orientation(Orientation::Portrait);
+        set_portrait_layout(PortraitLayout::Compact);
+        let layout = hud_layout();
+        assert!(layout.stats_bar);
+
+        let rect = layout.stats;
+        let (level_label_width, _, _) = pixel_text_metrics("LEVEL", LABEL_TEXT_SIZE);
+        let (lines_label_width, _, _) = pixel_text_metrics("LINES", LABEL_TEXT_SIZE);
+        let (lines_width, _, _) = pixel_text_metrics(&line_count_text(9_999), LABEL_TEXT_SIZE);
+        let readout_right = rect.x
+            + 16.0 * hud_scale()
+            + level_label_width
+            + 6.0
+            + digit_text_width("99", READOUT_PIXEL)
+            + 14.0
+            + lines_label_width
+            + 6.0
+            + lines_width;
+        let bar_width = PROGRESS_PIP_SIZE * 10.0 + PROGRESS_PIP_GAP * 9.0;
+        let pips_x = (rect.x + rect.w - 16.0 * hud_scale() - bar_width).round();
+
+        assert!(readout_right + 4.0 < pips_x);
+        assert!(DIGIT_HEIGHT as f32 * READOUT_PIXEL < rect.h - 2.0 * PANEL_FRAME);
+    }
+
+    #[test]
+    fn pause_controls_fit_on_screen_under_the_pause_menu() {
+        set_orientation(Orientation::Portrait);
+        let panel = menu_panel_rect(3);
+        let controls = pause_controls_rect(3);
+
+        assert!(controls.y > panel.y + panel.h);
+        assert!(controls.y + controls.h <= frame_height() - PORTRAIT_SAFE_BOTTOM);
+        assert!((controls.x - (frame_width() - controls.right())).abs() <= 1.0);
+    }
+
+    #[test]
     fn every_panel_title_fits_between_the_frame_and_header_divider() {
         let layout = hud_layout();
 
         for (rect, label) in [
             (layout.hold, "HOLD"),
             (layout.next, "NEXT"),
-            (layout.controls, "CONTROLS"),
+            (layout.controls.unwrap(), "CONTROLS"),
             (layout.stats, "LEVEL"),
             (layout.award, "LINE CLEAR"),
             (layout.award, "CARNAGE"),
@@ -1893,14 +2451,25 @@ mod tests {
 
     #[test]
     fn all_five_controls_and_their_shadows_fit_inside_the_frame() {
-        let rect = hud_layout().controls;
+        assert_eq!(CONTROL_ROWS.last().map(|row| (row.0, row.1)), Some(("ESC", "PAUSE")));
+        assert_eq!(CONTROL_ROWS.iter().filter(|row| row.0 == "ESC").count(), 1);
+        assert_eq!(TOUCH_CONTROL_ROWS.last().map(|row| row.1), Some("PAUSE"));
+
+        let game_screen = hud_layout().controls.unwrap();
+        set_orientation(Orientation::Portrait);
+        let pause_screen = pause_controls_rect(3);
+
+        for rect in [game_screen, pause_screen] {
+            assert_controls_fit(rect);
+        }
+    }
+
+    fn assert_controls_fit(rect: Rect) {
         let divider = rect.y + HUD_HEADER_DIVIDER_OFFSET * hud_scale();
         let right = rect.x + rect.w - 16.0 * hud_scale();
 
-        assert_eq!(CONTROL_ROWS.last().map(|row| (row.0, row.1)), Some(("ESC", "PAUSE")));
-        assert_eq!(CONTROL_ROWS.iter().filter(|row| row.0 == "ESC").count(), 1);
-
-        for (index, (key, action, width)) in CONTROL_ROWS.iter().enumerate() {
+        let rows = CONTROL_ROWS.iter().chain(TOUCH_CONTROL_ROWS.iter());
+        for (index, (key, action, width)) in rows.enumerate().map(|(i, row)| (i % 5, row)) {
             let keycap = control_keycap_rect(rect, index, *width);
             let baseline = control_label_baseline(keycap);
             let (key_width, key_height, _) = pixel_text_metrics(key, CONTROL_TEXT_SIZE);
@@ -2015,7 +2584,7 @@ mod tests {
         assert_eq!(layout.award.x, layout.hold.x);
         assert_eq!(layout.award.w, layout.hold.w);
         assert!(layout.award.y > layout.hold.y + layout.hold.h);
-        assert!(layout.award.y + layout.award.h < layout.controls.y);
+        assert!(layout.award.y + layout.award.h < layout.controls.unwrap().y);
         assert!(!layout.award.overlaps(&well));
     }
 

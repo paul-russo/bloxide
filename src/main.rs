@@ -16,15 +16,21 @@ mod render3d;
 mod scoring;
 mod telemetry;
 mod textures;
+mod touch;
 
-use draw::{camera_shake, draw_backdrop, Drawable, RenderSurface, WINDOW_HEIGHT, WINDOW_WIDTH};
+use draw::{
+    camera_shake, draw_backdrop, draw_pause_controls, menu_item_at, pause_button_at,
+    screen_to_frame, set_portrait_layout, Drawable, PortraitLayout, RenderSurface, WINDOW_HEIGHT,
+    WINDOW_WIDTH,
+};
 use game_state::{GameInput, GameState};
 use grid::{FIRST_VISIBLE_ROW_ID, GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use high_score_manager::HighScoreManager;
 use macroquad::{miniquad::window::quit, prelude::*};
 use menu::{Menu, MenuInput, MenuItem};
-use render3d::{FRAME_INDEX_CAPACITY, FRAME_VERTEX_CAPACITY};
+use render3d::{set_orientation, Orientation, FRAME_INDEX_CAPACITY, FRAME_VERTEX_CAPACITY};
 use telemetry::{Phase, Telemetry};
+use touch::{Gestures, TouchControls};
 
 fn window_conf() -> macroquad::conf::Conf {
     // Harness runs are launched repeatedly from a shell; keep their window
@@ -36,13 +42,38 @@ fn window_conf() -> macroquad::conf::Conf {
         headless::install();
     }
 
+    let orientation = orientation_from_args();
+    set_orientation(orientation);
+    if let Some(layout) = std::env::args().find_map(|arg| parse_portrait_layout(&arg)) {
+        set_portrait_layout(layout);
+    }
+
+    // A portrait window is only a desktop preview of the phone layout, and a
+    // 2x one would be taller than most displays; one point per pixel still
+    // gives a clean 2x on a Retina screen.
+    let (window_width, window_height) = match orientation {
+        Orientation::Landscape => (WINDOW_WIDTH as i32, WINDOW_HEIGHT as i32),
+        Orientation::Portrait => {
+            let (width, height) = orientation.render_size();
+            (width as i32, height as i32)
+        }
+    };
+
     macroquad::conf::Conf {
         miniquad_conf: Conf {
             window_title: String::from("BLOXIDE // Software Carnage"),
             high_dpi: true,
             window_resizable: false,
-            window_height: WINDOW_HEIGHT as i32,
-            window_width: WINDOW_WIDTH as i32,
+            window_height,
+            window_width,
+            platform: macroquad::miniquad::conf::Platform {
+                apple_gfx_api: if render3d::USES_METAL {
+                    macroquad::miniquad::conf::AppleGfxApi::Metal
+                } else {
+                    macroquad::miniquad::conf::AppleGfxApi::OpenGl
+                },
+                ..Default::default()
+            },
             ..Default::default()
         },
         // The renderer keeps a whole frame in a few batches; each batch has
@@ -51,6 +82,21 @@ fn window_conf() -> macroquad::conf::Conf {
         draw_call_index_capacity: FRAME_INDEX_CAPACITY,
         ..Default::default()
     }
+}
+
+/// Phones hold the game upright. `--portrait` previews that layout on desktop.
+fn orientation_from_args() -> Orientation {
+    if cfg!(target_os = "ios") || std::env::args().any(|arg| arg == "--portrait") {
+        Orientation::Portrait
+    } else {
+        Orientation::Landscape
+    }
+}
+
+/// `--layout=N` picks the Nth portrait HUD arrangement, counting from 1.
+fn parse_portrait_layout(arg: &str) -> Option<PortraitLayout> {
+    let index: usize = arg.strip_prefix("--layout=")?.parse().ok()?;
+    PortraitLayout::ALL.get(index.checked_sub(1)?).copied()
 }
 
 #[derive(PartialEq)]
@@ -71,6 +117,8 @@ enum HarnessScene {
     Still,
     /// A topped-out stack with the game over menu up.
     GameOver,
+    /// The resting stack with the pause menu up.
+    Paused,
     /// The main menu over the empty well.
     Menu,
 }
@@ -81,6 +129,7 @@ impl HarnessScene {
             HarnessScene::Carnage => "carnage",
             HarnessScene::Still => "still",
             HarnessScene::GameOver => "gameover",
+            HarnessScene::Paused => "paused",
             HarnessScene::Menu => "menu",
         }
     }
@@ -98,6 +147,8 @@ fn harness_scene_from_args() -> Option<HarnessScene> {
         Some(HarnessScene::Still)
     } else if args.iter().any(|arg| arg == "--gameover") {
         Some(HarnessScene::GameOver)
+    } else if args.iter().any(|arg| arg == "--paused") {
+        Some(HarnessScene::Paused)
     } else {
         Some(HarnessScene::Carnage)
     }
@@ -180,6 +231,7 @@ fn seed_screenshot_state<'a>(
     match scene {
         HarnessScene::Carnage => game_state.trigger_line_clear(),
         HarnessScene::GameOver => game_state.trigger_game_over(),
+        HarnessScene::Paused => game_state.toggle_pause(),
         HarnessScene::Still | HarnessScene::Menu => {}
     }
 
@@ -258,6 +310,50 @@ fn export_opaque_png(mut image: Image, path: &str) {
     image.export_png(path);
 }
 
+/// iOS apps don't quit themselves, so their menus leave the item out.
+fn with_quit(mut items: Vec<MenuItem<'static>>) -> Vec<MenuItem<'static>> {
+    if !cfg!(target_os = "ios") {
+        items.push(MenuItem {
+            label: "Quit",
+            id: "quit",
+        });
+    }
+
+    items
+}
+
+fn menu_input(menu: &Menu<'_>, tap: Option<Vec2>) -> MenuInput {
+    MenuInput {
+        up: is_key_pressed(KeyCode::Up),
+        down: is_key_pressed(KeyCode::Down),
+        select: is_key_pressed(KeyCode::Enter),
+        chosen: tap.and_then(|point| menu_item_at(menu, point)),
+    }
+}
+
+/// Apply a drag's column shifts as separate taps, each a press then a
+/// release, so they step one column apiece instead of charging auto-repeat.
+fn shift_by_columns(game_state: &mut GameState, columns: i32) {
+    let press = GameInput {
+        shift_left: columns < 0,
+        shift_right: columns > 0,
+        ..GameInput::default()
+    };
+
+    for _ in 0..columns.unsigned_abs() {
+        game_state.update_with_elapsed(std::time::Duration::ZERO, press);
+        game_state.update_with_elapsed(std::time::Duration::ZERO, GameInput::default());
+    }
+}
+
+/// iOS stops drawing while the app is in the background, so the first frame
+/// back arrives after a long gap. Play should resume paused, not mid-fall.
+fn returned_from_background() -> bool {
+    const BACKGROUND_GAP_SECONDS: f32 = 0.5;
+
+    cfg!(target_os = "ios") && get_frame_time() > BACKGROUND_GAP_SECONDS
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let high_score_manager = HighScoreManager::new();
@@ -313,23 +409,17 @@ async fn main() {
 
     let mut menu_main = Menu::new(
         "bloxide",
-        vec![
-            MenuItem {
-                label: "Start Run",
-                id: "new_game",
-            },
-            MenuItem {
-                label: "Quit",
-                id: "quit",
-            },
-        ],
+        with_quit(vec![MenuItem {
+            label: "Start Run",
+            id: "new_game",
+        }]),
     );
 
     menu_main.is_visible = true;
 
     let mut menu_game_over = Menu::new(
         "GAME OVER",
-        vec![
+        with_quit(vec![
             MenuItem {
                 label: "New Game",
                 id: "new_game",
@@ -338,16 +428,12 @@ async fn main() {
                 label: "Main Menu",
                 id: "back_to_main_menu",
             },
-            MenuItem {
-                label: "Quit",
-                id: "quit",
-            },
-        ],
+        ]),
     );
 
     let mut menu_paused = Menu::new(
         "PAUSED",
-        vec![
+        with_quit(vec![
             MenuItem {
                 label: "Resume",
                 id: "resume",
@@ -356,12 +442,10 @@ async fn main() {
                 label: "Main Menu",
                 id: "back_to_main_menu",
             },
-            MenuItem {
-                label: "Quit",
-                id: "quit",
-            },
-        ],
+        ]),
     );
+
+    let mut touch_controls = TouchControls::default();
 
     loop {
         if telemetry.begin_frame() {
@@ -377,11 +461,12 @@ async fn main() {
         } else {
             get_time()
         };
-        let menu_input = MenuInput {
-            up: is_key_pressed(KeyCode::Up),
-            down: is_key_pressed(KeyCode::Down),
-            select: is_key_pressed(KeyCode::Enter),
+        let gestures = if is_screenshot {
+            Gestures::default()
+        } else {
+            touch_controls.poll(time)
         };
+        let tap = gestures.tap.and_then(screen_to_frame);
 
         if let (Some(commands), Some(game_state)) =
             (agent_commands.as_mut(), maybe_game_state.as_mut())
@@ -399,17 +484,31 @@ async fn main() {
             }
         }
 
-        if current_screen == CurrentScreen::Game && maybe_game_state.is_some() {
-            let game_state = maybe_game_state.as_mut().unwrap();
+        let playing = match maybe_game_state.as_mut() {
+            Some(game_state) if current_screen == CurrentScreen::Game => Some(game_state),
+            _ => None,
+        };
+        if let Some(game_state) = playing {
+            if returned_from_background() && !game_state.get_is_paused() {
+                game_state.toggle_pause();
+            }
+
+            shift_by_columns(game_state, gestures.shift);
+
+            let pause_pressed = tap.is_some_and(pause_button_at) && !game_state.get_is_game_over();
             let input = GameInput {
-                soft_drop: is_key_down(KeyCode::Down),
+                soft_drop: is_key_down(KeyCode::Down) || gestures.soft_drop,
                 shift_left: is_key_down(KeyCode::Left),
                 shift_right: is_key_down(KeyCode::Right),
-                rotate_left: is_key_pressed(KeyCode::Z) || is_key_pressed(KeyCode::LeftControl),
-                rotate_right: is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::X),
-                hard_drop: is_key_pressed(KeyCode::Space),
-                hold_piece: is_key_pressed(KeyCode::C),
-                toggle_pause: is_key_pressed(KeyCode::Escape),
+                rotate_left: is_key_pressed(KeyCode::Z)
+                    || is_key_pressed(KeyCode::LeftControl)
+                    || (gestures.rotate_left && !pause_pressed),
+                rotate_right: is_key_pressed(KeyCode::Up)
+                    || is_key_pressed(KeyCode::X)
+                    || (gestures.rotate_right && !pause_pressed),
+                hard_drop: is_key_pressed(KeyCode::Space) || gestures.hard_drop,
+                hold_piece: is_key_pressed(KeyCode::C) || gestures.hold_piece,
+                toggle_pause: is_key_pressed(KeyCode::Escape) || pause_pressed,
             };
             if is_screenshot {
                 let elapsed = if screenshot_frame == 0 {
@@ -425,21 +524,21 @@ async fn main() {
             menu_game_over.is_visible = game_state.get_is_game_over();
             menu_paused.is_visible = game_state.get_is_paused();
 
-            match menu_game_over.update(menu_input) {
+            match menu_game_over.update(menu_input(&menu_game_over, tap)) {
                 Some("new_game") => *game_state = new_game(&high_score_manager, agent_mode),
                 Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
             }
 
-            match menu_paused.update(menu_input) {
+            match menu_paused.update(menu_input(&menu_paused, tap)) {
                 Some("resume") => game_state.toggle_pause(),
                 Some("back_to_main_menu") => current_screen = CurrentScreen::MainMenu,
                 Some("quit") => quit(),
                 _ => (),
             }
         } else {
-            match menu_main.update(menu_input) {
+            match menu_main.update(menu_input(&menu_main, tap)) {
                 Some("new_game") => {
                     current_screen = CurrentScreen::Game;
                     maybe_game_state = Some(new_game(&high_score_manager, agent_mode));
@@ -466,6 +565,7 @@ async fn main() {
                 game_state.draw(&frame);
                 menu_game_over.draw(&frame);
                 menu_paused.draw(&frame);
+                draw_pause_controls(&frame, &menu_paused);
             }
             None => {
                 // The empty well is drawn behind the main menu so the 3D

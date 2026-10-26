@@ -30,9 +30,11 @@ impl Piece {
         let orientation_def = self.orientations[orientation % 4];
         let mut canvas: BlockCanvas = [[None; 5]; 5];
 
-        for row in 0..self.bounds_height {
-            for col in 0..self.bounds_width {
-                canvas[row][col] = match orientation_def.blocks[row][col] {
+        let rows = canvas.iter_mut().zip(orientation_def.blocks.iter());
+        for (canvas_row, block_row) in rows.take(self.bounds_height) {
+            let cells = canvas_row.iter_mut().zip(block_row.iter());
+            for (cell, &block) in cells.take(self.bounds_width) {
+                *cell = match block {
                     0 => None,
                     _ => Some(Block::new(self.color)),
                 };

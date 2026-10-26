@@ -27,6 +27,11 @@ pub const BLOCK_TEXTURE_SIZE: usize = 16;
 /// Edge length of the seamless stone tile used behind the cabinet.
 pub const STONE_TEXTURE_SIZE: usize = 32;
 
+/// Edge length of the cabinet fascia material, in texels. The fascia tiles at
+/// one tile per world unit, which the camera maps to 17 framebuffer pixels, so
+/// this keeps one texel on one pixel.
+pub const FASCIA_TEXTURE_SIZE: usize = 17;
+
 /// Includes the materials, glyphs and the incandescent variants of each block.
 const ATLAS_SIZE: usize = 256;
 const HEAT_STEPS: usize = 16;
@@ -178,7 +183,7 @@ const BASE_BRIGHTNESS: f32 = 0.80;
 
 /// Deterministic integer hash in `[0, 1)`. Textures are regenerated identically
 /// on every launch, so nothing needs to be cached or shipped as an asset.
-fn hash01(x: usize, y: usize, seed: u32) -> f32 {
+pub(crate) fn hash01(x: usize, y: usize, seed: u32) -> f32 {
     let mut h = (x as u32).wrapping_mul(0x9E37_79B1)
         ^ (y as u32).wrapping_mul(0x85EB_CA77)
         ^ seed.wrapping_mul(0xC2B2_AE3D);
@@ -475,6 +480,96 @@ pub fn gunmetal() -> Canvas {
     canvas
 }
 
+/// Rust-eaten cast iron for the cabinet fascia, authored in its own colours
+/// rather than as a grey to be tinted: crunchy brown-black metal in the manner
+/// of Quake's metal set, pitted and blotched with rust, with grime streaked
+/// down it the way it runs on a wall and the odd dull scratch. Only the light
+/// tints it.
+fn rusted_iron() -> impl Fn(usize, usize) -> [u8; 4] {
+    const IRON_DARK: Color = color_u8!(30, 26, 22, 255);
+    const IRON_LIGHT: Color = color_u8!(126, 114, 96, 255);
+    const RUST: Color = color_u8!(104, 58, 30, 255);
+    const SCRATCH: Color = color_u8!(150, 140, 122, 255);
+
+    let size = FASCIA_TEXTURE_SIZE;
+    let mut metal = Canvas::new(size, 0.50);
+    metal.coarse_grain(2, 0.12, 51);
+    metal.grain(0.17, 52);
+
+    for y in 0..size {
+        for x in 0..size {
+            let roll = hash01(x, y, 58);
+            if roll > 0.93 {
+                metal.add(x, y, -0.28);
+            } else if roll < 0.03 {
+                metal.add(x, y, 0.18);
+            }
+        }
+    }
+
+    // Grime runs down whole columns, so it continues across vertically
+    // stacked tiles instead of repeating as a pattern.
+    for x in 0..size {
+        let streak = hash01(x, 0, 53);
+        if streak > 0.72 {
+            for y in 0..size {
+                metal.add(x, y, -0.16 * (streak - 0.72) / 0.28 - 0.04);
+            }
+        }
+    }
+
+    let mut rust = Canvas::new(size, 0.5);
+    rust.coarse_grain(2, 0.5, 54);
+    rust.grain(0.25, 55);
+
+    move |x, y| {
+        let roll = hash01(x, y, 57);
+        let color = if roll > 0.99 {
+            SCRATCH
+        } else {
+            let iron = mix_rgb(IRON_DARK, IRON_LIGHT, metal.get(x, y));
+            let rust_amount = ((rust.get(x, y) - 0.6) / 0.4).clamp(0.0, 1.0);
+            mix_rgb(iron, RUST, rust_amount * 0.75)
+        };
+
+        [
+            (color.r * 255.0).round() as u8,
+            (color.g * 255.0).round() as u8,
+            (color.b * 255.0).round() as u8,
+            255,
+        ]
+    }
+}
+
+/// Wear for the fascia's painted relief: bevels, straps and trim are tinted
+/// through this rather than drawn flat, so every highlight comes out noisy and
+/// chipped. Mostly near white, so it only ever darkens the tint.
+pub fn edge_grit() -> Canvas {
+    let size = FASCIA_TEXTURE_SIZE;
+    let mut canvas = Canvas::new(size, 0.82);
+    canvas.coarse_grain(2, 0.10, 61);
+    canvas.grain(0.18, 62);
+
+    for y in 0..size {
+        for x in 0..size {
+            if hash01(x, y, 63) > 0.86 {
+                canvas.set(x, y, 0.38);
+            }
+        }
+    }
+
+    canvas
+}
+
+fn mix_rgb(a: Color, b: Color, t: f32) -> Color {
+    Color::new(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        1.0,
+    )
+}
+
 /// Seamless cut-stone masonry: two courses of 32x16 blocks per tile, offset by
 /// half a block, with dark mortar and a lit upper edge on every block.
 pub fn stone_blocks() -> Canvas {
@@ -531,6 +626,8 @@ pub struct SceneTextures {
     heated_armor: HeatedRegions,
     heated_vent: HeatedRegions,
     gunmetal: UvRect,
+    rusted_iron: UvRect,
+    edge_grit: UvRect,
     stone: UvRect,
     white: UvRect,
     small_glyphs: GlyphRegions,
@@ -544,6 +641,8 @@ impl SceneTextures {
         let armor = builder.add_canvas(&armor_plate());
         let vent = builder.add_canvas(&vent_panel());
         let gunmetal = builder.add_canvas(&gunmetal());
+        let rusted_iron = builder.add(FASCIA_TEXTURE_SIZE, FASCIA_TEXTURE_SIZE, rusted_iron());
+        let edge_grit = builder.add_canvas(&edge_grit());
         let white = builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true);
         let heated_armor = pack_heated_material(&mut builder, &armor_plate());
         let heated_vent = pack_heated_material(&mut builder, &vent_panel());
@@ -575,6 +674,8 @@ impl SceneTextures {
             heated_armor,
             heated_vent,
             gunmetal,
+            rusted_iron,
+            edge_grit,
             stone,
             white,
             small_glyphs,
@@ -616,6 +717,14 @@ impl SceneTextures {
 
     pub fn gunmetal(&self) -> Material<'_> {
         self.material(self.gunmetal)
+    }
+
+    pub fn rusted_iron(&self) -> Material<'_> {
+        self.material(self.rusted_iron)
+    }
+
+    pub fn edge_grit(&self) -> Material<'_> {
+        self.material(self.edge_grit)
     }
 
     pub fn stone(&self) -> Material<'_> {
@@ -702,6 +811,8 @@ mod tests {
             builder.add_canvas(&armor_plate()),
             builder.add_canvas(&vent_panel()),
             builder.add_canvas(&gunmetal()),
+            builder.add(FASCIA_TEXTURE_SIZE, FASCIA_TEXTURE_SIZE, rusted_iron()),
+            builder.add_canvas(&edge_grit()),
             builder.add_bitmap(WHITE_SWATCH_SIZE, WHITE_SWATCH_SIZE, |_, _| true),
         ];
         regions.extend(pack_heated_material(&mut builder, &armor_plate()));

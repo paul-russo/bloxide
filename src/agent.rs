@@ -396,7 +396,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut lines = Vec::new();
-        while lines.len() < 1 && Instant::now() < deadline {
+        while lines.is_empty() && Instant::now() < deadline {
             lines.extend(source.pending_lines());
             std::thread::sleep(Duration::from_millis(20));
         }

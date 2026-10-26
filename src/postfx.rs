@@ -9,6 +9,8 @@
 
 use macroquad::prelude::*;
 
+use crate::render3d::USES_METAL;
+
 /// Colour levels per channel after quantisation. Sixteen is coarse enough that
 /// smooth gradients visibly band into dithered steps without crushing the HUD.
 const PALETTE_LEVELS: f32 = 16.0;
@@ -90,17 +92,94 @@ void main() {
     gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }"#;
 
+// The same filter for Metal. macroquad uploads `Projection`, `Model` and
+// `_Time` ahead of the material's own uniforms, in that order, and matches
+// fields by position; the first two field names follow macroquad's own Metal
+// shader, which keeps the product right.
+const METAL_SHADER: &str = r#"#include <metal_stdlib>
+using namespace metal;
+
+struct Uniforms {
+    float4x4 Model;
+    float4x4 Projection;
+    float4 _Time;
+    float2 TargetSize;
+    float PaletteLevels;
+    float DitherStrength;
+    float VignetteStrength;
+};
+
+struct Vertex {
+    float3 position [[attribute(0)]];
+    float2 texcoord [[attribute(1)]];
+    float4 color0 [[attribute(2)]];
+};
+
+struct RasterizerData {
+    float4 position [[position]];
+    float4 color [[user(locn0)]];
+    float2 uv [[user(locn1)]];
+};
+
+vertex RasterizerData vertexShader(Vertex v [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
+    RasterizerData out;
+    out.position = u.Model * u.Projection * float4(v.position, 1);
+    out.color = v.color0 / 255.0;
+    out.uv = v.texcoord;
+    return out;
+}
+
+float bayer2(float2 p) {
+    p = floor(p);
+    return fract(p.x * 0.5 + p.y * p.y * 0.75);
+}
+
+float bayer4(float2 p) {
+    return bayer2(0.5 * p) * 0.25 + bayer2(p);
+}
+
+fragment float4 fragmentShader(
+    RasterizerData in [[stage_in]],
+    constant Uniforms& u [[buffer(0)]],
+    texture2d<float> Texture [[texture(0)]],
+    sampler TextureSmplr [[sampler(0)]]
+) {
+    float3 rgb = Texture.sample(TextureSmplr, in.uv).rgb * in.color.rgb;
+    float2 pixel = floor(in.uv * u.TargetSize);
+
+    float luma = dot(rgb, float3(0.299, 0.587, 0.114));
+    float3 warm = rgb * float3(1.05, 0.97, 0.86) + float3(0.014, 0.009, 0.0);
+    rgb = mix(warm, rgb, smoothstep(0.0, 0.45, luma));
+
+    float2 centered = (in.uv - 0.5) * float2(u.TargetSize.x / u.TargetSize.y, 1.0);
+    float edge = dot(centered, centered) * 1.35;
+    rgb *= 1.0 - u.VignetteStrength * edge * edge;
+
+    float steps = u.PaletteLevels - 1.0;
+    float threshold = (bayer4(pixel) - 0.5) * u.DitherStrength;
+    rgb = floor(rgb * steps + 0.5 + threshold) / steps;
+
+    return float4(clamp(rgb, 0.0, 1.0), 1.0);
+}"#;
+
 pub struct PostProcess {
     material: Material,
 }
 
 impl PostProcess {
     pub fn new(target_width: u32, target_height: u32) -> Self {
-        let material = load_material(
+        let shader = if USES_METAL {
+            ShaderSource::Msl {
+                program: METAL_SHADER,
+            }
+        } else {
             ShaderSource::Glsl {
                 vertex: VERTEX_SHADER,
                 fragment: FRAGMENT_SHADER,
-            },
+            }
+        };
+        let material = load_material(
+            shader,
             MaterialParams {
                 uniforms: vec![
                     UniformDesc::new("TargetSize", UniformType::Float2),
@@ -135,7 +214,9 @@ impl PostProcess {
             WHITE,
             DrawTextureParams {
                 dest_size: Some(size),
-                flip_y: true,
+                // OpenGL render targets are stored bottom row first; Metal's
+                // are top row first like the screen.
+                flip_y: !USES_METAL,
                 ..Default::default()
             },
         );

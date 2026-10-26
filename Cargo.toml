@@ -9,3 +9,10 @@ edition = "2021"
 macroquad = "0.4.15"
 num-format = "0.4.4"
 rand = "0.8.5"
+
+# miniquad's Metal backend (used on iOS) builds every pipeline for the
+# screen's colour format, so drawing into an RGBA8 render target is silently
+# dropped. The vendored copy gives colour render targets the screen's format;
+# see the "bloxide patch" comment in vendor/miniquad/src/graphics/metal.rs.
+[patch.crates-io]
+miniquad = { path = "vendor/miniquad" }

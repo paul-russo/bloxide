@@ -56,9 +56,8 @@ impl Grid {
         bounds_height: usize,
         bounds_width: usize,
     ) -> &mut Self {
-        for canvas_row_id in 0..bounds_height {
-            for canvas_col_id in 0..bounds_width {
-                let canvas_cell = canvas[canvas_row_id][canvas_col_id];
+        for (canvas_row_id, canvas_row) in canvas.iter().enumerate().take(bounds_height) {
+            for (canvas_col_id, &canvas_cell) in canvas_row.iter().enumerate().take(bounds_width) {
                 if canvas_cell.is_some() {
                     let grid_col_id = canvas_col_id as isize + col_offset;
                     let grid_row_id = canvas_row_id as isize + row_offset;
@@ -90,9 +89,9 @@ impl Grid {
         bounds_height: usize,
         bounds_width: usize,
     ) -> bool {
-        for canvas_row_id in 0..bounds_height {
-            for canvas_col_id in 0..bounds_width {
-                if canvas[canvas_row_id][canvas_col_id].is_some() {
+        for (canvas_row_id, canvas_row) in canvas.iter().enumerate().take(bounds_height) {
+            for (canvas_col_id, canvas_cell) in canvas_row.iter().enumerate().take(bounds_width) {
+                if canvas_cell.is_some() {
                     let grid_col_id = canvas_col_id as isize + col_offset;
                     let grid_row_id = canvas_row_id as isize + row_offset;
 
@@ -120,9 +119,9 @@ impl Grid {
         bounds_height: usize,
         bounds_width: usize,
     ) -> bool {
-        for canvas_row_id in 0..bounds_height {
-            for canvas_col_id in 0..bounds_width {
-                if canvas[canvas_row_id][canvas_col_id].is_some() {
+        for (canvas_row_id, canvas_row) in canvas.iter().enumerate().take(bounds_height) {
+            for canvas_cell in canvas_row.iter().take(bounds_width) {
+                if canvas_cell.is_some() {
                     let grid_row_id = canvas_row_id as isize + row_offset;
 
                     // If any row ID would be at or below the first visible row, then this canvas would not be

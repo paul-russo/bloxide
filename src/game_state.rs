@@ -77,9 +77,9 @@ fn impact_contact_origins(
     let mut occupied_count = 0.0;
     let mut lowest_occupied_row = active_piece_row;
 
-    for canvas_row in 0..bounds_height {
-        for canvas_col in 0..bounds_width {
-            if canvas[canvas_row][canvas_col].is_none() {
+    for (canvas_row, cells) in canvas.iter().enumerate().take(bounds_height) {
+        for (canvas_col, cell) in cells.iter().enumerate().take(bounds_width) {
+            if cell.is_none() {
                 continue;
             }
 
@@ -892,6 +892,10 @@ impl<'a> GameState<'a> {
         // long once it lands.
         const SINK_SECONDS: f32 = 1.4;
 
+        // Fresh debris leaves the row white-hot and cools to gray scrap within
+        // the first moments of its fall, so it does not compete with the stack.
+        const COOL_SECONDS: f32 = 0.25;
+
         for splash in self.lava_splashes.iter_mut().filter(|splash| splash.active) {
             splash.age += dt;
             if splash.age >= SPLASH_SECONDS {
@@ -909,6 +913,7 @@ impl<'a> GameState<'a> {
             }
 
             voxel.age += dt;
+            voxel.forge_heat = (voxel.forge_heat - dt / COOL_SECONDS).max(0.0);
 
             if voxel.is_sinking() {
                 // Settle on the surface and slow the tumble as the metal
@@ -1045,8 +1050,8 @@ impl<'a> GameState<'a> {
         let mut pool_index = 0;
         let mut rng = rand::thread_rng();
 
-        for i in 0..cleared_count {
-            let Some(cleared) = cleared_blocks[i] else {
+        for &cleared in cleared_blocks.iter().take(cleared_count) {
+            let Some(cleared) = cleared else {
                 continue;
             };
 
@@ -1117,6 +1122,7 @@ impl<'a> GameState<'a> {
                     size,
                     age: 0.0,
                     submersion: 0.0,
+                    forge_heat: 1.0,
                     bounce_count: 0,
                     active: true,
                 };

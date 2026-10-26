@@ -15,12 +15,14 @@
 //! the texture or primitive type changes, so keeping both constant lets an
 //! entire frame reach the GPU in a few batches.
 
+use std::cell::Cell;
+
 use macroquad::prelude::*;
 use macroquad::window::get_internal_gl;
 
 use crate::grid::{GRID_COUNT_COLS, VISIBLE_GRID_COUNT_ROWS};
 use crate::lighting::{lit, SceneLights};
-use crate::textures::{iron_heat_color, Material, SceneTextures};
+use crate::textures::{hash01, iron_heat_color, Material, SceneTextures};
 
 /// Geometry one macroquad batch can hold. A frame with a full stack, a
 /// four-row carnage burst and the HUD comes to about 35k vertices, so a batch
@@ -31,12 +33,55 @@ use crate::textures::{iron_heat_color, Material, SceneTextures};
 pub const FRAME_VERTEX_CAPACITY: usize = 40_000;
 pub const FRAME_INDEX_CAPACITY: usize = 60_000;
 
-/// The entire game is rendered to this deliberately tiny framebuffer before
-/// nearest-neighbour integer upscaling. At the default 1200x900 window this is a
-/// clean 2x scale (4x on a Retina framebuffer), giving every edge the same
-/// software-rendered pixel density.
-pub const RENDER_WIDTH: u32 = 600;
-pub const RENDER_HEIGHT: u32 = 450;
+/// Shape of the deliberately tiny framebuffer the entire game is rendered to
+/// before nearest-neighbour upscaling. The cell pitch is fixed, so either
+/// shape gives every edge the same software-rendered pixel density; only how
+/// much of the scene around the well is in view changes.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Orientation {
+    /// HUD beside the well. At the default 1200x900 window this is a clean 2x
+    /// scale (4x on a Retina framebuffer).
+    Landscape,
+
+    /// HUD under the well, for phones held upright. About 4x on a 6.3-inch
+    /// iPhone's 1206x2622 screen. Both sides stay even so the well, centred
+    /// on the camera, lands on whole pixels.
+    Portrait,
+}
+
+impl Orientation {
+    pub const fn render_size(self) -> (u32, u32) {
+        match self {
+            Orientation::Landscape => (600, 450),
+            Orientation::Portrait => (302, 656),
+        }
+    }
+}
+
+thread_local! {
+    /// Per thread so each unit test lays out in its own orientation. The game
+    /// itself sets and reads it on one thread: macroquad calls `window_conf`
+    /// and runs the game loop on the main thread.
+    static ORIENTATION: Cell<Orientation> = const { Cell::new(Orientation::Landscape) };
+}
+
+/// Choose the framebuffer shape. Call it before the render target is created
+/// or anything is laid out; the camera and every HUD position read it.
+pub fn set_orientation(orientation: Orientation) {
+    ORIENTATION.with(|cell| cell.set(orientation));
+}
+
+pub fn orientation() -> Orientation {
+    ORIENTATION.with(Cell::get)
+}
+
+pub fn render_width() -> u32 {
+    orientation().render_size().0
+}
+
+pub fn render_height() -> u32 {
+    orientation().render_size().1
+}
 
 /// Width of the playable well in world units. One grid cell is one unit, so a
 /// grid coordinate becomes a world coordinate by a simple offset.
@@ -79,6 +124,21 @@ const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 4.83, 33.0);
 /// what balances the lintel above the well against the pit below it.
 const CAMERA_TARGET: Vec3 = Vec3::new(0.0, -0.40, 0.0);
 
+/// How far the portrait camera sits below the landscape one, in world units.
+/// A whole number keeps rows on the same pixel phase (one unit is exactly one
+/// cell pitch on screen). It lifts the cabinet to just under a phone's camera
+/// cutout and leaves the lower part of the frame for the HUD.
+const PORTRAIT_CAMERA_DROP: f32 = 4.0;
+
+/// Offset applied to both camera position and target, so the framing slides
+/// without changing the tilt.
+fn camera_framing() -> Vec3 {
+    match orientation() {
+        Orientation::Landscape => Vec3::ZERO,
+        Orientation::Portrait => Vec3::new(0.0, -PORTRAIT_CAMERA_DROP, 0.0),
+    }
+}
+
 /// Cosine of the camera's downward pitch. The orthographic view height is
 /// scaled by this so that one vertical world unit still covers exactly
 /// [`CELL_PIXEL_PITCH`] framebuffer pixels however far the camera tilts.
@@ -88,13 +148,13 @@ fn camera_pitch_cosine() -> f32 {
 }
 
 fn camera_view_height() -> f32 {
-    RENDER_HEIGHT as f32 * camera_pitch_cosine() / CELL_PIXEL_PITCH
+    render_height() as f32 * camera_pitch_cosine() / CELL_PIXEL_PITCH
 }
 
 /// An explicit aspect ratio independently locks the horizontal pitch to the
 /// same 17 pixels without changing the camera's position or direction.
 fn camera_aspect() -> f32 {
-    RENDER_WIDTH as f32 / (CELL_PIXEL_PITCH * camera_view_height())
+    render_width() as f32 / (CELL_PIXEL_PITCH * camera_view_height())
 }
 
 /// Ghost outlines are drawn brighter than the piece they preview, so the thin
@@ -122,11 +182,46 @@ const WELL_BACK_COLOR: Color = color_u8!(40, 41, 40, 255);
 /// The cabinet face and sloped throat around the recessed playfield. These stay
 /// neutral steel so the coloured blocks, the warm lamps and the semantic amber
 /// HUD accents remain the strongest colours on screen.
-const BEZEL_FRAME_COLOR: Color = color_u8!(52, 53, 52, 255);
-const BEZEL_TEXTURE_COLOR: Color = color_u8!(88, 90, 90, 255);
-const BEZEL_SIDE_COLOR: Color = color_u8!(44, 45, 46, 255);
+const BEZEL_FRAME_COLOR: Color = color_u8!(52, 46, 40, 255);
+const BEZEL_SIDE_COLOR: Color = color_u8!(46, 40, 35, 255);
 const BEZEL_EDGE_COLOR: Color = color_u8!(137, 126, 99, 185);
 const BEZEL_SEAM_COLOR: Color = color_u8!(13, 12, 10, 230);
+
+/// How much of the room's light the rusted-iron fascia returns. The material
+/// carries its own colour, so this is close to neutral.
+const FASCIA_TINT: Color = color_u8!(150, 146, 140, 255);
+
+/// Machined relief on the fascia plates: two-pixel bevels lit from the top
+/// left and shadowed at the bottom right, and the grooves of recessed panels.
+const RELIEF_LIGHT: Color = color_u8!(142, 128, 108, 255);
+const RELIEF_SOFT_LIGHT: Color = color_u8!(94, 84, 72, 255);
+const RELIEF_SOFT_DARK: Color = color_u8!(36, 31, 27, 255);
+const RELIEF_DARK: Color = color_u8!(12, 10, 9, 255);
+
+/// Bronze trim: the straps banding the pillars and the lintel's edges. Kept
+/// dull, so it reads as old metal rather than gilt under the lamps.
+const BRONZE_LIGHT: Color = color_u8!(158, 110, 64, 255);
+const BRONZE: Color = color_u8!(96, 62, 34, 255);
+const BRONZE_DARK: Color = color_u8!(38, 24, 12, 255);
+
+/// Height of the bronze straps banding the pillars, in framebuffer pixels.
+const PILLAR_BAND_PIXELS: f32 = 5.0;
+
+/// Pillar capitals: a block a little wider and deeper than the pillar, where
+/// it meets the lintel.
+const CAPITAL_PIXELS: Vec2 = Vec2::new(21.0, 6.0);
+const CAPITAL_PROJECTION: f32 = 0.05;
+
+/// The plinth the furnace grille stands on: how far it flares past the end
+/// posts on either side, in framebuffer pixels, and how far it stands proud
+/// of them. Its top sits just above the melt and it reaches `PLINTH_DROP`
+/// below the bottom bar's box; `PLINTH_BOLT_XS` are the bolt heads along its
+/// face.
+const PLINTH_FLARE_PIXELS: f32 = 3.0;
+const PLINTH_PROJECTION: f32 = 0.08;
+const PLINTH_TOP_ABOVE_LAVA: f32 = 0.35;
+const PLINTH_DROP: f32 = 0.5;
+const PLINTH_BOLT_XS: [f32; 6] = [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0];
 
 /// Faint cell guides on the back wall. These are a gameplay aid as much as
 /// decoration: with the 3D camera applied, they give the eye a reference for
@@ -173,10 +268,11 @@ const WELL_SPLAY: f32 = 0.15;
 const BACK_WALL_ROWS_ABOVE: usize = 2;
 
 /// Bolt heads studding the pillars and lintel corners.
-const BOLT_SIZE: f32 = 0.28;
+const BOLT_SIZE: f32 = 5.0 / CELL_PIXEL_PITCH;
 const BOLT_DEPTH: f32 = 0.10;
 const BOLT_SPACING: f32 = 3.0;
-const BOLT_COLOR: Color = color_u8!(132, 134, 132, 255);
+const BOLT_COLOR: Color = color_u8!(106, 98, 88, 255);
+const RUST_STAIN_COLOR: Color = color_u8!(114, 56, 24, 230);
 
 /// Caged bulkhead lamps mounted on the pillar fronts.
 const LAMP_HOUSING_SIZE: Vec3 = Vec3::new(0.62, 0.52, 0.26);
@@ -230,6 +326,11 @@ const LAVA_HOT_COLOR: Color = color_u8!(255, 240, 180, 255);
 /// is the light on the wall at the lava line, fading up to the floor grate.
 const PIT_WALL_GLOW: Vec3 = Vec3::new(3.2, 1.3, 0.3);
 
+/// Soot on the fascia: none above `SOOT_TOP_Y`, deepening to `SOOT_DARKENING`
+/// at the floor line and staying there down the pit.
+const SOOT_TOP_Y: f32 = FLOOR_Y + 5.0;
+const SOOT_DARKENING: f32 = 0.45;
+
 /// Indices into [`bezel_fascia_boxes`].
 const FASCIA_BOTTOM: usize = 0;
 const FASCIA_LINTEL: usize = 3;
@@ -246,7 +347,7 @@ const BACK_WALL_Z: f32 = -WELL_DEPTH / 2.0;
 /// Rebuilt per call rather than cached because it is cheap and may target either
 /// the low-resolution framebuffer or the screen-space projection helper.
 pub fn well_camera(render_target: Option<RenderTarget>, shake: Vec2) -> Camera3D {
-    let camera_offset = Vec3::new(shake.x, shake.y, 0.0);
+    let camera_offset = camera_framing() + Vec3::new(shake.x, shake.y, 0.0);
     Camera3D {
         position: CAMERA_POSITION + camera_offset,
         target: CAMERA_TARGET + camera_offset,
@@ -259,10 +360,24 @@ pub fn well_camera(render_target: Option<RenderTarget>, shake: Vec2) -> Camera3D
         // The whole scene sits roughly 20-45 units from the camera. Keeping the
         // clip range tight gives the low-resolution depth buffer substantially
         // more precision than Macroquad's general-purpose 0.01-10000 default.
-        z_near: 1.0,
-        z_far: 100.0,
+        z_near: if USES_METAL { METAL_Z_NEAR } else { Z_NEAR },
+        z_far: Z_FAR,
     }
 }
+
+/// iOS renders through Metal (OpenGL ES is deprecated there and emulated in
+/// the simulator); every other platform uses OpenGL.
+pub const USES_METAL: bool = cfg!(target_os = "ios");
+
+const Z_NEAR: f32 = 1.0;
+const Z_FAR: f32 = 100.0;
+
+/// macroquad hands Metal the OpenGL projection unchanged, but Metal clips
+/// depth to 0..1 rather than OpenGL's -1..1, which would cull everything
+/// nearer than halfway to `Z_FAR`. Pushing the near plane back by the same
+/// span makes `Z_NEAR..Z_FAR` land exactly on Metal's 0..1, at the same depth
+/// precision.
+const METAL_Z_NEAR: f32 = 2.0 * Z_NEAR - Z_FAR;
 
 /// Context-free copy of the well camera matrix used for HUD projection and
 /// projection invariants in tests. Macroquad's `Camera3D::matrix` queries the
@@ -271,9 +386,9 @@ pub fn well_camera(render_target: Option<RenderTarget>, shake: Vec2) -> Camera3D
 fn well_view_projection_matrix(shake: Vec2) -> Mat4 {
     let top = camera_view_height() * 0.5;
     let right = top * camera_aspect();
-    let camera_offset = Vec3::new(shake.x, shake.y, 0.0);
+    let camera_offset = camera_framing() + Vec3::new(shake.x, shake.y, 0.0);
 
-    Mat4::orthographic_rh_gl(-right, right, -top, top, 1.0, 100.0)
+    Mat4::orthographic_rh_gl(-right, right, -top, top, Z_NEAR, Z_FAR)
         * Mat4::look_at_rh(
             CAMERA_POSITION + camera_offset,
             CAMERA_TARGET + camera_offset,
@@ -301,8 +416,8 @@ pub fn world_to_screen_with_shake(point: Vec3, shake: Vec2) -> Vec2 {
     let ndc = clip.truncate() / clip.w;
 
     Vec2::new(
-        (ndc.x + 1.0) * 0.5 * RENDER_WIDTH as f32,
-        (1.0 - ndc.y) * 0.5 * RENDER_HEIGHT as f32,
+        (ndc.x + 1.0) * 0.5 * render_width() as f32,
+        (1.0 - ndc.y) * 0.5 * render_height() as f32,
     )
 }
 
@@ -335,8 +450,8 @@ impl ScreenPlane {
     /// here, so their shading does not jitter along with the well.
     pub fn resting_world(&self, screen: Vec2) -> Vec3 {
         let ndc = Vec2::new(
-            screen.x / RENDER_WIDTH as f32 * 2.0 - 1.0,
-            1.0 - screen.y / RENDER_HEIGHT as f32 * 2.0,
+            screen.x / render_width() as f32 * 2.0 - 1.0,
+            1.0 - screen.y / render_height() as f32 * 2.0,
         );
         let near = self
             .inverse_view_projection
@@ -699,13 +814,20 @@ fn draw_tiled_front_face(
             let e1 = Vec3::X * width;
             let e2 = Vec3::NEG_Y * height;
             let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
-            let colors = corners.map(|corner| lit(tint, lights.at(corner)));
+            let colors = corners.map(|corner| lit(soot(tint, corner), lights.at(corner)));
             let uv_max = Vec2::new(width / BEZEL_TILE_SIZE, height / BEZEL_TILE_SIZE);
             let (uv_min, uv_max) = flipped_uvs(uv_max, index % 2 == 1, (index / 2) % 2 == 1);
 
             draw_quad_uv(origin, e1, e2, uv_min, uv_max, material, colors);
         }
     }
+}
+
+/// Blacken a fascia colour with the soot the furnace has breathed up the
+/// cabinet: heaviest around the pit, thinning out a few rows above the floor.
+fn soot(base: Color, point: Vec3) -> Color {
+    let rise = ((SOOT_TOP_Y - point.y) / (SOOT_TOP_Y - FLOOR_Y)).clamp(0.0, 1.0);
+    shaded(base, 1.0 - SOOT_DARKENING * rise * rise, base.a)
 }
 
 /// Mirror a tile's UV range along either axis. Where a clipped tile is
@@ -724,21 +846,6 @@ fn flipped_uvs(uv_max: Vec2, flip_x: bool, flip_y: bool) -> (Vec2, Vec2) {
     };
 
     (Vec2::new(u0, v0), Vec2::new(u1, v1))
-}
-
-fn draw_front_face_outline(center: Vec3, size: Vec3, color: Color, textures: &SceneTextures) {
-    let half = size * 0.5;
-    let z = center.z + half.z + 0.006;
-    let corners = [
-        Vec3::new(center.x - half.x, center.y - half.y, z),
-        Vec3::new(center.x + half.x, center.y - half.y, z),
-        Vec3::new(center.x + half.x, center.y + half.y, z),
-        Vec3::new(center.x - half.x, center.y + half.y, z),
-    ];
-
-    for index in 0..4 {
-        draw_line_quad(corners[index], corners[(index + 1) % 4], color, textures);
-    }
 }
 
 const FACE_BACK: usize = 0;
@@ -965,6 +1072,10 @@ pub struct ShrapnelVoxel {
     /// its own size: 0.0 while airborne, 1.0 when it has gone under and is
     /// retired.
     pub submersion: f32,
+    /// Heat carried out of the white-hot row: 1.0 when the voxel breaks off,
+    /// cooling to 0.0 in flight so the fracture does not cut straight from
+    /// incandescent to cold scrap.
+    pub forge_heat: f32,
     pub bounce_count: u8,
     pub active: bool,
 }
@@ -1017,33 +1128,115 @@ pub fn draw_lava_splashes(splashes: &[LavaSplash], textures: &SceneTextures) {
     }
 }
 
+/// Where a shrapnel voxel is this frame and how hot it is.
+struct ShrapnelPose {
+    position: Vec3,
+    /// Edge length of the visible cube, which shrinks as the voxel goes under.
+    scale: f32,
+    /// Fraction of the voxel still above the melt.
+    remaining: f32,
+    /// Heat taken up from the melt, from 0.0 to 1.0.
+    soak_heat: f32,
+    /// Incandescence from 0.0 (cold scrap) to 1.0 (white-hot), from the melt
+    /// or from the fracture, whichever is hotter.
+    heat: f32,
+}
+
+impl ShrapnelPose {
+    /// `None` once the voxel is inactive or has sunk out of sight.
+    fn of(voxel: &ShrapnelVoxel) -> Option<Self> {
+        if !voxel.active {
+            return None;
+        }
+
+        // A voxel that has reached the melt floats on the surface while the
+        // heat takes it, then is clipped by the surface: the cube shrinks
+        // toward its top and the visible remainder rides the lava, which at
+        // this pixel scale reads as the debris going under.
+        const HEAT_SOAK: f32 = 0.55;
+        let remaining = if voxel.submersion <= HEAT_SOAK {
+            1.0
+        } else {
+            1.0 - (voxel.submersion - HEAT_SOAK) / (1.0 - HEAT_SOAK)
+        };
+        let scale = voxel.size * remaining;
+        if scale <= 0.001 {
+            return None;
+        }
+
+        // The fracture throws off white-hot metal that cools to gray scrap as
+        // it falls, keeping settled debris visually distinct from the colored
+        // playable stack, until the lava reheats it.
+        let soak_heat = (voxel.submersion / HEAT_SOAK).clamp(0.0, 1.0);
+
+        // A sinking voxel's visible remainder rides on the surface, lifted a
+        // touch so it never z-fights with the melt.
+        let position = if voxel.is_sinking() {
+            Vec3::new(
+                voxel.position.x,
+                LAVA_Y + scale * 0.5 + 0.02,
+                voxel.position.z,
+            )
+        } else {
+            voxel.position
+        };
+
+        Some(Self {
+            position,
+            scale,
+            remaining,
+            soak_heat,
+            heat: soak_heat.max(voxel.forge_heat),
+        })
+    }
+}
+
+/// The glow around a hot shrapnel voxel.
+#[derive(Copy, Clone, Default)]
+struct ShrapnelHalo {
+    position: Vec3,
+    radius: f32,
+    alpha: f32,
+}
+
+impl ShrapnelHalo {
+    const COLOR: Color = Color::new(1.0, 0.62, 0.14, 1.0);
+
+    /// How strongly fresh debris glows relative to debris soaking in the melt.
+    /// A whole row's worth of it is in flight at once over the stack, so at
+    /// full strength the halos merge into a wash over the playfield.
+    const FORGE_GLOW: f32 = 0.4;
+
+    /// `None` when the voxel is too cool to glow.
+    fn of(voxel: &ShrapnelVoxel) -> Option<Self> {
+        let pose = ShrapnelPose::of(voxel)?;
+        let glow = pose.soak_heat.max(voxel.forge_heat * Self::FORGE_GLOW);
+        if glow <= 0.15 {
+            return None;
+        }
+
+        Some(Self {
+            position: pose.position,
+            radius: voxel.size * (2.2 + 0.9 * glow),
+            alpha: (glow * 0.65 * pose.remaining.max(0.3)).clamp(0.0, 0.7),
+        })
+    }
+}
+
 /// Draw a single tumbling shrapnel voxel with dynamic directional shading,
-/// point-sampled texture, and hot-metal incandescence once it hits the melt.
+/// point-sampled texture, and hot-metal incandescence. Its halo is drawn
+/// separately by [`draw_shrapnel`].
 pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
-    if !voxel.active {
+    let Some(ShrapnelPose {
+        position,
+        scale,
+        heat,
+        ..
+    }) = ShrapnelPose::of(voxel)
+    else {
         return;
-    }
-
-    // A voxel that has reached the melt floats on the surface while the heat
-    // takes it, then is clipped by the surface: the cube shrinks toward its
-    // top and the visible remainder rides the lava, which at this pixel scale
-    // reads as the debris going under.
-    const HEAT_SOAK: f32 = 0.55;
-    let remaining = if voxel.submersion <= HEAT_SOAK {
-        1.0
-    } else {
-        1.0 - (voxel.submersion - HEAT_SOAK) / (1.0 - HEAT_SOAK)
     };
-    let scale = voxel.size * remaining;
-    if scale <= 0.001 {
-        return;
-    }
-
-    // The fracture exposes gray scrap. Only the lava reheats it, making the
-    // falling debris visually distinct from the colored playable stack.
-    let heat = (voxel.submersion / HEAT_SOAK).clamp(0.0, 1.0);
     let is_hot = heat > 0.0;
-    let fade = remaining;
 
     let color = if is_hot {
         if heat > 0.60 {
@@ -1071,27 +1264,6 @@ pub fn draw_shrapnel_voxel(voxel: &ShrapnelVoxel, textures: &SceneTextures) {
     } else {
         voxel.color
     };
-
-    // A sinking voxel's visible remainder rides on the surface, lifted a
-    // touch so it never z-fights with the melt.
-    let position = if voxel.is_sinking() {
-        Vec3::new(voxel.position.x, LAVA_Y + scale * 0.5 + 0.02, voxel.position.z)
-    } else {
-        voxel.position
-    };
-
-    if is_hot && heat > 0.15 {
-        let halo_radius = voxel.size * (2.2 + 0.9 * heat);
-        let halo_alpha = (heat * 0.65 * fade.max(0.3)).clamp(0.0, 0.7);
-
-        draw_glow_disc(
-            position,
-            halo_radius,
-            Color::new(1.0, 0.62, 0.14, 1.0),
-            halo_alpha,
-            textures,
-        );
-    }
 
     let rot = Quat::from_euler(
         EulerRot::XYZ,
@@ -1183,12 +1355,39 @@ pub fn draw_tumbling_cube(
     draw_shrapnel_voxel(&voxel, textures);
 }
 
-/// Draw all active 3D shrapnel voxels.
+/// Draw all active 3D shrapnel voxels, then the halos of the hot ones.
 pub fn draw_shrapnel(voxels: &[ShrapnelVoxel], textures: &SceneTextures) {
     for voxel in voxels {
         if voxel.active {
             draw_shrapnel_voxel(voxel, textures);
         }
+    }
+
+    // Halos are translucent but still write depth across their whole disc, so
+    // one drawn early would cut a hole in any cube or halo behind it drawn
+    // later. They go after every cube, farthest first.
+    let mut halos = [ShrapnelHalo::default(); MAX_SHRAPNEL_VOXELS];
+    let mut halo_count = 0;
+    for (slot, halo) in halos
+        .iter_mut()
+        .zip(voxels.iter().filter_map(ShrapnelHalo::of))
+    {
+        *slot = halo;
+        halo_count += 1;
+    }
+
+    let view = view_direction();
+    let halos = &mut halos[..halo_count];
+    halos.sort_unstable_by(|a, b| a.position.dot(view).total_cmp(&b.position.dot(view)));
+
+    for halo in halos.iter() {
+        draw_glow_disc(
+            halo.position,
+            halo.radius,
+            ShrapnelHalo::COLOR,
+            halo.alpha,
+            textures,
+        );
     }
 }
 
@@ -1625,6 +1824,22 @@ pub fn lintel_front_bounds() -> (Vec3, Vec3) {
     )
 }
 
+/// Heights of the bolts running up each pillar, which are also where the
+/// bronze bands clamp across it. The lamps take the place of whichever bolt
+/// would sit under them.
+fn pillar_bolt_heights(half_h: f32) -> impl Iterator<Item = f32> {
+    let lamp_clearance = LAMP_HOUSING_SIZE.y * 0.5 + BOLT_SIZE;
+
+    (0..)
+        .map(move |index| -half_h + 0.5 + index as f32 * BOLT_SPACING)
+        .take_while(move |&y| y < half_h)
+        .filter(move |&y| {
+            !SceneLights::lamp_positions()
+                .iter()
+                .any(|lamp| (lamp.y - y).abs() < lamp_clearance)
+        })
+}
+
 /// Bolt-head positions on the fascia front: a column up each pillar plus one
 /// in each corner of the lintel.
 fn bolt_positions(half_w: f32, half_h: f32) -> impl Iterator<Item = Vec3> {
@@ -1634,19 +1849,9 @@ fn bolt_positions(half_w: f32, half_h: f32) -> impl Iterator<Item = Vec3> {
     let (lintel_center, lintel_size) = boxes[FASCIA_LINTEL];
     let lintel_front_z = lintel_center.z + lintel_size.z * 0.5;
 
-    // The lamps take the place of whichever bolt would sit under them.
-    let lamp_clearance = LAMP_HOUSING_SIZE.y * 0.5 + BOLT_SIZE;
-    let pillar_bolts = (0..)
-        .map(move |index| -half_h + 0.5 + index as f32 * BOLT_SPACING)
-        .take_while(move |&y| y < half_h)
-        .filter(move |&y| {
-            !SceneLights::lamp_positions()
-                .iter()
-                .any(|lamp| (lamp.y - y).abs() < lamp_clearance)
-        })
-        .flat_map(move |y| {
-            [-1.0, 1.0].map(|x_sign| Vec3::new(x_sign * pillar_x, y, pillar_front_z))
-        });
+    let pillar_bolts = pillar_bolt_heights(half_h).flat_map(move |y| {
+        [-1.0, 1.0].map(|x_sign| Vec3::new(x_sign * pillar_x, y, pillar_front_z))
+    });
 
     let inset = 0.5;
     let lintel_bolts = [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
@@ -1662,33 +1867,115 @@ fn bolt_positions(half_w: f32, half_h: f32) -> impl Iterator<Item = Vec3> {
     pillar_bolts.chain(lintel_bolts)
 }
 
-/// A domed bolt head standing just off a fascia face: a soft drop shadow under
-/// a small face that is lit across its crown and shadowed at its skirt.
+/// An octagonal bolt head standing just off a fascia face: a soft drop shadow
+/// and a dark rim around a head lit across its crown and shadowed at its
+/// skirt, with a single glint where the light catches it.
 fn draw_bolt(center: Vec3, lights: &SceneLights, textures: &SceneTextures) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
     let half = BOLT_SIZE * 0.5;
-    let shadow_offset = Vec3::new(0.06, -0.06, 0.0);
-    let top_left = Vec3::new(center.x - half, center.y + half, center.z + BOLT_DEPTH);
+    let z = center.z + BOLT_DEPTH;
     let base = lit(BOLT_COLOR, lights.at(center));
+    let crown = shaded(base, 1.3, 1.0);
+    let skirt = shaded(base, 0.45, 1.0);
+    let shadow = color_u8!(8, 7, 6, 200);
+    let rim = color_u8!(12, 10, 8, 255);
 
-    draw_quad(
-        top_left + shadow_offset + Vec3::Z * 0.002,
-        Vec3::X * BOLT_SIZE,
-        Vec3::NEG_Y * BOLT_SIZE,
-        textures.white(),
-        [color_u8!(8, 8, 7, 200); 4],
+    draw_octagon(
+        center.truncate() + Vec2::new(pixel, -pixel),
+        half + pixel,
+        2.0 * pixel,
+        z,
+        [shadow, shadow],
+        textures,
     );
-    draw_quad(
-        top_left + Vec3::Z * 0.004,
-        Vec3::X * BOLT_SIZE,
-        Vec3::NEG_Y * BOLT_SIZE,
-        textures.white(),
-        [
-            shaded(base, 1.5, 1.0),
-            shaded(base, 1.3, 1.0),
-            shaded(base, 0.55, 1.0),
-            shaded(base, 0.7, 1.0),
-        ],
+    draw_octagon(
+        center.truncate(),
+        half + pixel,
+        2.0 * pixel,
+        z + 0.002,
+        [rim, rim],
+        textures,
     );
+    draw_octagon(
+        center.truncate(),
+        half,
+        pixel,
+        z + 0.004,
+        [crown, skirt],
+        textures,
+    );
+
+    let glint = shaded(base, 1.75, 1.0);
+    draw_quad(
+        Vec3::new(center.x - half + pixel, center.y + half - pixel, z + 0.006),
+        Vec3::X * pixel,
+        Vec3::NEG_Y * pixel,
+        textures.white(),
+        [glint; 4],
+    );
+}
+
+/// Rust weeping down the fascia from a bolt: a couple of one-pixel drips of
+/// uneven length, fading out as they run, cut off at `floor_y` where the face
+/// they run down ends. `seed` picks the drips, so every bolt weeps differently
+/// but the same way on every frame.
+fn draw_rust_stain(
+    center: Vec3,
+    floor_y: f32,
+    seed: usize,
+    lights: &SceneLights,
+    textures: &SceneTextures,
+) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let face_z = center.z + 0.014;
+    let drip_top = center.y - BOLT_SIZE * 0.5;
+    let stain = lit(RUST_STAIN_COLOR, lights.at(center));
+
+    for drip in 0..2 {
+        let offset = (hash01(seed, drip, 71) * 5.0).floor() - 2.0;
+        let length = (6.0 + (hash01(seed, drip, 72) * 16.0).floor()) * pixel;
+        let run = length.min(drip_top - floor_y);
+        if run <= 0.0 {
+            continue;
+        }
+
+        let end = Color::new(stain.r, stain.g, stain.b, stain.a * (1.0 - run / length));
+        let x = center.x + (offset - 0.5) * pixel;
+        draw_quad(
+            Vec3::new(x, drip_top, face_z),
+            Vec3::X * pixel,
+            Vec3::NEG_Y * run,
+            textures.white(),
+            [stain, stain, end, end],
+        );
+    }
+}
+
+/// A camera-facing octagon: a square of half-width `half` with its corners
+/// cut back by `corner`, built from two overlapping quads. `colors` runs from
+/// its top edge to its bottom edge.
+fn draw_octagon(
+    center: Vec2,
+    half: f32,
+    corner: f32,
+    z: f32,
+    colors: [Color; 2],
+    textures: &SceneTextures,
+) {
+    let [top, bottom] = colors;
+    let at = |y: f32| mix_color(top, bottom, (center.y + half - y) / (2.0 * half));
+
+    for (half_x, half_y) in [(half, half - corner), (half - corner, half)] {
+        let y_top = center.y + half_y;
+        let y_bottom = center.y - half_y;
+        draw_quad(
+            Vec3::new(center.x - half_x, y_top, z),
+            Vec3::X * (2.0 * half_x),
+            Vec3::NEG_Y * (2.0 * half_y),
+            textures.white(),
+            [at(y_top), at(y_top), at(y_bottom), at(y_bottom)],
+        );
+    }
 }
 
 /// Draw a caged bulkhead lamp housing with its emissive face. The translucent
@@ -1799,11 +2086,11 @@ pub fn draw_lamp_glow(lights: &SceneLights, textures: &SceneTextures) {
     }
 }
 
-/// The bottom bar fronts the pit: a solid steel post at either end, and
-/// between them an open grille looking straight in at the melt. Bars are two
-/// pixels wide on a four-pixel pitch so they land on whole framebuffer pixels
-/// and line up with the floor grate above. Horizontal ribs brace the bars at
-/// the floor line and at every unit below it.
+/// The bottom bar fronts the pit: a riveted plinth along its foot, a solid
+/// steel post at either end standing on it, and between them an open grille
+/// looking straight in at the melt. Bars are two pixels wide on a six-pixel
+/// pitch so they land on whole framebuffer pixels, braced by a rib at the
+/// floor line and footed in the plinth.
 fn draw_furnace_front(
     center: Vec3,
     size: Vec3,
@@ -1812,26 +2099,28 @@ fn draw_furnace_front(
 ) {
     let pixel = 1.0 / CELL_PIXEL_PITCH;
     let top = center.y + size.y * 0.5;
-    let bottom = center.y - size.y * 0.5;
     let min_x = center.x - size.x * 0.5;
     let max_x = center.x + size.x * 0.5;
     let front_z = center.z + size.z * 0.5;
     let post_width = BEZEL_FASCIA_WIDTH + BEZEL_BEVEL_WIDTH;
+    let plinth_top = ((LAVA_Y + PLINTH_TOP_ABOVE_LAVA) * CELL_PIXEL_PITCH).round() * pixel;
 
+    draw_furnace_plinth(center, size, plinth_top, textures, lights);
+
+    let standing_height = top - plinth_top;
     for post_x in [min_x, max_x - post_width] {
-        let post_center = Vec3::new(post_x + post_width * 0.5, center.y, center.z);
-        let post_size = Vec3::new(post_width, size.y, size.z);
-        draw_shaded_box(post_center, post_size, BEZEL_FRAME_COLOR, 1.0, textures);
-        draw_box_wires(post_center, post_size, BEZEL_SEAM_COLOR, textures);
-        draw_tiled_front_face(
-            post_center,
-            post_size,
-            textures.gunmetal(),
-            BEZEL_TEXTURE_COLOR,
-            0,
-            lights,
+        let post_center = Vec3::new(
+            post_x + post_width * 0.5,
+            top - standing_height * 0.5,
+            center.z,
         );
-        draw_front_face_outline(post_center, post_size, BEZEL_SEAM_COLOR, textures);
+        let post_size = Vec3::new(post_width, standing_height, size.z);
+        draw_fascia_slab(post_center, post_size, 0, textures, lights);
+        draw_panel_groove(
+            FaceRect::front_of(post_center, post_size).inset(5.0),
+            lights,
+            textures,
+        );
     }
 
     // The grille bars stand against the glow behind them, so they read dark:
@@ -1851,21 +2140,66 @@ fn draw_furnace_front(
         draw_quad(
             Vec3::new(x, top, bar_z),
             Vec3::X * bar_width,
-            Vec3::NEG_Y * size.y,
+            Vec3::NEG_Y * standing_height,
             textures.white(),
             [bar_rim, bar_face, bar_face, bar_rim],
         );
     }
 
-    // A rib braces the bars at the floor line and another at the melt.
-    for rib_top in [top, (LAVA_Y + 0.35).max(bottom + 0.2)] {
-        draw_quad(
-            Vec3::new(center.x - span_half, rib_top, bar_z + 0.002),
-            Vec3::X * span_half * 2.0,
-            Vec3::NEG_Y * (2.0 * pixel),
-            textures.white(),
-            [bar_rim, bar_rim, bar_face, bar_face],
-        );
+    draw_quad(
+        Vec3::new(center.x - span_half, top, bar_z + 0.002),
+        Vec3::X * span_half * 2.0,
+        Vec3::NEG_Y * (2.0 * pixel),
+        textures.white(),
+        [bar_rim, bar_rim, bar_face, bar_face],
+    );
+}
+
+fn plinth_bottom_y(front: Vec3, front_size: Vec3) -> f32 {
+    front.y - front_size.y * 0.5 - PLINTH_DROP
+}
+
+/// World-space bottom-left and bottom-right corners of the plinth's face, the
+/// cabinet's lowest edge. The portrait HUD hangs below it.
+pub fn plinth_foot_bounds() -> (Vec3, Vec3) {
+    let (front, front_size) =
+        bezel_fascia_boxes(WELL_WIDTH / 2.0, WELL_HEIGHT / 2.0)[FASCIA_BOTTOM];
+    let half_w = front_size.x * 0.5 + PLINTH_FLARE_PIXELS / CELL_PIXEL_PITCH;
+    let bottom = plinth_bottom_y(front, front_size);
+    let face_z = front.z + front_size.z * 0.5 + PLINTH_PROJECTION;
+
+    (
+        Vec3::new(front.x - half_w, bottom, face_z),
+        Vec3::new(front.x + half_w, bottom, face_z),
+    )
+}
+
+/// The heavy iron footing under the furnace front, from just below the bar's
+/// box up to `plinth_top`. It flares past the end posts and stands a little
+/// proud of them, so the cabinet steps out at its foot the way it does under
+/// the lintel, and is bolted along its face.
+fn draw_furnace_plinth(
+    front: Vec3,
+    front_size: Vec3,
+    plinth_top: f32,
+    textures: &SceneTextures,
+    lights: &SceneLights,
+) {
+    let flare = PLINTH_FLARE_PIXELS / CELL_PIXEL_PITCH;
+    let bottom = plinth_bottom_y(front, front_size);
+    let back_z = front.z - front_size.z * 0.5;
+    let size = Vec3::new(
+        front_size.x + 2.0 * flare,
+        plinth_top - bottom,
+        front_size.z + PLINTH_PROJECTION,
+    );
+    let center = Vec3::new(front.x, bottom + size.y * 0.5, back_z + size.z * 0.5);
+
+    draw_fascia_slab(center, size, 2, textures, lights);
+
+    let face_z = center.z + size.z * 0.5;
+    for x in PLINTH_BOLT_XS {
+        draw_bolt(Vec3::new(x, center.y, face_z), lights, textures);
     }
 }
 
@@ -1906,24 +2240,298 @@ fn draw_bezel_throat(half_w: f32, half_h: f32, lights: &SceneLights, textures: &
     let pixel = 1.0 / CELL_PIXEL_PITCH;
     for x_sign in [-1.0, 1.0] {
         let inner_x = x_sign * (half_w - pixel);
-        draw_quad(
-            Vec3::new(inner_x.min(x_sign * half_w), rim_top, edge_z),
-            Vec3::X * pixel,
-            Vec3::NEG_Y * (rim_top - rim_bottom),
-            textures.white(),
-            [BEZEL_EDGE_COLOR; 4],
+        let rim = FaceRect::from_top_left(
+            inner_x.min(x_sign * half_w),
+            rim_top,
+            pixel,
+            rim_top - rim_bottom,
+            edge_z,
         );
+        draw_lit_rect(rim, textures.edge_grit(), BEZEL_EDGE_COLOR, lights);
     }
 }
 
-/// Draw the cabinet: a sloped throat into the well, riveted steel pillars
+/// The front face of a fascia solid, in world x/y at depth `z`.
+#[derive(Copy, Clone, Debug)]
+struct FaceRect {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    z: f32,
+}
+
+impl FaceRect {
+    fn front_of(center: Vec3, size: Vec3) -> Self {
+        let half = size * 0.5;
+        Self {
+            left: center.x - half.x,
+            right: center.x + half.x,
+            top: center.y + half.y,
+            bottom: center.y - half.y,
+            z: center.z + half.z,
+        }
+    }
+
+    /// Shrink by whole framebuffer pixels on each side.
+    fn inset(self, pixels: f32) -> Self {
+        let amount = pixels / CELL_PIXEL_PITCH;
+        Self {
+            left: self.left + amount,
+            right: self.right - amount,
+            top: self.top - amount,
+            bottom: self.bottom + amount,
+            z: self.z,
+        }
+    }
+
+    fn width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    fn height(&self) -> f32 {
+        self.top - self.bottom
+    }
+
+    /// A `width` by `height` rectangle hanging down from `(left, top)`.
+    fn from_top_left(left: f32, top: f32, width: f32, height: f32, z: f32) -> Self {
+        Self {
+            left,
+            right: left + width,
+            top,
+            bottom: top - height,
+            z,
+        }
+    }
+}
+
+/// Fill a camera-facing rectangle with `material`, split on the world unit
+/// grid so long trim picks up the lamps and the furnace along its length
+/// rather than only at its ends. The material is anchored to that grid, one
+/// texel per framebuffer pixel, so thin strips sample fresh texels wherever
+/// they run instead of repeating one row of the texture.
+fn draw_lit_rect(rect: FaceRect, material: Material, base: Color, lights: &SceneLights) {
+    const EPSILON: f32 = 0.0001;
+
+    let mut y = rect.top;
+    while y > rect.bottom + EPSILON {
+        let cell_top = (y - EPSILON).ceil();
+        let next_y = (cell_top - 1.0).max(rect.bottom);
+        let mut x = rect.left;
+        while x < rect.right - EPSILON {
+            let cell_left = (x + EPSILON).floor();
+            let next_x = (cell_left + 1.0).min(rect.right);
+            let origin = Vec3::new(x, y, rect.z);
+            let e1 = Vec3::X * (next_x - x);
+            let e2 = Vec3::NEG_Y * (y - next_y);
+            let corners = [origin, origin + e1, origin + e1 + e2, origin + e2];
+            let colors = corners.map(|corner| lit(soot(base, corner), lights.at(corner)));
+            let uv_min = Vec2::new(x - cell_left, cell_top - y);
+            let uv_max = Vec2::new(next_x - cell_left, cell_top - next_y);
+
+            draw_quad_uv(origin, e1, e2, uv_min, uv_max, material, colors);
+            x = next_x;
+        }
+        y = next_y;
+    }
+}
+
+/// A one-pixel ring just inside `face`: `top_left` along the top and left
+/// edges, `bottom_right` along the bottom and right, which own the corners
+/// they share. Stacked rings make bevels (light over dark) and grooves
+/// (dark over light).
+fn draw_face_ring(
+    face: FaceRect,
+    top_left: Color,
+    bottom_right: Color,
+    lights: &SceneLights,
+    textures: &SceneTextures,
+) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let z = face.z + 0.004;
+    let (width, height) = (face.width(), face.height());
+
+    let top = FaceRect::from_top_left(face.left, face.top, width, pixel, z);
+    let left = FaceRect::from_top_left(face.left, face.top, pixel, height, z);
+    let bottom = FaceRect::from_top_left(face.left, face.bottom + pixel, width, pixel, z);
+    let right = FaceRect::from_top_left(face.right - pixel, face.top, pixel, height, z);
+
+    let grit = textures.edge_grit();
+    draw_lit_rect(top, grit, top_left, lights);
+    draw_lit_rect(left, grit, top_left, lights);
+    draw_lit_rect(bottom, grit, bottom_right, lights);
+    draw_lit_rect(right, grit, bottom_right, lights);
+}
+
+/// The two-pixel raised bevel around a fascia plate. It starts a pixel in:
+/// the outermost pixel belongs to the solid's dark edge line, and a ring on
+/// it would fight that line for the same depth.
+fn draw_plate_bevel(face: FaceRect, lights: &SceneLights, textures: &SceneTextures) {
+    draw_face_ring(face.inset(1.0), RELIEF_LIGHT, RELIEF_DARK, lights, textures);
+    draw_face_ring(
+        face.inset(2.0),
+        RELIEF_SOFT_LIGHT,
+        RELIEF_SOFT_DARK,
+        lights,
+        textures,
+    );
+}
+
+/// The groove outlining a recessed panel: shadowed along its top and left,
+/// catching the light along its bottom and right.
+fn draw_panel_groove(face: FaceRect, lights: &SceneLights, textures: &SceneTextures) {
+    draw_face_ring(face, RELIEF_DARK, RELIEF_SOFT_LIGHT, lights, textures);
+}
+
+/// A rusted-iron slab of the cabinet: a solid box faced with the iron
+/// material and edged with a raised bevel.
+fn draw_fascia_slab(
+    center: Vec3,
+    size: Vec3,
+    phase: usize,
+    textures: &SceneTextures,
+    lights: &SceneLights,
+) {
+    draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0, textures);
+    draw_box_wires(center, size, BEZEL_SEAM_COLOR, textures);
+    draw_tiled_front_face(
+        center,
+        size,
+        textures.rusted_iron(),
+        FASCIA_TINT,
+        phase,
+        lights,
+    );
+    draw_plate_bevel(FaceRect::front_of(center, size), lights, textures);
+}
+
+/// A bronze strap clamped across a pillar at `center_y`, a pixel proud of it
+/// on either side so it reads as wrapping around, with a one-pixel shadow
+/// cast onto the iron below.
+fn draw_pillar_band(face: FaceRect, center_y: f32, lights: &SceneLights, textures: &SceneTextures) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let left = face.left - pixel;
+    let width = face.width() + 2.0 * pixel;
+    let top = center_y + PILLAR_BAND_PIXELS * 0.5 * pixel;
+    let z = face.z + 0.012;
+
+    let rows = [
+        (BRONZE_LIGHT, 1.0),
+        (BRONZE, PILLAR_BAND_PIXELS - 2.0),
+        (BRONZE_DARK, 1.0),
+    ];
+    let mut row_top = top;
+    for (color, pixels) in rows {
+        let row = FaceRect::from_top_left(left, row_top, width, pixels * pixel, z);
+        draw_lit_rect(row, textures.edge_grit(), color, lights);
+        row_top -= pixels * pixel;
+    }
+
+    let shadow = FaceRect::from_top_left(face.left, row_top, face.width(), pixel, face.z + 0.008);
+    draw_lit_rect(shadow, textures.edge_grit(), RELIEF_DARK, lights);
+}
+
+/// A pillar's front: bronze bands at each bolt, and between them recessed
+/// panels inset from the bevel.
+fn draw_pillar_detail(face: FaceRect, half_h: f32, lights: &SceneLights, textures: &SceneTextures) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let band_half = PILLAR_BAND_PIXELS * 0.5 * pixel;
+    let panel_margin = 5.0 * pixel;
+    let band_heights: Vec<f32> = pillar_bolt_heights(half_h).collect();
+
+    // Panel edges: the plate's ends inside the bevel, and either side of
+    // every band, from the top down.
+    let mut edges = vec![face.top - panel_margin];
+    for &y in band_heights.iter().rev() {
+        edges.push(y + band_half + 3.0 * pixel);
+        edges.push(y - band_half - 3.0 * pixel);
+    }
+    edges.push(face.bottom + panel_margin);
+
+    for pair in edges.chunks_exact(2) {
+        let panel = FaceRect {
+            left: face.left + panel_margin,
+            right: face.right - panel_margin,
+            top: pair[0],
+            bottom: pair[1],
+            z: face.z,
+        };
+        draw_panel_groove(panel, lights, textures);
+    }
+
+    for &y in &band_heights {
+        draw_pillar_band(face, y, lights, textures);
+    }
+}
+
+/// A capital where a pillar meets the lintel: a short block a little wider
+/// and deeper than the pillar, so the frame steps out under the beam instead
+/// of meeting it in a plain butt joint.
+fn draw_pillar_capital(pillar: (Vec3, Vec3), textures: &SceneTextures, lights: &SceneLights) {
+    let (center, size) = pillar;
+    let capital_size = Vec3::new(
+        CAPITAL_PIXELS.x / CELL_PIXEL_PITCH,
+        CAPITAL_PIXELS.y / CELL_PIXEL_PITCH,
+        size.z + CAPITAL_PROJECTION,
+    );
+    let capital_center = Vec3::new(
+        center.x,
+        center.y + (size.y - capital_size.y) * 0.5,
+        center.z - size.z * 0.5 + capital_size.z * 0.5,
+    );
+
+    draw_shaded_box(
+        capital_center,
+        capital_size,
+        BEZEL_FRAME_COLOR,
+        1.0,
+        textures,
+    );
+    draw_box_wires(capital_center, capital_size, BEZEL_SEAM_COLOR, textures);
+    draw_tiled_front_face(
+        capital_center,
+        capital_size,
+        textures.rusted_iron(),
+        FASCIA_TINT,
+        1,
+        lights,
+    );
+    draw_face_ring(
+        FaceRect::front_of(capital_center, capital_size).inset(1.0),
+        RELIEF_LIGHT,
+        RELIEF_DARK,
+        lights,
+        textures,
+    );
+}
+
+/// The lintel's front: bronze trim inside the bevel along its top and
+/// bottom, framing the score readout mounted between them.
+fn draw_lintel_trim(face: FaceRect, lights: &SceneLights, textures: &SceneTextures) {
+    let pixel = 1.0 / CELL_PIXEL_PITCH;
+    let trim = face.inset(3.0);
+    let z = face.z + 0.006;
+
+    for trim_top in [trim.top, trim.bottom + 3.0 * pixel] {
+        let rows = [(BRONZE_LIGHT, 1.0), (BRONZE, 1.0), (BRONZE_DARK, 1.0)];
+        let mut row_top = trim_top;
+        for (color, pixels) in rows {
+            let row = FaceRect::from_top_left(trim.left, row_top, trim.width(), pixels * pixel, z);
+            draw_lit_rect(row, textures.edge_grit(), color, lights);
+            row_top -= pixels * pixel;
+        }
+    }
+}
+
+/// Draw the cabinet: a sloped throat into the well, banded iron pillars
 /// carrying a heavy lintel, the furnace grille along the bottom, and a caged
 /// lamp on each pillar. The throat stays open between lintel and well so
 /// pieces visibly drop out of the machine rather than appear behind glass.
 fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &SceneLights) {
     draw_bezel_throat(half_w, half_h, lights, textures);
 
-    for (index, (center, size)) in bezel_fascia_boxes(half_w, half_h).into_iter().enumerate() {
+    let boxes = bezel_fascia_boxes(half_w, half_h);
+    for (index, &(center, size)) in boxes.iter().enumerate() {
         // The bottom bar is open grille between its end posts, so it draws
         // its own solids rather than one box that would wall off the pit.
         if index == FASCIA_BOTTOM {
@@ -1931,20 +2539,26 @@ fn draw_well_bezel(half_w: f32, half_h: f32, textures: &SceneTextures, lights: &
             continue;
         }
 
-        draw_shaded_box(center, size, BEZEL_FRAME_COLOR, 1.0, textures);
-        draw_box_wires(center, size, BEZEL_SEAM_COLOR, textures);
-        draw_tiled_front_face(
-            center,
-            size,
-            textures.gunmetal(),
-            BEZEL_TEXTURE_COLOR,
-            index,
-            lights,
-        );
-        draw_front_face_outline(center, size, BEZEL_SEAM_COLOR, textures);
+        draw_fascia_slab(center, size, index, textures, lights);
+
+        let face = FaceRect::front_of(center, size);
+        if index == FASCIA_LINTEL {
+            draw_lintel_trim(face, lights, textures);
+        } else {
+            draw_pillar_detail(face, half_h, lights, textures);
+            draw_pillar_capital((center, size), textures, lights);
+        }
     }
 
-    for bolt in bolt_positions(half_w, half_h) {
+    let (lintel_center, lintel_size) = boxes[FASCIA_LINTEL];
+    let lintel_bottom = lintel_center.y - lintel_size.y * 0.5;
+    for (index, bolt) in bolt_positions(half_w, half_h).enumerate() {
+        let stain_floor = if bolt.y > lintel_bottom {
+            lintel_bottom + 3.0 / CELL_PIXEL_PITCH
+        } else {
+            LAVA_Y
+        };
+        draw_rust_stain(bolt, stain_floor, index, lights, textures);
         draw_bolt(bolt, lights, textures);
     }
 
@@ -2128,13 +2742,13 @@ mod tests {
 
     #[test]
     fn blocks_sit_just_behind_a_narrow_rim() {
-        assert!(BEZEL_THROAT_Z > BLOCK_INSET * 0.5);
-        assert!(BEZEL_FRONT_Z > BEZEL_THROAT_Z);
+        const { assert!(BEZEL_THROAT_Z > BLOCK_INSET * 0.5) };
+        const { assert!(BEZEL_FRONT_Z > BEZEL_THROAT_Z) };
 
         // The frame's front is within a quarter unit of the block faces, and
         // the chamfer between them is a lip, not a ledge.
-        assert!(BEZEL_FRONT_Z - BLOCK_INSET * 0.5 < 0.25);
-        assert!(BEZEL_BEVEL_WIDTH < 0.2);
+        const { assert!(BEZEL_FRONT_Z - BLOCK_INSET * 0.5 < 0.25) };
+        const { assert!(BEZEL_BEVEL_WIDTH < 0.2) };
     }
 
     #[test]
@@ -2242,6 +2856,6 @@ mod tests {
         assert!((bottom_top - FLOOR_Y).abs() < 1e-5, "grille starts at the floor grate");
         assert!(bottom_bottom < LAVA_Y, "grille reaches below the melt");
         assert!((left_bottom - bottom_top).abs() < 1e-5, "pillars stand on the grille");
-        assert!(LAVA_Y < FLOOR_Y - 1.0, "there is a real drop into the pit");
+        const { assert!(LAVA_Y < FLOOR_Y - 1.0, "there is a real drop into the pit") };
     }
 }

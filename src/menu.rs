@@ -17,6 +17,9 @@ pub struct MenuInput {
     pub up: bool,
     pub down: bool,
     pub select: bool,
+
+    /// An item picked directly, such as by tapping it; selects that item.
+    pub chosen: Option<usize>,
 }
 
 impl<'a> Menu<'a> {
@@ -33,6 +36,11 @@ impl<'a> Menu<'a> {
     pub fn update(&mut self, input: MenuInput) -> Option<&str> {
         if !self.is_visible {
             return None;
+        }
+
+        if let Some(index) = input.chosen.filter(|&index| index < self.items.len()) {
+            self.active_index = index;
+            return Some(self.items[index].id);
         }
 
         let mut next_index = self.active_index as isize;

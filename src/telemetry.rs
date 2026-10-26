@@ -196,7 +196,8 @@ impl Telemetry {
             return;
         }
 
-        if self.gpu_sync {
+        // glFinish has no context to wait on under Metal.
+        if self.gpu_sync && !crate::render3d::USES_METAL {
             self.enter(Phase::GpuSync);
             set_default_camera();
             unsafe {

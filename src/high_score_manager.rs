@@ -1,12 +1,24 @@
-use std::{cell::Cell, fs};
+use std::{cell::Cell, fs, path::PathBuf};
 
 pub struct HighScoreManager {
     high_score: Cell<usize>,
 }
 
+/// iOS apps run from a read-only bundle, so the score lives in the app's
+/// Documents folder there; elsewhere it stays in the working directory.
+fn high_score_path() -> PathBuf {
+    if cfg!(target_os = "ios") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join("Documents").join(".highscore");
+        }
+    }
+
+    PathBuf::from("./.highscore")
+}
+
 impl HighScoreManager {
     pub fn new() -> Self {
-        let read_high_score = fs::read_to_string("./.highscore")
+        let read_high_score = fs::read_to_string(high_score_path())
             .and_then(|data| data.parse::<usize>().or(Ok(0)))
             .unwrap_or(0);
 
@@ -17,7 +29,10 @@ impl HighScoreManager {
 
     fn set_score(&self, score: usize) {
         self.high_score.set(score);
-        fs::write("./.highscore", score.to_string()).expect("Unable to write file");
+
+        if let Err(error) = fs::write(high_score_path(), score.to_string()) {
+            eprintln!("Unable to save high score: {error}");
+        }
     }
 
     pub fn add_score(&self, score: usize) {
